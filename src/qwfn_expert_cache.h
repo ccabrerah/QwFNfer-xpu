@@ -406,6 +406,7 @@ private:
     size_t                 arena_bytes_ = 0;
     ggml_backend_buffer_t  arena_buf_ = nullptr;
     ggml_backend_buffer_t  arena_hostbuf_ = nullptr;   // owns arena_ when pinned
+    host_block             arena_block_;               // owns arena_ when QWFN_LOCK_HOST
     bool                   arena_pinned_ = false;
     bool                   last_promote_async_ = false;
     struct pending_rel { uint32_t layer, expert; int32_t slot; };

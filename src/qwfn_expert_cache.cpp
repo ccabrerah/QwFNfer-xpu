@@ -121,7 +121,15 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
     // silently falls back to an ordinary CPU buffer if pinning fails, and that
     // one is neither pinned nor page-aligned, so check both before trusting it.
     arena_pinned_ = false;
-    if (cfg.host_buft && !getenv("QWFN_PAGEABLE_ARENA")) {
+    // QWFN_LOCK_HOST: anonymous, locked, driver-registered memory instead of the backend's host
+    // buffer, which the xe driver may swap out under pressure (qwfn_io.h).
+    // Without the driver import, copies from it are staged and slow (a pageable arena cost 220 -> 80
+    // tok/s prefill), so an unregistered block is dropped for the backend's buffer.
+    if (host_lock_requested() && cfg.vram_backend && host_block_alloc(arena_block_, arena_bytes_, "expert RAM tier", true)) {
+        if (arena_block_.imported) { arena_ = (uint8_t *) arena_block_.p; arena_pinned_ = true; }
+        else host_block_free(arena_block_);
+    }
+    if (!arena_ && cfg.host_buft && !getenv("QWFN_PAGEABLE_ARENA")) {
         arena_hostbuf_ = ggml_backend_buft_alloc_buffer(cfg.host_buft, arena_bytes_);
         uint8_t * p = arena_hostbuf_ ? (uint8_t *) ggml_backend_buffer_get_base(arena_hostbuf_) : nullptr;
         if (arena_hostbuf_ && p && ggml_backend_buffer_get_type(arena_hostbuf_) == cfg.host_buft &&
@@ -306,7 +314,8 @@ void expert_cache::shutdown() {
     extra_bytes_ = 0;
     total_gslots_ = 0;
     if (arena_buf_) { ggml_backend_buffer_free(arena_buf_); arena_buf_ = nullptr; }
-    if (arena_hostbuf_) { ggml_backend_buffer_free(arena_hostbuf_); arena_hostbuf_ = nullptr; arena_ = nullptr; }
+    if (arena_block_.p) { host_block_free(arena_block_); arena_ = nullptr; }
+    else if (arena_hostbuf_) { ggml_backend_buffer_free(arena_hostbuf_); arena_hostbuf_ = nullptr; arena_ = nullptr; }
     else if (arena_) { dio_free(arena_); arena_ = nullptr; }
     arena_pinned_ = false;
     blk_.clear();

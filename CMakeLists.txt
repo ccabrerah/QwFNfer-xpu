@@ -88,7 +88,7 @@ target_include_directories(qwfn_core PUBLIC
   "${LLAMA_CPP_ROOT}/ggml/src"       # ggml-impl.h: the graph struct, for the per-node profiler only
   "${URING_INCLUDE_DIR}"
 )
-target_link_libraries(qwfn_core PUBLIC ggml_base ggml_all Threads::Threads "${URING_LIBRARY}")
+target_link_libraries(qwfn_core PUBLIC ggml_base ggml_all Threads::Threads "${URING_LIBRARY}" ${CMAKE_DL_LIBS})
 target_compile_options(qwfn_core PRIVATE -O3 ${QWFN_ARCH_FLAGS} -Wall -Wextra -Wno-unused-parameter)
 
 add_executable(qwfn-iobench tools/qwfn_iobench.cpp)
