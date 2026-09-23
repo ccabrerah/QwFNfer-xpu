@@ -112,6 +112,11 @@ target_include_directories(qwfn-refdump PRIVATE "${LLAMA_CPP_ROOT}/include" "${L
 target_link_libraries(qwfn-refdump PRIVATE llama_ref ggml_base ggml_all)
 target_compile_options(qwfn-refdump PRIVATE -O2)
 
+# Overlay tooling (docs/dense-overlay.md): metadata heads and local re-encodes of split GGUFs.
+add_executable(gguf-requant tools/overlay/gguf_requant.cpp)
+target_link_libraries(gguf-requant PRIVATE ggml_base ggml_all Threads::Threads)
+target_include_directories(gguf-requant PRIVATE "${LLAMA_CPP_ROOT}/ggml/include")
+
 add_executable(qwfn-run tools/qwfn_run.cpp)
 target_link_libraries(qwfn-run PRIVATE qwfn_core)
 target_compile_options(qwfn-run PRIVATE -O3 ${QWFN_ARCH_FLAGS})
