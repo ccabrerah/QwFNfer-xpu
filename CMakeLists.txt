@@ -117,6 +117,13 @@ add_executable(gguf-requant tools/overlay/gguf_requant.cpp)
 target_link_libraries(gguf-requant PRIVATE ggml_base ggml_all Threads::Threads)
 target_include_directories(gguf-requant PRIVATE "${LLAMA_CPP_ROOT}/ggml/include")
 
+# Isolated kernel benches at this model's decode shapes (tools/perf).
+foreach(b mv_bench moe_bench)
+  add_executable(${b} tools/perf/${b}.cpp)
+  target_include_directories(${b} PRIVATE "${LLAMA_CPP_ROOT}/ggml/include")
+  target_link_libraries(${b} PRIVATE ggml_base ggml_all)
+endforeach()
+
 add_executable(qwfn-run tools/qwfn_run.cpp)
 target_link_libraries(qwfn-run PRIVATE qwfn_core)
 target_compile_options(qwfn-run PRIVATE -O3 ${QWFN_ARCH_FLAGS})
