@@ -737,6 +737,47 @@ void engine::reset() {
     }
 }
 
+size_t engine::checkpoint_bytes() const {
+    return st_.checkpoint_bytes(n_past_);
+}
+
+bool engine::checkpoint_save(checkpoint & out, std::string & err) {
+    if (mtp_on_) { err = "checkpoint: not supported with the draft head"; return false; }
+    ggml_backend_synchronize(w_.backend());
+    const state_config & sc = st_.config();
+    out.n_past = n_past_;
+    out.n_ctx = sc.n_ctx; out.type_k = sc.type_k; out.type_v = sc.type_v;
+    out.kv_host = sc.kv_host; out.idx_host = sc.idx_host;
+    // A reused buffer that is too small is released first: growing it in place would make the
+    // vector allocate up to twice the size and copy the old contents across, briefly holding
+    // three checkpoints' worth of host memory for one.
+    const size_t need = st_.checkpoint_bytes(n_past_);
+    if (out.st.capacity() < need) std::vector<uint8_t>().swap(out.st);
+    out.st.resize(need);
+    st_.save(n_past_, out.st.data());
+    return true;
+}
+
+bool engine::checkpoint_restore(const checkpoint & in, std::string & err) {
+    if (mtp_on_) { err = "checkpoint: not supported with the draft head"; return false; }
+    const state_config & sc = st_.config();
+    if (in.n_ctx != sc.n_ctx || in.type_k != sc.type_k || in.type_v != sc.type_v ||
+        in.kv_host != sc.kv_host || in.idx_host != sc.idx_host) {
+        err = "checkpoint: taken under a different state configuration"; return false;
+    }
+    if (in.n_past < 0 || in.n_past > (int32_t) sc.n_ctx || in.st.size() != st_.checkpoint_bytes(in.n_past)) {
+        err = "checkpoint: size does not match its position"; return false;
+    }
+    ggml_backend_synchronize(w_.backend());
+    // reset() clears everything derived: rollback expectations, the decode bias,
+    // and marks the pooled block keys for a rebuild from the restored raw cache.
+    reset();
+    st_.restore(in.n_past, in.st.data());
+    clear_embeddings();
+    n_past_ = in.n_past;
+    return true;
+}
+
 // Everything the decode attention graph needs for this token: the write row,
 // the cells and positions of the block holding it, the bias window around it,
 // and the block bucket the graph is shaped for. After a prefill the pooled
