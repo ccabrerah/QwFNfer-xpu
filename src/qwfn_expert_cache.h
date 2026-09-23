@@ -85,6 +85,7 @@ struct expert_cache_stats {
     double   t_submit   = 0;    // building + submitting the reads
     double   t_promote  = 0;    // host->device copies warming the VRAM tier
     double   t_wait     = 0;    // blocked on completions
+    double   t_wait_spec = 0, t_wait_demand = 0;   // of t_wait: on in-flight speculative reads a fetch needs, on its demand reads
     uint64_t n_bursts   = 0;    // fetch_begin calls that issued at least one read
     uint64_t n_reads    = 0;    // individual io_uring reads issued
     uint64_t bytes_read = 0;

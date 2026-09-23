@@ -306,6 +306,10 @@ public:
     // Instrument: time layer `il`'s cached decode graph truncated after each node
     // (min of `reps` replays) and print the per-node deltas >= 8 us. Ends the session.
     void profile_layer_graph(uint32_t il, int reps = 10);
+    // Same prefix-timing applied to a live PREFILL chunk graph (QWFN_PF_PROFILE).
+    // Executes the graph O(n) times, so it corrupts engine state: measurement only.
+    void profile_prefill_graph(ggml_cgraph * gf, uint32_t il, int64_t Tc, int reps = 5);
+    bool pf_profiled_ = false;
     void profile_all_graphs();   // every cached decode graph replayed standalone (min of 10): the step's device time without the loop
     double t_replay_alloc = 0, t_replay_launch = 0, t_replay_wait = 0; uint64_t n_replay = 0;   // the cached decode graphs' replays, split
     uint64_t prefill_bytes_read()     const { return pf_.bytes_read; }       // expert bytes the streamed sweeps read
@@ -316,7 +320,17 @@ public:
 
     double t_prefill = 0, t_decode = 0, t_io = 0, t_warm = 0;
     double t_pf_graphA = 0, t_pf_moe = 0, t_pf_read = 0;   // where a layer-major prefill's time goes
+    double t_pf_zero = 0, t_pf_readback = 0, t_pf_sync = 0, t_pf_prefetch = 0, t_pf_head = 0;   // previously untimed prefill phases
+    double t_pf_attn_in = 0, t_pf_pos = 0;   // mask/indexer build and position upload, per chunk
+    double t_qsa_cellblk = 0, t_qsa_blkidx = 0, t_qsa_bias = 0, t_qsa_upload = 0;   // inside t_pf_attn_in
+    // graphA decomposition: build/run/free, and run split by layer type.
+    // gA_attn + gA_dn == gA_run (disjoint, covering). gA_ple OVERLAPS both.
+    double t_pf_gA_build = 0, t_pf_gA_run = 0, t_pf_gA_free = 0;
+    double t_pf_gA_attn = 0, t_pf_gA_dn = 0, t_pf_gA_ple = 0;
+    uint64_t n_pf_gA_attn = 0, n_pf_gA_dn = 0;
     double t_moe_gpu = 0, t_moe_cpu = 0, t_layerA = 0;   // where decode time goes
+    double t_readback = 0, t_prefetch = 0, t_settle_promo = 0, t_uploads = 0, t_head = 0;   // decode host work between the graphs
+    uint64_t n_upload_skip = 0;   // decode copies skipped because the device already held the zeros
     // The GPU MoE runs asynchronously, overlapped with the expert I/O wait and
     // the CPU MoE. t_moe_gpu then counts launch cost plus whatever the final
     // sync still had to wait -- t_moe_gpu_sync is that wait alone, and ~0 means

@@ -922,7 +922,7 @@ bool expert_cache::settle_pending(const uint32_t * expert_ids, uint32_t n, bool 
         if (ready) for (uint32_t i = 0; i < n; i++) if (expert_ids[i] == p.expert) ready[i] = true;
     }
     pending_.clear();
-    st_.t_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count();
+    { const double dw =  std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count(); st_.t_wait += dw; st_.t_wait_spec += dw; }
     return true;
 }
 
@@ -950,7 +950,7 @@ bool expert_cache::fetch_end() {
         const int32_t v = inflight_slots_[k];
         if (lp.slot_expert[v] == (uint16_t) inflight_experts_[k]) lp.slot_valid[v] = 1;
     }
-    st_.t_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count();
+    { const double dw =  std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count(); st_.t_wait += dw; st_.t_wait_demand += dw; }
     st_.bytes_read = io_hot_.stat_bytes + io_cold_.stat_bytes;
     return true;
 }
