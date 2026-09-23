@@ -24,7 +24,7 @@ else
 fi
 set +u; source "$ONEAPI" --force >/dev/null 2>&1; set -u
 cmake -S . -B build-sycl -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
-  -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL -DGGML_SYCL_DNN=ON -DGGML_SYCL_GRAPH=ON -DDNNL_DIR="$DNNL_DIR" \
+  -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL -DGGML_SYCL_F16=ON -DGGML_SYCL_DNN=ON -DGGML_SYCL_GRAPH=ON -DDNNL_DIR="$DNNL_DIR" \
   -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON -DLLAMA_CURL=OFF
 cmake --build build-sycl -j "$(nproc)" --target ggml llama test-backend-ops
 echo "built: $DIR/build-sycl/bin"
