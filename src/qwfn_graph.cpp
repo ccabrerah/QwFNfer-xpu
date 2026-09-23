@@ -735,7 +735,11 @@ void graph_builder::moe_route(ggml_tensor * cur, int il, ggml_tensor ** sel, ggm
 ggml_tensor * graph_builder::moe_route_predict(ggml_tensor * res_hc, int il_next, int k,
                                                ggml_tensor * head_w, ggml_tensor * head_b, ggml_tensor ** x_out,
                                                ggml_tensor ** scores_out) {
-    ggml_tensor * cur = hc_mix(res_hc, il_next, /*ffn=*/true, nullptr);
+    return moe_route_predict_x(hc_mix(res_hc, il_next, /*ffn=*/true, nullptr), il_next, k, head_w, head_b, x_out, scores_out);
+}
+
+ggml_tensor * graph_builder::moe_route_predict_x(ggml_tensor * cur, int il_next, int k, ggml_tensor * head_w, ggml_tensor * head_b,
+                                                 ggml_tensor ** x_out, ggml_tensor ** scores_out) {
     if (x_out) *x_out = cur;
     // A learned head (trained with qwfn-train-predictor; measured no better) replaces the
     // router matrix when given: same input, weights fine-tuned offline to the

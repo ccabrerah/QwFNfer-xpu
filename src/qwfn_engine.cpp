@@ -546,6 +546,11 @@ bool engine::init(const model_index * hot, const model_index * cold,
     // that layer's graph ran: the next graph computes them from the tier by
     // slot (at most max_promotions_per_layer of them), the "late fold".
     n_late_ = moe_in_graph_ ? (1 + MTP_MAX_DRAFTS) * (int) std::max<uint32_t>(1, ec_cfg.max_promotions_per_layer) : 0;   // room for a multi-token step's budget
+    // A decode step fetches each layer once, for the union of its positions, and that fetch promotes at
+    // most promote_per_layer * n_new experts (eval_decode sets the cap per step): a T-position step's fold
+    // never holds more than late_rows(T). At T = 1 that cuts the fold's three mul_mat_id from 8 experts to 2
+    // in every layer graph. QWFN_LATE_FULL=1 restores the full width.
+    n_late_per_pos_ = getenv("QWFN_LATE_FULL") ? n_late_ : (int) std::max<uint32_t>(1, ec_cfg.max_promotions_per_layer);
     // Before the tier sizes itself from the free VRAM: the heads' 123 MB must come out of the tier, not the decode reserve.
     if (!cfg.predictor_path.empty() && !load_predictor(cfg.predictor_path, err)) return false;
     if (!ec_.init(hot, cold, ec_cfg, err)) return false;
@@ -1852,10 +1857,11 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     // prompt's (a 27-token batch read 1 KB past the two-column tensors: garbage
     // ids and weights folded into every position, gibberish from the next turn on).
     auto late_fold = [&](ggml_context * c, uint32_t prev, ggml_tensor * pg) {
-        if (!decode || !moe_in_graph(prev) || n_late_ <= 0) return pg;
-        ggml_tensor * ids = ggml_view_2d(c, t_gids_, n_late_, T, t_gids_->nb[1], 0);
-        ggml_tensor * w   = ggml_view_3d(c, t_gw_, 1, n_late_, T, t_gw_->nb[1], t_gw_->nb[2], 0);
-        return ggml_add(c, pg, moe_id_graph(c, ec_.gpu_tier(prev), ids, w, t_cur_, n_embd, hp_.n_ff_exp, n_late_, T, /*fused_sum=*/true));
+        const int nl = late_rows(T);
+        if (!decode || !moe_in_graph(prev) || nl <= 0) return pg;
+        ggml_tensor * ids = ggml_view_2d(c, t_gids_, nl, T, t_gids_->nb[1], 0);
+        ggml_tensor * w   = ggml_view_3d(c, t_gw_, 1, nl, T, t_gw_->nb[1], t_gw_->nb[2], 0);
+        return ggml_add(c, pg, moe_id_graph(c, ec_.gpu_tier(prev), ids, w, t_cur_, n_embd, hp_.n_ff_exp, nl, T, /*fused_sum=*/true));
     };
 
     int sections[4] = { hp_.mrope_sections[0], hp_.mrope_sections[1],
@@ -2157,8 +2163,11 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 // QWFN_PREDICT_PLAIN=1 predicts from the bare residual for comparison.
                 static const bool predict_shared = getenv("QWFN_PREDICT_SHARED") != nullptr;
                 static const bool predict_plain  = getenv("QWFN_PREDICT_PLAIN") != nullptr;
+                // QWFN_PREDICT_CUR2=1: predict L+1's routing from this layer's own FFN-mix input through L+1's
+                // router, skipping the residual combine and L+1's hc_mix (not with the spec block).
+                static const bool predict_cur2 = getenv("QWFN_PREDICT_CUR2") != nullptr;
                 ggml_tensor * rp = r;
-                if (pg_here && !predict_plain) rp = gb.hc_combine(r, ggml_add(c, sh, pg_here), inject);
+                if (pg_here && !predict_plain && !predict_cur2) rp = gb.hc_combine(r, ggml_add(c, sh, pg_here), inject);
                 else if (predict_shared)        rp = gb.hc_combine(r, sh, inject);
                 // Speculative block (cfg spec_block): the residual predictor's
                 // remaining error is layer L+1's own block, which it cannot see.
@@ -2191,7 +2200,9 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 // the margin gate).
                 const int depth = (int) QWFN_SPEC_MAX;
                 ggml_tensor * xpred = nullptr, * scores = nullptr;
-                selnext = gb.moe_route_predict(rp, (int) iln, depth, pred_w(iln), pred_b(iln), &xpred, &scores);
+                selnext = predict_cur2 && !spec_blk
+                        ? gb.moe_route_predict_x(cur2, (int) iln, depth, pred_w(iln), pred_b(iln), &xpred, &scores)
+                        : gb.moe_route_predict(rp, (int) iln, depth, pred_w(iln), pred_b(iln), &xpred, &scores);
                 if (t_xdec_ && xpred)   // the head's input for layer il+1, kept for the decode dump
                     ggml_build_forward_expand(g, ggml_cpy(c, xpred, ggml_view_1d(c, t_xdec_, n_embd, (size_t) il * t_xdec_->nb[1])));
                 if (pack_ok) {   // into the readback pack (I32 -> F32 for the ids), see t_pack_
@@ -2522,7 +2533,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     // yet: their slots go up for the next graph's late fold,
                     // through pinned staging on the compute stream -- after the
                     // promotion copies, before the graph that reads them.
-                    if ((int) late_gpu.size() > n_late_) { fprintf(stderr, "[qwfn] %zu late experts, fold holds %d\n", late_gpu.size(), n_late_); abort(); }
+                    if ((int) late_gpu.size() > late_rows(T)) { fprintf(stderr, "[qwfn] %zu late experts, fold holds %d\n", late_gpu.size(), late_rows(T)); abort(); }
                     // Nothing late and the rows already zero on the device from an earlier layer:
                     // the fold reads the same zeros without two more copies.
                     static const bool upload_skip = getenv("QWFN_NO_UPLOAD_SKIP") == nullptr;
@@ -2611,9 +2622,10 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             // 71% of layers have no miss and keep the full window.
             // Measured on the replayed sequence: deferring costs more in
             // settle-wait at the next layer than it saves in demand-wait here
-            // (17.5/19.4 vs 19.2 tok/s), so early submission stays the default
-            // and QWFN_PREFETCH_DEFER=1 selects the deferred variant.
-            static const bool prefetch_early = getenv("QWFN_PREFETCH_DEFER") == nullptr;
+            // (17.5/19.4 vs 19.2 tok/s) under an older configuration. On the B70 stable config (no spec
+            // block) the deferred variant wins 3/3 pairs (-1.6 and -4.9 ms/token on the clean ones): it is
+            // the default here, and QWFN_PREFETCH_EARLY=1 selects early submission.
+            static const bool prefetch_early = getenv("QWFN_PREFETCH_EARLY") != nullptr;
             const bool had_miss = ec_.has_inflight();
 
             // VRAM-resident experts first: their kernels run behind everything

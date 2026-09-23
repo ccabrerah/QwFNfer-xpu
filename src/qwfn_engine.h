@@ -496,6 +496,8 @@ private:
     ggml_tensor *         p_vslot_ = nullptr, * p_vmask_ = nullptr;
     std::vector<uint64_t> vslot_ver_;
     int                   n_late_ = 0;   // slots of the late fold (experts promoted this token)
+    int                   n_late_per_pos_ = 0; // fold rows the graph reads per position of the step (see late_rows)
+    int late_rows(int64_t T) const { return (int) std::min<int64_t>(n_late_, (int64_t) n_late_per_pos_ * T); }
     int64_t               late_zero_rows_ = 0;         // leading rows of t_gids_/t_gw_ known zero on the device
     const ggml_tensor *   pc_zero_t_ = nullptr;        // t_pc_ whose leading pc_zero_rows_ rows are known zero
     int64_t               pc_zero_rows_ = 0;
