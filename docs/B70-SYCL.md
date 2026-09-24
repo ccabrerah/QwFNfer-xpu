@@ -47,6 +47,10 @@ and a long-context needle).
 | `09-q2_0-soa` | `GGML_TYPE_Q2_0_SOA`: a q2_0 slice stored as [16-byte code groups][fp16 scales], reordered on upload and back on download; the one-token wide MoE kernel and the fused GLU read it with aligned vector loads (bit-identical results); large batches dequantize | used when the engine asks for it (`QWFN_Q2_SOA=1`) |
 | `10-sparse-decode-attn` | the one-token sparse attention (gather the selected cells from the q8_0 cache, cast to f16, `FLASH_ATTN_EXT`) as one chunked online-softmax kernel reading the q8_0 rows directly, plus a merge | `GGML_SYCL_FUSE_SPARSE_DECODE=1` |
 | `11-hc-gate-in-k1` | the combine gate `scale(sigmoid(inj))` evaluated inside the patch-04 kernel instead of two launches | `GGML_SYCL_FUSE_HC_GATE=1` (with `GGML_SYCL_FUSE_HC`) |
+| `12-topk-moe-div-output` | the router fusion (softmax, top-k, gather, normalise) also matches when the caller keeps the normalised weights (the DIV) as an output | always (`GGML_SYCL_TOPK_DIV_OUT=0` for the old match) |
+| `13-topk-workgroup` | work-group-wide top-k: the router fusion with one lane per expert, and an argsort read only through its first-k view (the next-layer predictor) writes only those k | `GGML_SYCL_TOPK_WG=1` |
+| `14-hc-mix-fusions` | the hyper-connection mixer: SiLU as the one-token matvec's epilogue, and sigmoid·x → permute → stream mean as one kernel | `GGML_SYCL_FUSE_HC_MIX=1` |
+| `15-decode-fusions` | chains of 2-4 ADDs as one kernel; the MoE weighted sum reading the expert rows in place (no CONT); the one-token DeltaNet conv (concat, state update, conv, SiLU) as one kernel | `GGML_SYCL_FUSE_ADDCHAIN=1`, `GGML_SYCL_FUSE_MOESUM=1`, `GGML_SYCL_FUSE_CONV=1` |
 
 The measurements behind each are in the research repository's `docs/decode-fusion-plan.md`,
 `docs/hc-fusion-plan.md`, `docs/flash-attention-sycl.md` and `docs/outprod-the-real-bottleneck.md`.

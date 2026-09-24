@@ -21,6 +21,7 @@ measurements and the rejected alternatives.
 | `QWFN_Q2_SOA=1` | VRAM-tier q2_0 experts in the [codes][scales] layout (patch 09) | decode graph -18%, 40K held decode +20% |
 | `GGML_SYCL_FUSE_SPARSE_DECODE=1` | one-token sparse attention as one kernel on the q8_0 cache (patch 10) | decode graph -8.5% |
 | `GGML_SYCL_FUSE_HC_GATE=1` | the combine gate inside the combine + norm kernel (patch 11) | decode graph -1.5% |
+| `GGML_SYCL_TOPK_WG=1` `GGML_SYCL_FUSE_HC_MIX=1` `GGML_SYCL_FUSE_ADDCHAIN=1` `GGML_SYCL_FUSE_MOESUM=1` `GGML_SYCL_FUSE_CONV=1` | small-kernel fusions at decode (patches 12-15), bit-identical to the unfused ops | decode graph -8% (-2.0 ms/token), decode ~+5% |
 | `QWFN_VOCAB_MODEL=<stock head>` | tokenizer from the stock model (needed with an overlay) | - |
 | `QWFN_GGML_BACKENDS=<llama build>/bin` `QWFN_REQUIRE_GPU=1` | which ggml backends to load; fail rather than run on the CPU | - |
 
