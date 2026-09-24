@@ -31,7 +31,8 @@ Reference machine: Arc Pro B70 on PCIe 3.0 x16, Ryzen 7 5700 (8C/16T), 32 GB RAM
 
 Every change is off by default unless noted, so the patched tree behaves as upstream until a switch is set.
 `test-backend-ops` covers each (`-o MUL_MAT`, `-o MUL_MAT_ID`, `-o FLASH_ATTN_EXT`, `-o OUT_PROD`, and the
-`HC_COMBINE_NORM` case the series adds).
+`HC_COMBINE_NORM` case the series adds; patch 09 is checked against q2_0 op by op, and patch 10 by replay NLL
+and a long-context needle).
 
 | Patch | What | Switch |
 |---|---|---|
@@ -43,6 +44,9 @@ Every change is off by default unless noted, so the patched tree behaves as upst
 | `06-hc-fusion-decode` | the patch-04 fusion at decode sizes | `GGML_SYCL_FUSE_HC_DECODE=1` |
 | `07-moe-q2_0-wide` | q2_0 MoE matvec with one whole 64-weight block per lane | `GGML_SYCL_MOE_Q2W=1` |
 | `08-moe-q2_0-glu-fused` | fused q2_0 MoE gate + up + SwiGLU at one token (one quantize, one kernel) | with `GGML_SYCL_MOE_Q2W=1`; `GGML_SYCL_MOE_GLU_OFF=1` disables |
+| `09-q2_0-soa` | `GGML_TYPE_Q2_0_SOA`: a q2_0 slice stored as [16-byte code groups][fp16 scales], reordered on upload and back on download; the one-token wide MoE kernel and the fused GLU read it with aligned vector loads (bit-identical results); large batches dequantize | used when the engine asks for it (`QWFN_Q2_SOA=1`) |
+| `10-sparse-decode-attn` | the one-token sparse attention (gather the selected cells from the q8_0 cache, cast to f16, `FLASH_ATTN_EXT`) as one chunked online-softmax kernel reading the q8_0 rows directly, plus a merge | `GGML_SYCL_FUSE_SPARSE_DECODE=1` |
+| `11-hc-gate-in-k1` | the combine gate `scale(sigmoid(inj))` evaluated inside the patch-04 kernel instead of two launches | `GGML_SYCL_FUSE_HC_GATE=1` (with `GGML_SYCL_FUSE_HC`) |
 
 The measurements behind each are in the research repository's `docs/decode-fusion-plan.md`,
 `docs/hc-fusion-plan.md`, `docs/flash-attention-sycl.md` and `docs/outprod-the-real-bottleneck.md`.
