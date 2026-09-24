@@ -2060,10 +2060,13 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         // sparse-attention layers reshape with n_kv every token.
         const bool replayable = cfg_.reuse_graphs && decode && (!hp_.is_attn_layer(il) || use_qd);
         // An attention graph is shaped by its block bucket; a new bucket means a new graph.
-        // Readback pack (t_pack_): decode, one token, the GPU MoE in the graph so
+        // Readback pack (t_pack_): decode, the GPU MoE in the graph so
         // nothing on the device needs t_sel_/t_w_ afterwards. Decided here so the
         // build and the readback of a cached graph agree.
-        const bool pack_ok = t_pack_ && decode && T == 1 && moe_in_graph(il) && !legacy_moe && !check_moe;
+        // Any T up to the pack's room (a verify step): nothing on the device reads t_sel_/t_w_/t_selnext_/
+        // t_specscore_ after the layer graph, only the host does. QWFN_PACK_T1_ONLY=1: one-token steps only.
+        static const bool pack_t1_only = getenv("QWFN_PACK_T1_ONLY") != nullptr;
+        const bool pack_ok = t_pack_ && decode && (pack_t1_only ? T == 1 : T <= 1 + MTP_MAX_DRAFTS) && moe_in_graph(il) && !legacy_moe && !check_moe;
         // A graph that speculatively runs an attention successor's block is shaped by the bucket too.
         const bool spec_attn_next = cfg_.spec_block && decode && use_qd && il + 1 < hp_.n_layer
                                     && hp_.is_attn_layer(il + 1) && spec_block_mask_[il + 1];
