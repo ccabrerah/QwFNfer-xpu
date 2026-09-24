@@ -568,6 +568,11 @@ ggml_tensor * graph_builder::sparse_attn_decode(ggml_tensor * cur, ggml_tensor *
     ggml_build_forward_expand(gf_, kc_w);
     ggml_build_forward_expand(gf_, vc_w);
 
+    // Q and the mask go into the graph first, so the two gathers and the attention come out as nine consecutive
+    // nodes: the SYCL backend can then run them as one fused kernel (GGML_SYCL_FUSE_SPARSE_DECODE).
+    ggml_tensor * qp  = ggml_permute(ctx0, Q, 0, 2, 1, 3);                            // [hd, 1, nh]
+    ggml_build_forward_expand(gf_, qp);
+    ggml_build_forward_expand(gf_, mask);
     auto gather = [&](ggml_tensor * cache_w) {
         ggml_tensor * g = ggml_get_rows(ctx0, cache_w, cells);                        // F32 [kv_dim, NC]
         g = ggml_permute(ctx0, ggml_reshape_3d(ctx0, g, hd, nh_kv, NC), 0, 2, 1, 3);  // [hd, NC, nh_kv]
@@ -576,7 +581,6 @@ ggml_tensor * graph_builder::sparse_attn_decode(ggml_tensor * cur, ggml_tensor *
     ggml_tensor * Kg = gather(kc_w);
     ggml_tensor * Vg = gather(vc_w);
 
-    ggml_tensor * qp  = ggml_permute(ctx0, Q, 0, 2, 1, 3);                            // [hd, 1, nh]
     ggml_tensor * out = ggml_flash_attn_ext(ctx0, qp, Kg, Vg, mask, 1.0f / sqrtf((float) hd), 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
     out = ggml_reshape_2d(ctx0, out, hd * nh, 1);

@@ -486,6 +486,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
         ec_cfg.vram_backend = w_.backend();
     }
     ec_cfg.async_promote = getenv("QWFN_SYNC_PROMOTE") == nullptr;
+    ec_cfg.q2_soa = getenv("QWFN_Q2_SOA") != nullptr;   // the VRAM tier's q2_0 experts in the SOA layout (SYCL)
     ec_cfg.use_cold_tier = cfg.use_cold_tier;
     ec_cfg.max_promotions_per_layer = cfg.promote_per_layer;
     ec_cfg.ram_frac      = cfg.ram_frac;
