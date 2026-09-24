@@ -1155,12 +1155,14 @@ void engine::profile_layer_graph(uint32_t il, int reps) {
     std::vector<double> t(n + 1, 0.0);
     for (int k = 1; k <= n; k++) t[k] = time_prefix(k);
     int n_view = 0, n_small = 0; double t_small = 0, t_big = 0;
+    // QWFN_PROFILE_MIN_US: print nodes at or above this delta (default 8; 0 lists every node, views included)
+    static const double min_us = getenv("QWFN_PROFILE_MIN_US") ? atof(getenv("QWFN_PROFILE_MIN_US")) : 8.0;
     for (int k = 1; k <= n; k++) {
         const double d = (t[k] - t[k - 1]) * 1e6;
         const ggml_tensor * nd = gf->nodes[k - 1];
         const bool view = nd->op == GGML_OP_NONE || nd->op == GGML_OP_RESHAPE || nd->op == GGML_OP_VIEW || nd->op == GGML_OP_PERMUTE || nd->op == GGML_OP_TRANSPOSE;
         if (view) n_view++; else if (d < 8.0) { n_small++; t_small += d; } else t_big += d;
-        if (d >= 8.0)
+        if (d >= min_us)
             fprintf(stderr, "[profile]   %3d %-13s %-30s [%lld,%lld,%lld] src0=%-8s +%4.0f us  (cum %5.0f)\n", k, ggml_op_name(nd->op), nd->name,
                     (long long) nd->ne[0], (long long) nd->ne[1], (long long) nd->ne[2],
                     nd->src[0] ? ggml_type_name(nd->src[0]->type) : "-", d, t[k] * 1e6);
