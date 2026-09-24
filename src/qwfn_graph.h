@@ -110,8 +110,15 @@ public:
     // chain carries the caches as written by the first call so the second reads
     // through those writes (its block may contain the first position's key).
     struct qsa_chain { ggml_tensor * ic = nullptr, * kc = nullptr, * vc = nullptr, * pc = nullptr; };
+    // The projections of all T positions, computed once (each [dim, T]); a chained call takes its column
+    // `col` from them and returns its attention output before the output projection, which the caller then
+    // applies once to the T concatenated outputs. None of them reads the caches, so batching changes no order.
+    struct qsa_proj { ggml_tensor * k_raw = nullptr, * q_idx = nullptr, * qg = nullptr, * k = nullptr, * v = nullptr; int64_t col = 0; };
+    qsa_proj sparse_attn_decode_proj(ggml_tensor * cur, int il);
+    ggml_tensor * sparse_attn_decode_out(ggml_tensor * out, int il);   // the output projection of [hd*nh, T]
     ggml_tensor * sparse_attn_decode(ggml_tensor * cur, ggml_tensor * inp_pos, const int sections[4],
-                                     int il, const qsa_decode_inputs & qd, qsa_chain * chain = nullptr);
+                                     int il, const qsa_decode_inputs & qd, qsa_chain * chain = nullptr,
+                                     const qsa_proj * proj = nullptr);
 
     // Rollback snapshots for a two-token graph: the DeltaNet block keeps K=2
     // state snapshots and copies the one-token-back state into `rs`, the conv

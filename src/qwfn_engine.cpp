@@ -2121,17 +2121,23 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             auto attn_dec = [&](graph_builder & gbx, ggml_tensor * x, uint32_t l) -> ggml_tensor * {
                 qd_.pool_cache = pool_cache_[l];
                 if (T == 1) return gbx.sparse_attn_decode(x, vpos(c), sections, (int) l, qd_);
-                // T positions as T chained calls: each reads through the writes of the ones before.
+                // T positions as T chained calls: each reads through the writes of the ones before. The
+                // projections, which read no cache, run once for the T positions (QWFN_QSA_PROJ_EACH=1: per call).
+                static const bool proj_each = getenv("QWFN_QSA_PROJ_EACH") != nullptr;
                 graph_builder::qsa_chain ch;
+                graph_builder::qsa_proj pj;
+                if (!proj_each) pj = gbx.sparse_attn_decode_proj(x, (int) l);
                 ggml_tensor * out = nullptr;
                 for (int64_t k = 0; k < T; k++) {
                     qsa_decode_inputs & q = k == 0 ? qd_ : qdk_[k - 1];
                     q.pool_cache = pool_cache_[l];
+                    pj.col = k;
                     ggml_tensor * xk = ggml_view_2d(c, x, n_embd, 1, x->nb[1], (size_t) k * x->nb[1]);
-                    ggml_tensor * ok = gbx.sparse_attn_decode(xk, ggml_view_1d(c, inp_pos_one_, 4, (size_t) k * 4 * sizeof(int32_t)), sections, (int) l, q, &ch);
+                    ggml_tensor * ok = gbx.sparse_attn_decode(xk, ggml_view_1d(c, inp_pos_one_, 4, (size_t) k * 4 * sizeof(int32_t)), sections, (int) l, q, &ch,
+                                                              proj_each ? nullptr : &pj);
                     out = out ? ggml_concat(c, out, ok, 1) : ok;
                 }
-                return out;
+                return proj_each ? out : gbx.sparse_attn_decode_out(out, (int) l);
             };
 
             ggml_tensor * r = vres(c, cur_res);
