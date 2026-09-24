@@ -18,6 +18,7 @@ export GGML_SYCL_FA_ONEDNN=1 GGML_SYCL_ENABLE_MKL_FA=0          # oneDNN flash a
 export QWFN_DEV_MASK=1 QWFN_QSA_PACK=1 QWFN_LOCK_HOST=1          # prefill inputs on the device; locked host memory
 export GGML_SYCL_FUSE_HC=1 GGML_SYCL_FUSE_HC_DECODE=1            # hyper-connection combine+norm fusion
 export KMP_BLOCKTIME=0 GGML_SYCL_MMVW=1 GGML_SYCL_SMALLK=1 GGML_SYCL_MOE_Q2W=1 QWFN_PREDICT_CUR2=1   # decode
+export QWFN_Q2_SOA=1 GGML_SYCL_FUSE_SPARSE_DECODE=1 GGML_SYCL_FUSE_HC_GATE=1                         # decode (patches 09-11)
 exec "$HERE/build/qwfn-server" "$HEAD" \
     --ctx 131072 --kv q8_0 --vram 24 --ram 8 --batch 16384 --prefill-chunk 6144 --reserve 2048 --prefix-cache 3 \
     "$@"

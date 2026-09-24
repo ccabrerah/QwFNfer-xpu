@@ -18,6 +18,9 @@ measurements and the rejected alternatives.
 | `GGML_SYCL_SMALLK=1` | small-K f32 matmul without oneMKL's host cost | decode graph -4.9% |
 | `GGML_SYCL_MOE_Q2W=1` | wide q2_0 MoE matvec + fused gate/up/SwiGLU | decode graph -1.3%, -3% with the fused GLU |
 | `QWFN_PREDICT_CUR2=1` | cheaper next-layer expert prediction (prefetch only) | decode +4.7% |
+| `QWFN_Q2_SOA=1` | VRAM-tier q2_0 experts in the [codes][scales] layout (patch 09) | decode graph -18%, 40K held decode +20% |
+| `GGML_SYCL_FUSE_SPARSE_DECODE=1` | one-token sparse attention as one kernel on the q8_0 cache (patch 10) | decode graph -8.5% |
+| `GGML_SYCL_FUSE_HC_GATE=1` | the combine gate inside the combine + norm kernel (patch 11) | decode graph -1.5% |
 | `QWFN_VOCAB_MODEL=<stock head>` | tokenizer from the stock model (needed with an overlay) | - |
 | `QWFN_GGML_BACKENDS=<llama build>/bin` `QWFN_REQUIRE_GPU=1` | which ggml backends to load; fail rather than run on the CPU | - |
 
