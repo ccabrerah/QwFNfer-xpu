@@ -70,7 +70,10 @@ ggml_tensor * graph_builder::hc_mix_w(ggml_tensor * x, ggml_tensor * w_norm, ggm
 
     // Collapse the streams by their mean.
     ggml_tensor * mixed;
-    if (gpu_fuse_ && hc_mean_ && nt == 1) {
+    // Up to 4 positions (an MTP verify step) too: the reshape below is a plain [hc] x [hc, n_embd * nt] matmul,
+    // each position summed as at one token. QWFN_HC_MEAN_T1_ONLY=1: one position only (the adds otherwise).
+    static const bool mean_t1_only = getenv("QWFN_HC_MEAN_T1_ONLY") != nullptr;
+    if (gpu_fuse_ && hc_mean_ && (mean_t1_only ? nt == 1 : nt <= 4)) {
         // One matmul with the (1/hc) vector: two kernels instead of five. A
         // different summation order from the adds below, so GPU graphs only.
         ggml_tensor * gt = ggml_cont(ctx0, ggml_permute(ctx0, gated, 1, 0, 2, 3));   // [hc, n_embd, T]
