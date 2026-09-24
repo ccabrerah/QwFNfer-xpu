@@ -2072,7 +2072,10 @@ int main(int argc, char ** argv) {
                         {"cache_misses", c.misses}, {"cache_reads", c.n_reads}, {"cache_bytes_read", c.bytes_read},
                         {"cache_t_submit", c.t_submit}, {"cache_t_wait", c.t_wait}, {"cache_t_promote", c.t_promote},
                         {"cache_bursts", c.n_bursts}, {"cache_pf_wasted", c.pf_wasted},
-                        {"cache_t_wait_spec", c.t_wait_spec}, {"cache_t_wait_demand", c.t_wait_demand}}},
+                        {"cache_t_wait_spec", c.t_wait_spec}, {"cache_t_wait_demand", c.t_wait_demand},
+                        // the draft head (--mtp): whole head, its three parts, and the rollbacks of rejected drafts
+                        {"t_mtp", S.eng.t_mtp}, {"t_mtp_pre", S.eng.t_mtp_pre}, {"t_mtp_moe", S.eng.t_mtp_moe},
+                        {"t_mtp_post", S.eng.t_mtp_post}, {"t_rollback", S.eng.t_rollback}, {"n_rollback", S.eng.n_rollback}}},
             // cumulative layer-major prefill split: seconds, and expert bytes read from disk vs copied from the RAM tier
             {"prefill_split", {{"t_prefill", S.eng.t_prefill}, {"t_graph_a", S.eng.t_pf_graphA}, {"t_moe", S.eng.t_pf_moe},
                                {"t_read", S.eng.t_pf_read}, {"bytes_read", S.eng.prefill_bytes_read()},
