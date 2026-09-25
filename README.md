@@ -28,7 +28,7 @@ Against the first B70 enablement (2026-09-15: stock llama.cpp SYCL backend, Unsl
 | oneDNN flash attention for prefill | `GGML_SYCL_FA_ONEDNN` | 89K prefill 90-192 -> ~300 tok/s |
 | causal mask and sparse-attention bias built on the device | engine (`QWFN_DEV_MASK`, `QWFN_QSA_PACK`) | 89K prefill 361 -> 389 tok/s |
 | locked, driver-registered host memory for the RAM tier and prefill staging | engine (`QWFN_LOCK_HOST`) | 89K prefill 425 -> 482 tok/s |
-| fix: the prefill's sparse-attention selection no longer spends its slots on blocks after the query (backend-neutral; offered upstream) | engine | 118K prompt, 8 notes to list in order: 0-1/8 -> 8/8 placed right; chat-framed 38K NLL 1.58 -> 1.39; no speed cost |
+| fix: the prefill's sparse-attention selection no longer spends its slots on blocks after the query (backend-neutral; offered upstream) | engine | usable cells per query 823 -> 1,998 of 2,052 (40K); 118K prompt, 8 notes to list in order: 0-1/8 placed right in 5 of 5 runs without it, 8/8 in 7 of 7 with it; no speed cost |
 | dense overlay v2: Unsloth's bits for the tensors GSQ-RCO cut to 2 bits | `scripts/b70/build-overlay.sh` | natural-text NLL -0.034 (about 10x the run spread) |
 
 Every change is off by default in the patched ggml tree and checked with `test-backend-ops`; the details and the
