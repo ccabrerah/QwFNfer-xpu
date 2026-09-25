@@ -317,20 +317,25 @@ ggml_tensor * graph_builder::qsa_top_k(ggml_tensor * cur, ggml_tensor * inp_pos,
 // F16 anyway, so an F16 triangle would build and then abort at execution -- so the
 // triangle is F32 and is cast on the way into the F16 mask. It spans only the square,
 // so the temporary is ~16 MB at T=2048 rather than n_kv*T.
-// The QSA block bias, built on the device (QWFN_QSA_PACK). bias[b, i] is 0 when block b
-// lies wholly at or before query q = n_past_ + i -- (b+1)*r <= q+1 -- and 1e9 otherwise,
-// which forces the tail block and any later whole blocks into the selection (the causal
-// mask then removes their future cells). This equals the host fill exactly: its -inf
-// branch covers b >= n_kv/r, and with n_blocks = ceil(n_kv/r) the only such b is the
-// dead block, which it then overwrites with 1e9 -- as here, since (n_bid+1)*r > n_kv.
-// Every intermediate is an integer below 2^24 plus a half, so F32 is exact.
+// The QSA block bias, built on the device (QWFN_QSA_PACK). bias[b, i] for query
+// q = n_past_ + i is 0 when block b lies wholly at or before q -- (b+1)*r <= q+1 --, 1e9
+// for the block holding q (forced into the selection, as decode forces its tail), and
+// -1e9 for blocks wholly after q -- b*r > q -- so they never take a selection slot from
+// a past block (the causal mask would empty them anyway). This equals the host fill in
+// build_attn_inputs exactly. Every intermediate is an integer below 2^24 plus a half, so
+// F32 is exact.
 ggml_tensor * graph_builder::qsa_bias_dev(int64_t n_blocks, int64_t r, int64_t T) {
     ggml_tensor * col = ggml_arange(ctx0, 0.0f, (float) n_blocks, 1.0f);                     // b
     col = ggml_scale_bias(ctx0, col, (float) r, (float) r - 1.5f);                             // (b+1)*r - 1.5
     col = ggml_repeat_4d(ctx0, ggml_reshape_2d(ctx0, col, n_blocks, 1), n_blocks, T, 1, 1);
     ggml_tensor * q = ggml_arange(ctx0, (float) n_past_, (float) (n_past_ + T), 1.0f);         // q
     ggml_tensor * x = ggml_sub(ctx0, col, ggml_reshape_2d(ctx0, q, 1, T));                    // > 0 <=> (b+1)*r > q+1
-    return ggml_scale(ctx0, ggml_step(ctx0, x), 1e9f);
+    ggml_tensor * f = ggml_arange(ctx0, 0.0f, (float) n_blocks, 1.0f);                         // b
+    f = ggml_scale_bias(ctx0, f, (float) r, -0.5f);                                            // b*r - 0.5
+    f = ggml_repeat_4d(ctx0, ggml_reshape_2d(ctx0, f, n_blocks, 1), n_blocks, T, 1, 1);
+    f = ggml_sub(ctx0, f, ggml_reshape_2d(ctx0, q, 1, T));                                    // > 0 <=> b*r > q
+    return ggml_sub(ctx0, ggml_scale(ctx0, ggml_step(ctx0, x), 1e9f),
+                          ggml_scale(ctx0, ggml_step(ctx0, f), 2e9f));                        // 0 / 1e9 / 1e9 - 2e9
 }
 
 ggml_tensor * graph_builder::causal_mask_dev(int64_t n_kv, int64_t T) {

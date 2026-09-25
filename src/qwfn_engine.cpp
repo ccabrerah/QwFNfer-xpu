@@ -1046,8 +1046,10 @@ bool engine::build_attn_inputs(int64_t n_past_c, int64_t Tc, attn_inputs & ai, s
         const auto tq2 = std::chrono::steady_clock::now();
         t_qsa_cellblk += std::chrono::duration<double>(tq1 - tq0).count();
         t_qsa_blkidx  += std::chrono::duration<double>(tq2 - tq1).count();
-        // Row i: 0 for whole blocks before the tail, 1e9 from the tail block on
-        // (still whole), -inf for blocks past n_bid; the dead block gets 1e9.
+        // Row i (query q): 0 for whole blocks before the tail, 1e9 for the block holding q
+        // (whole or the dead one), -1e9 for blocks wholly after q, -inf for blocks past
+        // n_bid. A block after q must not be forced: in a prefill chunk it would take one
+        // of the selection's slots from a past block, and the causal mask empties it.
         const auto tq3 = std::chrono::steady_clock::now();
         for (int64_t i = 0; i < Tc; i++) {
             float * row = bi_p + i * n_blocks;
@@ -1057,6 +1059,8 @@ bool engine::build_attn_inputs(int64_t n_past_c, int64_t Tc, attn_inputs & ai, s
             std::fill(row + tail_b, row + n_bid, 1e9f);
             std::fill(row + n_bid, row + n_blocks, -INFINITY);
             if (have_dead) row[dead] = 1e9f;
+            for (int64_t b = tail_b; b < n_blocks; b++)
+                if (row[b] > 0.0f && b * (int64_t) ratio > q) row[b] = -1e9f;
         }
         const auto tq4 = std::chrono::steady_clock::now();
         t_qsa_bias += std::chrono::duration<double>(tq4 - tq3).count();
@@ -1946,6 +1950,9 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 bi[i * n_blocks + b] = (b >= n_bid) ? -INFINITY
                                      : (b * (int64_t) ratio >= tail ? 1e9f : 0.0f);
             if (have_dead) bi[i * n_blocks + dead] = 1e9f;
+            // blocks wholly after q are not forced (see build_attn_inputs)
+            for (int64_t b = tail / ratio; b < n_blocks; b++)
+                if (bi[i * n_blocks + b] > 0.0f && b * (int64_t) ratio > q) bi[i * n_blocks + b] = -1e9f;
         }
         ggml_backend_tensor_set(qsa.cell_blk,  cb.data(), 0, cb.size() * 4);
         ggml_backend_tensor_set(qsa.blk_cells, bc.data(), 0, bc.size() * 4);
