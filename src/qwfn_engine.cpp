@@ -1012,6 +1012,14 @@ bool engine::build_attn_inputs(int64_t n_past_c, int64_t Tc, attn_inputs & ai, s
             for (uint32_t k = 0; k < ratio; k++) bc[b * ratio + k] = (int32_t) (b * ratio + k);
             for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + b] = (int32_t) (b * ratio);
         }
+        // The partial tail block, if any: its real cells (the last one repeated) and position, as decode
+        // maps it. Left at zero it pointed at cell 0, and a query inside it -- the last 1-3 tokens of a chunk
+        // that ends mid-block -- could not attend to itself or the cells just before it.
+        if (n_bid < n_blocks) {
+            for (uint32_t k = 0; k < ratio; k++)
+                bc[n_bid * ratio + k] = (int32_t) std::min<int64_t>(n_bid * (int64_t) ratio + k, n_kv - 1);
+            for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + n_bid] = (int32_t) (n_bid * ratio);
+        }
         const auto tq4 = std::chrono::steady_clock::now();
         t_qsa_blkidx += std::chrono::duration<double>(tq4 - tq1).count();
         ggml_backend_tensor_set(qsa_packed, bc, 0, (bc_n + bp_n) * 4);
@@ -1042,6 +1050,14 @@ bool engine::build_attn_inputs(int64_t n_past_c, int64_t Tc, attn_inputs & ai, s
         for (int64_t b = 0; b < n_bid; b++) {
             for (uint32_t k = 0; k < ratio; k++) bc[b * ratio + k] = (int32_t) (b * ratio + k);
             for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + b] = (int32_t) (b * ratio);
+        }
+        // The partial tail block, if any: its real cells (the last one repeated) and position, as decode
+        // maps it. Left at zero it pointed at cell 0, and a query inside it -- the last 1-3 tokens of a chunk
+        // that ends mid-block -- could not attend to itself or the cells just before it.
+        if (n_bid < n_blocks) {
+            for (uint32_t k = 0; k < ratio; k++)
+                bc[n_bid * ratio + k] = (int32_t) std::min<int64_t>(n_bid * (int64_t) ratio + k, n_kv - 1);
+            for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + n_bid] = (int32_t) (n_bid * ratio);
         }
         const auto tq2 = std::chrono::steady_clock::now();
         t_qsa_cellblk += std::chrono::duration<double>(tq1 - tq0).count();
@@ -1942,6 +1958,14 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         for (int64_t b = 0; b < n_bid; b++) {
             for (uint32_t k = 0; k < ratio; k++) bc[b * ratio + k] = (int32_t) (b * ratio + k);
             for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + b] = (int32_t) (b * ratio);
+        }
+        // The partial tail block, if any: its real cells (the last one repeated) and position, as decode
+        // maps it. Left at zero it pointed at cell 0, and a query inside it -- the last 1-3 tokens of a chunk
+        // that ends mid-block -- could not attend to itself or the cells just before it.
+        if (n_bid < n_blocks) {
+            for (uint32_t k = 0; k < ratio; k++)
+                bc[n_bid * ratio + k] = (int32_t) std::min<int64_t>(n_bid * (int64_t) ratio + k, n_kv - 1);
+            for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + n_bid] = (int32_t) (n_bid * ratio);
         }
         for (int64_t i = 0; i < T; i++) {
             const int64_t q = n_past + i;
