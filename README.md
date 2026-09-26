@@ -35,7 +35,8 @@ Against the first B70 enablement (2026-09-15: stock llama.cpp SYCL backend, Unsl
 | dense overlay v2: Unsloth's bits for the tensors GSQ-RCO cut to 2 bits | `scripts/b70/build-overlay.sh` | natural-text NLL -0.034 (about 10x the run spread) |
 
 Every change is off by default in the patched ggml tree and checked with `test-backend-ops`; the details and the
-rejected alternatives are in [`docs/B70-SYCL.md`](docs/B70-SYCL.md) and [`docs/B70-config.md`](docs/B70-config.md).
+rejected alternatives are in [`docs/B70-SYCL.md`](docs/B70-SYCL.md) and [`docs/B70-config.md`](docs/B70-config.md), and
+everything tried so far (adopted, rejected, and ideas not yet tried) in [`docs/B70-registry.md`](docs/B70-registry.md).
 
 ## Preferred config
 

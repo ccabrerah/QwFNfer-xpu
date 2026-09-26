@@ -59,6 +59,8 @@ The measurements behind each are in the research repository's `docs/decode-fusio
 
 ## What not to turn on, and why
 
+The short list; the full record of what was tried (and what is left to try) is [`B70-registry.md`](B70-registry.md).
+
 | Setting | Measured effect |
 |---|---|
 | `--spec-block` | Slower: the duplicate block per layer costs more GPU time than its better expert prediction saves in I/O. |
