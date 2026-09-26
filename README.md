@@ -12,7 +12,8 @@ and its OpenAI and Anthropic APIs) works as upstream documents it.
 Against the first B70 enablement (2026-09-15: stock llama.cpp SYCL backend, Unsloth UD-Q3_K_XL, no switches):
 **15-16 tok/s warm chat and 222-248 tok/s prefill at 21K**. Now, with the validated run configuration below, at a
 110 W power cap: **29-31 tok/s short-prompt decode, 27 tok/s decode at 40K context, 430-450 tok/s prefill at
-20-40K, ~386 tok/s at 89K**.
+20-40K, ~386 tok/s at 89K**. The [preferred config](#preferred-config) (overlay v3) spends some of that on quality:
+**23-26 tok/s short-prompt decode** at a natural-text NLL of 1.51, against 2.02 for the validated overlay.
 
 | Change | Where | Measured effect |
 |---|---|---|
@@ -40,15 +41,18 @@ rejected alternatives are in [`docs/B70-SYCL.md`](docs/B70-SYCL.md) and [`docs/B
 
 **Overlay v3 with vision**: the heaviest overlay this card runs at a usable speed. It is the validated
 configuration below with more bits where the stock quantization is thinnest: expert down and the dense tensors.
-Same build, flags and launcher, a different head. It gives up decode speed. Measured against v2 in one session
-on the hardware below, two server starts per overlay:
+Same build, flags and launcher, a different head. Its IQ4_NL expert down runs through patch 17's kernel
+(`QWFN_IQ4_SOA`), which cuts v3's GPU time per decode token by 12%. On the hardware below:
 
 | | v2 (validated config) | v3 (preferred) |
 |---|---|---|
-| decode, short prompt | 24-32 tok/s | 18-21 tok/s |
-| prefill at 20K / 40K / 89K | 514 / 522 / 416-431 tok/s | 454 / 482 / 401-408 tok/s |
+| decode, short prompt, current build (two runs each) | 23-30 tok/s | 23-26 tok/s |
+| prefill at 20K / 40K / 89K, one session before patches 16-17 | 514 / 522 / 416-431 tok/s | 454 / 482 / 401-408 tok/s |
 | expert blocks resident in VRAM | 67% | 51% |
 | 89K needle / 118K prompt, 8 notes recalled | correct / 7 of 8 | correct / 7 of 8 |
+
+Decode varies with the start as well: how fast missed experts come off the NVMe differs between server starts
+(7-13 ms per token on this drive), which moves decode by up to ~13%.
 
 **Weights.** v2, plus from Unsloth's UD-Q3_K_XL:
 - expert down at IQ4_NL on the 43 layers v2 leaves at Q2_0 (+20.3 GB);
@@ -122,6 +126,7 @@ QWFN_B70_HEAD=<overlay dir>/v2/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00006.gg
 | fusions | `GGML_SYCL_FUSE_HC=1 GGML_SYCL_FUSE_HC_DECODE=1 GGML_SYCL_FUSE_HC_GATE=1 GGML_SYCL_FUSE_SPARSE_DECODE=1 GGML_SYCL_TOPK_WG=1 GGML_SYCL_FUSE_HC_MIX=1 GGML_SYCL_FUSE_ADDCHAIN=1 GGML_SYCL_FUSE_MOESUM=1 GGML_SYCL_FUSE_CONV=1` |
 | decode | `KMP_BLOCKTIME=0 GGML_SYCL_MMVW=1 GGML_SYCL_SMALLK=1 GGML_SYCL_MOE_Q2W=1 QWFN_PREDICT_CUR2=1 QWFN_Q2_SOA=1 QWFN_IQ4_SOA=1` |
 | host | memlock unlimited (`LimitMEMLOCK=infinity` under systemd) for `QWFN_LOCK_HOST`; a writable `$HOME` so the GPU compiler cache persists (the first request after a new build compiles the kernels) |
+| compute runtime | recommended: `NEOReadDebugKeys=1 EnableSharedSystemUsmSupport=0`. By default the runtime may route GPU copies from ordinary host memory through the kernel's shared virtual memory (xe SVM, device-private pages); a process killed in the middle of such a copy can leave the xe driver unable to unbind. Measured at no cost for this engine (interleaved starts, decode and prefill unchanged) |
 
 What not to turn on, and why (`--spec-block`, `--mtp`, `--batch 32768`, `--vram` above 24): see
 [`docs/B70-SYCL.md`](docs/B70-SYCL.md).
