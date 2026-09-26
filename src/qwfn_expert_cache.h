@@ -119,6 +119,9 @@ public:
         // Hand the VRAM tier's q2_0 parts to the kernels as GGML_TYPE_Q2_0_SOA (codes and scales in separate
         // aligned arrays; the backend reorders on upload). Taken only when the backend supports it.
         bool q2_soa = false;
+        // The same for the iq4_nl parts (GGML_TYPE_IQ4_NL_SOA, ggml-sycl patch 17): an iq4_nl block has q2_0's byte
+        // structure, so it takes the same layout. Taken only when the backend supports it.
+        bool iq4_soa = false;
         // Extra device bytes appended to the tier that the prefill streamer
         // borrows as its staging. During decode they hold expert slots like
         // the rest of the tier (the layers whose slots fall in that tail are
@@ -354,9 +357,16 @@ private:
     // Copy one host block into a device slot, evicting the coldest if needed.
     bool promote(layer_pool & lp, uint32_t expert_id, const uint8_t * host_block);
     void fill_gpu_handle(const layer_pool & lp, uint32_t gslot, expert_handle & h) const;
-    // The type the VRAM tier presents a part as: Q2_0_SOA for q2_0 when q2_soa is on.
-    ggml_type gpu_type(ggml_type t) const { return q2_soa_ && t == GGML_TYPE_Q2_0 ? GGML_TYPE_Q2_0_SOA : t; }
+    // The type the VRAM tier presents a part as: Q2_0_SOA for q2_0 when q2_soa is on, IQ4_NL_SOA for iq4_nl when
+    // iq4_soa is on.
+    ggml_type gpu_type(ggml_type t) const {
+        if (q2_soa_  && t == GGML_TYPE_Q2_0)   return GGML_TYPE_Q2_0_SOA;
+        if (iq4_soa_ && t == GGML_TYPE_IQ4_NL) return GGML_TYPE_IQ4_NL_SOA;
+        return t;
+    }
+    static bool is_soa(ggml_type t) { return t == GGML_TYPE_Q2_0_SOA || t == GGML_TYPE_IQ4_NL_SOA; }
     bool      q2_soa_ = false;
+    bool      iq4_soa_ = false;
 
     int32_t  find_slot(layer_pool & lp, uint32_t expert_id) const;
     // Slots referenced by the fetch() call in progress. Every handle it has
