@@ -23,6 +23,7 @@ Against the first B70 enablement (2026-09-15: stock llama.cpp SYCL backend, Unsl
 | wide q2_0 MoE matvec + fused gate/up/SwiGLU | patches 07-08 (`GGML_SYCL_MOE_Q2W`) | decode layer graphs -4% |
 | hyper-connection combine + norm (and its gate) as one kernel | patches 04, 06, 11 | decode layer graphs -2.3%; with the device-built inputs, 89K prefill -14% |
 | small-kernel fusions: router top-k, hyper-connection mixer, ADD chains, MoE weighted sum, DeltaNet conv | patches 12-15 | decode layer graphs -8% (~300 fewer kernels per token), decode ~+5% |
+| the prefill sparse-attention indexer's per-head score sum as one kernel | patch 16 (`GGML_SYCL_FUSE_IDX`) | attention -10% at 89K (78 -> 70 s), -1.8 s at 40K; bit-identical |
 | OpenMP pool stops spinning next to the launch thread | `KMP_BLOCKTIME=0` | decode +5% |
 | next-layer expert prediction from the FFN input | engine (`QWFN_PREDICT_CUR2`) | decode +4.7% |
 | oneDNN flash attention for prefill | `GGML_SYCL_FA_ONEDNN` | 89K prefill 90-192 -> ~300 tok/s |
@@ -84,7 +85,7 @@ Linux 7.1 with the xe driver, oneAPI 2026.0, oneDNN built for SYCL. GPU power ca
 | dense overlay v2 (+5.7 GB) | attention, shared-expert and `ssm_out` tensors at Q5_K/Q6_K/Q8_0, `token_embd` Q8_0, `output` Q6_K, expert down Q8_0 on layers 2, 4, 30, 46, 47, layer-2 expert gate/up IQ3_XXS: fetched by HTTP range from [Unsloth's](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) UD-Q2_K_XL and UD-Q3_K_XL ([`docs/dense-overlay.md`](docs/dense-overlay.md)) |
 | vision (optional) | `mmproj-Qwen3.8-Flash-Next-BF16.gguf` |
 
-**Build.** llama.cpp `bbdd9f2` + `patches/ggml-sycl/01-15`, then the engine against it:
+**Build.** llama.cpp `bbdd9f2` + `patches/ggml-sycl/01-16`, then the engine against it:
 
 ```sh
 scripts/b70/build-llama-sycl.sh ~/src/llama-b70
@@ -107,7 +108,7 @@ QWFN_B70_HEAD=<overlay dir>/v2/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00006.gg
 | server flags | `--ctx 131072 --kv q8_0 --vram 24 --ram 8 --batch 16384 --prefill-chunk 6144 --reserve 2048 --prefix-cache 3` |
 | backend | `QWFN_GGML_BACKENDS=<llama>/build-sycl/bin QWFN_REQUIRE_GPU=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1 SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1` |
 | tokenizer | `QWFN_VOCAB_MODEL=<GSQ-RCO dir>/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf` (needed with the overlay head) |
-| prefill | `GGML_SYCL_FA_ONEDNN=1 GGML_SYCL_ENABLE_MKL_FA=0 QWFN_DEV_MASK=1 QWFN_QSA_PACK=1 QWFN_LOCK_HOST=1` |
+| prefill | `GGML_SYCL_FA_ONEDNN=1 GGML_SYCL_ENABLE_MKL_FA=0 QWFN_DEV_MASK=1 QWFN_QSA_PACK=1 QWFN_LOCK_HOST=1 GGML_SYCL_FUSE_IDX=1` |
 | fusions | `GGML_SYCL_FUSE_HC=1 GGML_SYCL_FUSE_HC_DECODE=1 GGML_SYCL_FUSE_HC_GATE=1 GGML_SYCL_FUSE_SPARSE_DECODE=1 GGML_SYCL_TOPK_WG=1 GGML_SYCL_FUSE_HC_MIX=1 GGML_SYCL_FUSE_ADDCHAIN=1 GGML_SYCL_FUSE_MOESUM=1 GGML_SYCL_FUSE_CONV=1` |
 | decode | `KMP_BLOCKTIME=0 GGML_SYCL_MMVW=1 GGML_SYCL_SMALLK=1 GGML_SYCL_MOE_Q2W=1 QWFN_PREDICT_CUR2=1 QWFN_Q2_SOA=1` |
 | host | memlock unlimited (`LimitMEMLOCK=infinity` under systemd) for `QWFN_LOCK_HOST`; a writable `$HOME` so the GPU compiler cache persists (the first request after a new build compiles the kernels) |

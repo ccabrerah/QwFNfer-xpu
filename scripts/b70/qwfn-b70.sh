@@ -16,6 +16,7 @@ export QWFN_GGML_BACKENDS=$LLAMA/build-sycl/bin QWFN_REQUIRE_GPU=1 QWFN_VOCAB_MO
 export ONEAPI_DEVICE_SELECTOR=level_zero:0 UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1 SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
 export GGML_SYCL_FA_ONEDNN=1 GGML_SYCL_ENABLE_MKL_FA=0          # oneDNN flash attention
 export QWFN_DEV_MASK=1 QWFN_QSA_PACK=1 QWFN_LOCK_HOST=1          # prefill inputs on the device; locked host memory
+export GGML_SYCL_FUSE_IDX=1                                      # prefill: the sparse-attention indexer's head sum as one kernel (patch 16)
 export GGML_SYCL_FUSE_HC=1 GGML_SYCL_FUSE_HC_DECODE=1            # hyper-connection combine+norm fusion
 export KMP_BLOCKTIME=0 GGML_SYCL_MMVW=1 GGML_SYCL_SMALLK=1 GGML_SYCL_MOE_Q2W=1 QWFN_PREDICT_CUR2=1   # decode
 export QWFN_Q2_SOA=1 GGML_SYCL_FUSE_SPARSE_DECODE=1 GGML_SYCL_FUSE_HC_GATE=1                         # decode (patches 09-11)

@@ -51,6 +51,7 @@ and a long-context needle).
 | `13-topk-workgroup` | work-group-wide top-k: the router fusion with one lane per expert, and an argsort read only through its first-k view (the next-layer predictor) writes only those k | `GGML_SYCL_TOPK_WG=1` |
 | `14-hc-mix-fusions` | the hyper-connection mixer: SiLU as the one-token matvec's epilogue, and sigmoid·x → permute → stream mean as one kernel | `GGML_SYCL_FUSE_HC_MIX=1` |
 | `15-decode-fusions` | chains of 2-4 ADDs as one kernel; the MoE weighted sum reading the expert rows in place (no CONT); the one-token DeltaNet conv (concat, state update, conv, SiLU) as one kernel | `GGML_SYCL_FUSE_ADDCHAIN=1`, `GGML_SYCL_FUSE_MOESUM=1`, `GGML_SYCL_FUSE_CONV=1` |
+| `16-indexer-head-sum` | the sparse-attention indexer's per-head score sum at prefill (relu, permute, copy, sum_rows over 4 heads) as one kernel that reads the scores once, summing in sum_rows' own order (bit-identical) | `GGML_SYCL_FUSE_IDX=1` |
 
 The measurements behind each are in the research repository's `docs/decode-fusion-plan.md`,
 `docs/hc-fusion-plan.md`, `docs/flash-attention-sycl.md` and `docs/outprod-the-real-bottleneck.md`.
