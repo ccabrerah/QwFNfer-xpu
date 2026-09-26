@@ -34,9 +34,44 @@ Against the first B70 enablement (2026-09-15: stock llama.cpp SYCL backend, Unsl
 Every change is off by default in the patched ggml tree and checked with `test-backend-ops`; the details and the
 rejected alternatives are in [`docs/B70-SYCL.md`](docs/B70-SYCL.md) and [`docs/B70-config.md`](docs/B70-config.md).
 
+## Preferred config
+
+**Overlay v3 with vision**: the best-quality weights this card runs at a usable speed. It is the validated
+configuration below with a heavier overlay: the same build, flags and launcher, a different head. It gives up
+decode speed for quality. Measured against v2 in one session on the hardware below, two server starts per
+overlay:
+
+| | v2 (validated config) | v3 (preferred) |
+|---|---|---|
+| natural-text NLL (1,024 tokens after an 8K prompt; lower is better) | 1.48-1.50 | **1.39-1.44** |
+| decode, short prompt | 24-32 tok/s | 18-21 tok/s |
+| prefill at 20K / 40K / 89K | 514 / 522 / 416-431 tok/s | 454 / 482 / 401-408 tok/s |
+| expert blocks resident in VRAM | 67% | 51% |
+| 89K needle / 118K prompt, 8 notes recalled | correct / 7 of 8 | correct / 7 of 8 |
+
+**Weights.** v2, plus from Unsloth's UD-Q3_K_XL:
+- expert down at IQ4_NL on the 43 layers v2 leaves at Q2_0 (+20.3 GB);
+- the attention, shared-expert gate/up and `ssm_out` tensors at Q8_0 instead of Q5_K/Q6_K (+3.0 GB).
+
+Expert gate/up stay Q2_0. Vision is the BF16 `mmproj`. That is 96 GB on disk, or 82 GB after pruning the
+14 GB of the stock first shard that v3 shadows (which also retires v1/v2).
+
+```sh
+scripts/b70/build-overlay.sh <GSQ-RCO dir> <overlay dir> v3
+# optional: drop the shadowed tensors from the stock first shard (v1/v2 heads stop working)
+python3 tools/overlay/shard_prune.py <overlay dir>/v3 <GSQ-RCO dir>/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf pruned.gguf \
+  && mv pruned.gguf <GSQ-RCO dir>/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf
+
+QWFN_B70_LLAMA=~/src/llama-b70 QWFN_B70_GSQ=<GSQ-RCO dir> \
+QWFN_B70_HEAD=<overlay dir>/v3/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00007.gguf \
+  scripts/b70/qwfn-b70.sh --mmproj <GSQ-RCO dir>/mmproj-Qwen3.8-Flash-Next-BF16.gguf
+```
+
+For the fastest decode, use v2 (below).
+
 ## Validated run configuration
 
-The configuration every number above was measured with, and the one to start from.
+The configuration every number above was measured with (overlay v2), and the base the preferred config builds on.
 
 **Hardware and system.** Arc Pro B70 (32 GB) on PCIe 3.0 x16, Ryzen 7 5700 (8C/16T), 32 GB RAM, NVMe Gen3 x4;
 Linux 7.1 with the xe driver, oneAPI 2026.0, oneDNN built for SYCL. GPU power cap 110 W (140-160 W is ~6% faster).
