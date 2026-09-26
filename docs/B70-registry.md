@@ -46,20 +46,33 @@ patch in detail in [`B70-SYCL.md`](B70-SYCL.md).
 | F16 / Q8_0 experts; MXFP4, Q5_0, Q3_K | slow or too big here | MXFP4: see ideas (its lookup is the same emulated permute) |
 | Level Zero knobs (counter-based events, single-thread mode, in-order lists) | no change: layer-graph time is device-side | — |
 
+## Where decode time goes (preferred config, 2026-09-26)
+
+Short-prompt warm decode on the reference machine, ~40 ms/token (~25 tok/s), from the server's `/stats` decode
+split (`tools/perf/decab.py`):
+
+| part | ms/token | what it is |
+|---|---:|---|
+| layer graphs on the GPU | ~26 | dense matvecs (Q8_0 in overlay v3: ~7.4), bf16 hyper-connection matvecs (~5.5, at bandwidth), GPU experts (IQ4_NL down ~1.5, Q2_0 gate/up ~1.3), attention, DeltaNet, ~5,000 small kernels |
+| expert I/O | ~7.6 (7-13 between starts) | waiting for missed experts read from the NVMe (~4 misses/token; 51% of expert blocks fit in VRAM) |
+| host | ~6.5 | CPU-computed experts (~7/token), routing readback, promotions |
+
 ## Ideas -- not yet tried
 
-Ranked by expected gain. When one is tried, move it to a table above.
+Ranked by expected gain for the preferred config per effort. When one is tried, move it to a table above.
+Effort: S = a kernel or a switch, M = a few days, L = a week or more.
 
-| Idea | Expected | First step |
-|---|---|---|
-| Find the start-to-start expert-read variance | up to ~13% decode on some starts | per start: io_uring depth reached, submit/complete CPUs vs NVMe interrupts, compressed extents on the model files |
-| Patch 17's local-memory table for other table types (MXFP4, IQ4_XS) | MXFP4/IQ4_XS kernels several times faster; upstreamable | port the lookup, bench against the CPU with a 64-matmul graph |
-| Expert residency for overlay v3 (51% VRAM coverage) | the largest remaining decode lever on v3 | frequency-weighted VRAM tier; misses/token at 20-100K |
-| Q8_0 dense matvec (~67% of bandwidth) | ~3-4% decode on v3 | a wide-load kernel like `mmvw` |
-| Prefill upload overlap on a dedicated copy engine | ~8-15% prefill | route uploads to a separate copy engine; keep the graph's small copies off that queue |
-| GSQ-RCO IQ3_S (3.50 bpw) as a base model | quality/speed between v3 and a full Q4 | NLL through the decode path + decode speed vs v3 |
-| XMX grouped MoE kernel past 20 TFLOP/s | a few seconds per 40K prefill | tile and SLM layout profile |
-| Deterministic greedy decode on v3 | reproducibility | find the op whose result varies between runs |
-| hc mixer weights in q8_0 (bf16 matvecs are at bandwidth) | ~2-3 ms/token | overlay + NLL |
-| One graph per token (instead of 48 per-layer graphs) | launch overhead | large: needs the expert residency decided before the token |
-| Router top-k over a work-group; radix top-k for the predictor | ~0.5-1 ms/token each | small kernels |
+| Idea | Expected | Effort | Helps the preferred config | First step |
+|---|---|---|---|---|
+| Expert residency for overlay v3 | the largest decode lever: expert I/O and most of the host time | M-L | yes | frequency-weighted VRAM tier; misses/token at 20-100K first |
+| Find the start-to-start expert-read variance | up to ~13% decode on some starts; cleaner comparisons | M | yes | per start: io_uring depth reached, submit/complete CPUs vs NVMe interrupts, compressed extents on the model files |
+| Q8_0 dense matvec (~67% of bandwidth) | ~3-4% decode | S-M | yes | a wide-load kernel like `mmvw` |
+| Prefill upload overlap on a dedicated copy engine | ~8-15% prefill | M | yes | route uploads to a separate copy engine; keep the graph's small copies off that queue |
+| hc mixer weights in q8_0 (bf16 matvecs are at bandwidth) | ~2-3 ms/token | M | yes | overlay + NLL |
+| Router top-k over a work-group; radix top-k for the predictor | ~0.5-1 ms/token each | S | yes | small kernels |
+| Prefill DeltaNet | a few % prefill | M | yes | per-kernel profile at 40K |
+| XMX grouped MoE kernel past 20 TFLOP/s | a few seconds per 40K prefill | L | yes | tile and SLM layout profile |
+| GSQ-RCO IQ3_S (3.50 bpw) as a base model | quality/speed vs v3 unknown | M | maybe | NLL through the decode path + decode speed vs v3 |
+| Deterministic greedy decode on v3 | reproducibility | M | hygiene | find the op whose result varies between runs |
+| One graph per token (instead of 48 per-layer graphs) | launch overhead | L | yes | needs the expert residency decided before the token |
+| Patch 17's local-memory table for MXFP4 / IQ4_XS | several-x faster kernels for those types; upstreamable | S-M | no (v3 uses neither) | port the lookup, bench against the CPU with a 64-matmul graph |
