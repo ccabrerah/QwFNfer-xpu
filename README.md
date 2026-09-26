@@ -23,6 +23,7 @@ Against the first B70 enablement (2026-09-15: stock llama.cpp SYCL backend, Unsl
 | wide q2_0 MoE matvec + fused gate/up/SwiGLU | patches 07-08 (`GGML_SYCL_MOE_Q2W`) | decode layer graphs -4% |
 | hyper-connection combine + norm (and its gate) as one kernel | patches 04, 06, 11 | decode layer graphs -2.3%; with the device-built inputs, 89K prefill -14% |
 | small-kernel fusions: router top-k, hyper-connection mixer, ADD chains, MoE weighted sum, DeltaNet conv | patches 12-15 | decode layer graphs -8% (~300 fewer kernels per token), decode ~+5% |
+| IQ4_NL experts in an aligned layout, decoded through a local-memory table (overlay v3's expert down) | patch 17 + engine (`QWFN_IQ4_SOA`) | one-token IQ4_NL MoE matvec 2.75x; v3 decode graph -12% |
 | the prefill sparse-attention indexer's per-head score sum as one kernel | patch 16 (`GGML_SYCL_FUSE_IDX`) | attention -10% at 89K (78 -> 70 s), -1.8 s at 40K; bit-identical |
 | OpenMP pool stops spinning next to the launch thread | `KMP_BLOCKTIME=0` | decode +5% |
 | next-layer expert prediction from the FFN input | engine (`QWFN_PREDICT_CUR2`) | decode +4.7% |
@@ -56,10 +57,15 @@ on the hardware below, two server starts per overlay:
 Expert gate/up stay Q2_0. Vision is the BF16 `mmproj`. That is 96 GB on disk, or 82 GB after pruning the
 14 GB of the stock first shard that v3 shadows (which also retires v1/v2).
 
-Quality: v3's natural-text NLL (1,024 tokens after an 8K prompt) is 1.46-1.49 over six server starts on the
-current engine. v2 has not been re-measured since the prefill sparse-attention fix. Before that fix, both overlays'
-NLL scattered between starts by more than their difference, so v3's edge over v2 is expected from the bits but not
-yet measured.
+Quality, as natural-text NLL over 1,024 tokens after an 8K prompt (lower is better):
+
+| | v2 | v3 |
+|---|---|---|
+| the text through the decode path, token by token (the reference) | 2.02 | **1.51** |
+| prompt prefill, then the 1,024 tokens decoded | 2.00-2.03 | **1.46-1.49** |
+
+The two paths agree, which is what the prefill sparse-attention fix (in the table above) is for. Before that fix,
+prefill disagreed with decode and v2's prefill number came out near 1.5.
 
 ```sh
 scripts/b70/build-overlay.sh <GSQ-RCO dir> <overlay dir> v3
@@ -89,7 +95,7 @@ Linux 7.1 with the xe driver, oneAPI 2026.0, oneDNN built for SYCL. GPU power ca
 | dense overlay v2 (+5.7 GB) | attention, shared-expert and `ssm_out` tensors at Q5_K/Q6_K/Q8_0, `token_embd` Q8_0, `output` Q6_K, expert down Q8_0 on layers 2, 4, 30, 46, 47, layer-2 expert gate/up IQ3_XXS: fetched by HTTP range from [Unsloth's](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) UD-Q2_K_XL and UD-Q3_K_XL ([`docs/dense-overlay.md`](docs/dense-overlay.md)) |
 | vision (optional) | `mmproj-Qwen3.8-Flash-Next-BF16.gguf` |
 
-**Build.** llama.cpp `bbdd9f2` + `patches/ggml-sycl/01-16`, then the engine against it:
+**Build.** llama.cpp `bbdd9f2` + `patches/ggml-sycl/01-17`, then the engine against it:
 
 ```sh
 scripts/b70/build-llama-sycl.sh ~/src/llama-b70
@@ -114,7 +120,7 @@ QWFN_B70_HEAD=<overlay dir>/v2/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00006.gg
 | tokenizer | `QWFN_VOCAB_MODEL=<GSQ-RCO dir>/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf` (needed with the overlay head) |
 | prefill | `GGML_SYCL_FA_ONEDNN=1 GGML_SYCL_ENABLE_MKL_FA=0 QWFN_DEV_MASK=1 QWFN_QSA_PACK=1 QWFN_LOCK_HOST=1 GGML_SYCL_FUSE_IDX=1` |
 | fusions | `GGML_SYCL_FUSE_HC=1 GGML_SYCL_FUSE_HC_DECODE=1 GGML_SYCL_FUSE_HC_GATE=1 GGML_SYCL_FUSE_SPARSE_DECODE=1 GGML_SYCL_TOPK_WG=1 GGML_SYCL_FUSE_HC_MIX=1 GGML_SYCL_FUSE_ADDCHAIN=1 GGML_SYCL_FUSE_MOESUM=1 GGML_SYCL_FUSE_CONV=1` |
-| decode | `KMP_BLOCKTIME=0 GGML_SYCL_MMVW=1 GGML_SYCL_SMALLK=1 GGML_SYCL_MOE_Q2W=1 QWFN_PREDICT_CUR2=1 QWFN_Q2_SOA=1` |
+| decode | `KMP_BLOCKTIME=0 GGML_SYCL_MMVW=1 GGML_SYCL_SMALLK=1 GGML_SYCL_MOE_Q2W=1 QWFN_PREDICT_CUR2=1 QWFN_Q2_SOA=1 QWFN_IQ4_SOA=1` |
 | host | memlock unlimited (`LimitMEMLOCK=infinity` under systemd) for `QWFN_LOCK_HOST`; a writable `$HOME` so the GPU compiler cache persists (the first request after a new build compiles the kernels) |
 
 What not to turn on, and why (`--spec-block`, `--mtp`, `--batch 32768`, `--vram` above 24): see
