@@ -59,12 +59,6 @@ The measurements behind each are in the research repository's `docs/decode-fusio
 
 ## What not to turn on, and why
 
-The short list; the full record of what was tried (and what is left to try) is [`B70-registry.md`](B70-registry.md).
-
-| Setting | Measured effect |
-|---|---|
-| `--spec-block` | Slower: the duplicate block per layer costs more GPU time than its better expert prediction saves in I/O. |
-| `--mtp` (draft head) | 15-25% slower than plain on the current stack: 79-92% of drafts are accepted, but a draft + verify step costs 2.1-2.4x a plain step (the verify step falls off the one-token kernels and the head runs its experts on the CPU). |
-| `--batch 32768` | The prefill borrows too much of the expert tier: decode right after drops sharply. 16384 is the setting. |
-| `--vram` above 24 | Leaves under 2 GB of VRAM after a long document; the host needs ~1.5 GB free to stay clear of the driver's VRAM-to-RAM eviction. |
-| Power cap below 140 W | 140 W costs ~6% prefill and decode; 130 W ~13-15%. |
+The settings measured and rejected on this card (`--spec-block`, `--mtp`, `--batch` other than 16384, `--vram`
+above 24, power caps below 140 W, and more), each with its measurement and when to revisit it, are in
+[`B70-registry.md`](B70-registry.md).

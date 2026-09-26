@@ -2,7 +2,7 @@
 
 What has been tried for speed and quality on the Arc Pro B70, what it measured, and what is left to try. The point
 is to avoid re-running dead ends: **before retrying a rejected item, check its "revisit when" column.** The patch
-series itself is described in [`B70-SYCL.md`](B70-SYCL.md), the run configuration in [`B70-config.md`](B70-config.md).
+series is described in [`B70-SYCL.md`](B70-SYCL.md), the run configuration in the README.
 
 Measurement notes that apply throughout:
 
@@ -19,25 +19,8 @@ Last updated: 2026-09-26.
 
 ## Adopted
 
-| Change | Measured | Where |
-|---|---|---|
-| q2_0 experts stored as [codes][scales] per slice | decode layer graphs -18%, 40K decode +20% | patch 09, `QWFN_Q2_SOA` |
-| Wide-load bf16/f16 one-token matvec | decode +23% | patch 05, `GGML_SYCL_MMVW` |
-| One-token sparse attention as one kernel over the q8_0 cache | decode layer graphs -8.5% | patch 10 |
-| Small-K f32 matmul without oneMKL's per-call host cost | decode layer graphs -4.9% | patch 05, `GGML_SYCL_SMALLK` |
-| Wide q2_0 MoE matvec, fused gate/up/SwiGLU | decode layer graphs -4% | patches 07-08 |
-| Hyper-connection combine + norm (+ its gate) as one kernel | decode -2.3%; 89K prefill -14% with the device-built inputs | patches 04, 06, 11 |
-| Small-kernel fusions (router top-k, hc mixer, ADD chains, MoE weighted sum, DeltaNet conv) | decode ~+5% | patches 12-15 |
-| Prefill indexer head sum as one kernel | prefill attention -10% at 40-89K; bit-identical | patch 16 |
-| **IQ4_NL experts as [codes][scales], decoded through a local-memory table** | one-token IQ4_NL MoE matvec 2.75x; overlay v3 decode graph -12% | patch 17, `QWFN_IQ4_SOA` |
-| OpenMP pool not spinning next to the launch thread | decode +5% | `KMP_BLOCKTIME=0` |
-| Next-layer expert prediction from the FFN input | decode +4.7% | `QWFN_PREDICT_CUR2` |
-| oneDNN flash attention for prefill | 89K prefill 90-192 -> ~300 tok/s | `GGML_SYCL_FA_ONEDNN` |
-| Causal mask and sparse-attention bias built on the device | 89K prefill 361 -> 389 tok/s | `QWFN_DEV_MASK`, `QWFN_QSA_PACK` |
-| Locked, driver-registered host memory for the RAM tier and staging | 89K prefill 425 -> 482 tok/s | `QWFN_LOCK_HOST` |
-| Prefill sparse-attention selection fix (no slots on blocks after the query; the partial tail block's own cells) | usable cells/query 823 -> 1,998 at 40K; prefill NLL now agrees with decode | engine |
-| Dense overlay v2, then **overlay v3** (the preferred config) | v3 NLL 1.51 vs v2 2.02 (decode path) | `scripts/b70/build-overlay.sh` |
-| Shared System USM off (`NEOReadDebugKeys=1 EnableSharedSystemUsmSupport=0`) | no measured cost; removes the kernel SVM path for host copies | host environment (README) |
+Everything adopted is in the README's **Major improvements** table (what, where, measured effect); each ggml
+patch in detail in [`B70-SYCL.md`](B70-SYCL.md).
 
 ## Tried and rejected
 
@@ -49,6 +32,7 @@ Last updated: 2026-09-26.
 | `--batch 8192` / `4096` | prefill -19% / -24%; each halving doubles the passes over the expert set | only if VRAM is needed elsewhere |
 | `--batch 24576` | +3-5% prefill with v2, decode unaffected; not adopted yet | re-measure decode after a long prefill with v3 (51% VRAM coverage) |
 | Power cap below 140 W | 140 W -6%, 130 W -13-15% | — |
+| `--vram` above 24 | leaves under 2 GB of VRAM after a long document; the host needs ~1.5 GB free to stay clear of the driver's VRAM-to-RAM eviction | a card with more VRAM |
 | Rank-counting argsort (one barrier instead of bitonic stages) | +4% decode graph time | a top-k that reads each value once |
 | Grouped oneMKL `gemm_batch` for the prefill MoE | no faster than per-expert GEMMs; prefill unchanged | — |
 | Grouped XMX MUL_MAT_ID kernel (joint_matrix, one launch over all experts) | correct, +3% prefill at 40K; the kernel plateaus near 20 TFLOP/s | the kernel gets well past that |

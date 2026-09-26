@@ -5,16 +5,16 @@ that far. An overlay puts those tensors back at the bits Unsloth uses, without c
 metadata head with `split.count` raised, the replacement GGUFs, then the stock shards as symlinks. The engine
 keeps the **first** tensor of a name across shards, so the replacements win.
 
-`scripts/b70/build-overlay.sh GSQ_DIR OUT_DIR [v1|v2]` fetches the replacement tensors from
+`scripts/b70/build-overlay.sh GSQ_DIR OUT_DIR [v1|v2|v3]` fetches the replacement tensors from
 `unsloth/Qwen3.8-Flash-Next-GGUF` by HTTP range (`tools/overlay/gguf_fetch.py`, only those tensors' bytes)
 and assembles the head (`gguf-requant meta`). Run the server on the new head with
 `QWFN_VOCAB_MODEL=<stock head shard>`: llama.cpp's split loader, which reads the tokenizer, rejects shards
 that carry no `split.no`.
 
-| Overlay | Tensors | Size | Measured |
-|---|---|---:|---|
-| v1 | attention and shared-expert gate/up at Q5_K, `ssm_out` at Q6_K (from UD-Q2_K_XL) | +2.0 GB on disk, +565 MB dense core | replay NLL -1.2%, no speed cost |
-| v2 = v1 + | shared-expert down Q8_0 on all 48 layers, layer-1 `ple_key` Q8_0, layer-2 expert gate/up IQ3_XXS (UD-Q2_K_XL); `token_embd` Q8_0, `output` Q6_K, expert down Q8_0 on layers 2, 4, 30, 46, 47 (UD-Q3_K_XL) | +5.7 GB on disk, dense core 4.00 -> 4.15 GB | natural-text NLL -0.034 (about 10x the run spread); warm decode -7%, prefill -8% (20K) to -2% (100K) |
+What each overlay contains and what it measured: v2 in the README's validated run configuration, v3 in its
+preferred config. v1, the base of both, is attention and shared-expert gate/up at Q5_K and `ssm_out` at Q6_K from
+UD-Q2_K_XL (replay NLL -1.2%, no speed cost). With v3, `tools/overlay/shard_prune.py` can drop the 14 GB of the
+stock first shard that v3 shadows (see the README).
 
 v2's cost is its heavier per-token reads (Q8_0 expert down on five layers, Q8_0 shared-expert down on all,
 Q6_K output), not the expert tier: the VRAM tier holds 16437 instead of 17328 blocks, but the share of
