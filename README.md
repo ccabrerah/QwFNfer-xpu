@@ -37,14 +37,13 @@ rejected alternatives are in [`docs/B70-SYCL.md`](docs/B70-SYCL.md) and [`docs/B
 
 ## Preferred config
 
-**Overlay v3 with vision**: the best-quality weights this card runs at a usable speed. It is the validated
-configuration below with a heavier overlay: the same build, flags and launcher, a different head. It gives up
-decode speed for quality. Measured against v2 in one session on the hardware below, two server starts per
-overlay:
+**Overlay v3 with vision**: the heaviest overlay this card runs at a usable speed. It is the validated
+configuration below with more bits where the stock quantization is thinnest: expert down and the dense tensors.
+Same build, flags and launcher, a different head. It gives up decode speed. Measured against v2 in one session
+on the hardware below, two server starts per overlay:
 
 | | v2 (validated config) | v3 (preferred) |
 |---|---|---|
-| natural-text NLL (1,024 tokens after an 8K prompt; lower is better) | 1.48-1.50 | **1.39-1.44** |
 | decode, short prompt | 24-32 tok/s | 18-21 tok/s |
 | prefill at 20K / 40K / 89K | 514 / 522 / 416-431 tok/s | 454 / 482 / 401-408 tok/s |
 | expert blocks resident in VRAM | 67% | 51% |
@@ -56,6 +55,11 @@ overlay:
 
 Expert gate/up stay Q2_0. Vision is the BF16 `mmproj`. That is 96 GB on disk, or 82 GB after pruning the
 14 GB of the stock first shard that v3 shadows (which also retires v1/v2).
+
+Quality: v3's natural-text NLL (1,024 tokens after an 8K prompt) is 1.46-1.49 over six server starts on the
+current engine. v2 has not been re-measured since the prefill sparse-attention fix. Before that fix, both overlays'
+NLL scattered between starts by more than their difference, so v3's edge over v2 is expected from the bits but not
+yet measured.
 
 ```sh
 scripts/b70/build-overlay.sh <GSQ-RCO dir> <overlay dir> v3
