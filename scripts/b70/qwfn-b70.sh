@@ -25,6 +25,15 @@ export GGML_SYCL_Q8W=1                                                          
 export GGML_SYCL_Q8_REUSE=1 GGML_SYCL_Q8_DIRECT=1                                                    # one-token Q8_0: q8_1 input reused, direct dispatch (patches 19-20)
 export GGML_SYCL_Q8_EPILOGUE=1                                                                       # Q8_0 MUL_MAT -> [SCALE ->] SILU as one launch (patch 21; overlay v4's mixers)
 export GGML_SYCL_TOPK_WG=1 GGML_SYCL_FUSE_HC_MIX=1 GGML_SYCL_FUSE_ADDCHAIN=1 GGML_SYCL_FUSE_MOESUM=1 GGML_SYCL_FUSE_CONV=1   # decode fusions (patches 12-15)
+# The MTP draft head (docs/B70-config.md, "MTP"): QWFN_B70_MTP = the head (its experts in Q2_0, all on the device),
+# QWFN_B70_DRAFT_VOCAB = the token ids it may draft (optional). One draft per step, no layer-0 prefetch pass, and the
+# expert tier one GB smaller for the head.
+MTP=()
+if [ -n "${QWFN_B70_MTP:-}" ]; then
+  export QWFN_MTP_EXPERTS_VRAM=1 QWFN_NO_SPEC_L0=1
+  [ -n "${QWFN_B70_DRAFT_VOCAB:-}" ] && export QWFN_MTP_DRAFT_VOCAB=$QWFN_B70_DRAFT_VOCAB
+  MTP=(--vram 24 --mtp "$QWFN_B70_MTP" --mtp-drafts 1)
+fi
 exec "$HERE/build/qwfn-server" "$HEAD" \
     --ctx 131072 --kv q8_0 --vram 25 --ram 8 --batch 16384 --prefill-chunk 6144 --reserve 2048 --prefix-cache 3 \
-    "$@"
+    "${MTP[@]}" "$@"
