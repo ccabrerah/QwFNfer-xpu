@@ -2084,7 +2084,8 @@ int main(int argc, char ** argv) {
                         // the draft head (--mtp): whole head, its three parts, and the rollbacks of rejected drafts
                         {"t_mtp", S.eng.t_mtp}, {"t_mtp_pre", S.eng.t_mtp_pre}, {"t_mtp_moe", S.eng.t_mtp_moe},
                         {"t_mtp_post", S.eng.t_mtp_post}, {"t_rollback", S.eng.t_rollback}, {"n_rollback", S.eng.n_rollback},
-                        {"t_spec_l0", S.eng.t_spec_l0}, {"n_spec_l0", S.eng.n_spec_l0}}},
+                        {"t_spec_l0", S.eng.t_spec_l0}, {"n_spec_l0", S.eng.n_spec_l0},
+                        {"graph_a_mb", S.eng.graph_a_mb}, {"graph_a_n", S.eng.graph_a_n}}},
             // cumulative layer-major prefill split: seconds, and expert bytes read from disk vs copied from the RAM tier
             {"prefill_split", {{"t_prefill", S.eng.t_prefill}, {"t_graph_a", S.eng.t_pf_graphA}, {"t_moe", S.eng.t_pf_moe},
                                {"t_read", S.eng.t_pf_read}, {"bytes_read", S.eng.prefill_bytes_read()},

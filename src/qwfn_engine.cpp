@@ -598,6 +598,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
     gA_.assign(hp_.n_layer, layer_graph{});
     gA_bucket_.assign(hp_.n_layer, -1);
     if (!getenv("QWFN_NO_GRAPH_STASH")) gA_stash_.assign(2 + MTP_MAX_DRAFTS, std::vector<stashed_graph>(hp_.n_layer));
+    gA_stash_budget_ = (size_t) (getenv("QWFN_GRAPH_STASH_MB") ? atol(getenv("QWFN_GRAPH_STASH_MB")) : 256) << 20;
     gM_.assign(hp_.n_layer, moe_graph{});
     if (getenv("QWFN_VRAM_AUDIT")) {
         // Every device buffer the engine holds at the end of init, and what the
@@ -1372,6 +1373,7 @@ void engine::free_graph_stash() {
             if (s.g.ctx) ggml_free(s.g.ctx);
             s = stashed_graph{};
         }
+    gA_stash_bytes_ = 0;
 }
 
 void engine::graph_buffer_bytes(size_t & a_bytes, int & a_graphs, size_t & m_bytes, int & m_graphs) const {
@@ -2095,13 +2097,26 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             const size_t told = gA_T_[il];
             if (gA_[il].gf && told >= 1 && told < gA_stash_.size()) {
                 stashed_graph & s = gA_stash_[told][il];
+                if (s.g.gf) gA_stash_bytes_ -= graph_bytes(s.g);
                 if (s.g.ga)  ggml_gallocr_free(s.g.ga);
                 if (s.g.ctx) ggml_free(s.g.ctx);
-                s = stashed_graph{ gA_[il], gA_bucket_[il], gA_pack_[il] };
-                gA_[il] = layer_graph{};
+                s = stashed_graph{};
+                const size_t sz = graph_bytes(gA_[il]);
+                if (gA_stash_bytes_ + sz <= gA_stash_budget_) {   // parked, else freed below as before
+                    s = stashed_graph{ gA_[il], gA_bucket_[il], gA_pack_[il] };
+                    gA_stash_bytes_ += sz;
+                    gA_[il] = layer_graph{};
+                } else if (!gA_stash_full_logged_) {
+                    gA_stash_full_logged_ = true;
+                    fprintf(stderr, "[qwfn] graph stash full: %.0f MB parked, a %.1f MB graph (layer %u, T=%zu) not kept\n",
+                            gA_stash_bytes_ / 1048576.0, sz / 1048576.0, il, told);
+                }
             }
             if (T >= 1 && (size_t) T < gA_stash_.size() && gA_stash_[T][il].g.gf) {
                 stashed_graph & r = gA_stash_[T][il];
+                if (gA_[il].ga)  ggml_gallocr_free(gA_[il].ga);   // a graph the budget did not park
+                if (gA_[il].ctx) ggml_free(gA_[il].ctx);
+                gA_stash_bytes_ -= graph_bytes(r.g);
                 gA_[il] = r.g; gA_bucket_[il] = r.bucket; gA_pack_[il] = r.pack; gA_T_[il] = (uint8_t) T;
                 r = stashed_graph{};
             }
@@ -3329,6 +3344,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
 
     const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (decode) { t_decode += dt; n_decode += T; } else { t_prefill += dt; n_prefill += T; }
+    { size_t ab, mb; int ag, mg; graph_buffer_bytes(ab, ag, mb, mg); graph_a_mb = ab / 1048576.0; graph_a_n = ag; }   // engine thread: /stats reads the copy
     return true;
 }
 

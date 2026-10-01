@@ -340,6 +340,7 @@ public:
     std::string memory_summary() const;
 
     double t_prefill = 0, t_decode = 0, t_io = 0, t_warm = 0;
+    double graph_a_mb = 0; int graph_a_n = 0;   // layer-graph compute buffers (cached + parked), as of the last eval; for /stats
     double t_pf_graphA = 0, t_pf_moe = 0, t_pf_read = 0;   // where a layer-major prefill's time goes
     double t_pf_zero = 0, t_pf_readback = 0, t_pf_sync = 0, t_pf_prefetch = 0, t_pf_head = 0;   // previously untimed prefill phases
     double t_pf_attn_in = 0, t_pf_pos = 0;   // mask/indexer build and position upload, per chunk
@@ -437,7 +438,10 @@ private:
     // that T comes back; index [T][layer], T = 1..1 + MTP_MAX_DRAFTS. QWFN_NO_GRAPH_STASH=1: the old rebuild.
     struct stashed_graph { layer_graph g; int64_t bucket = -1; uint8_t pack = 0; };
     std::vector<std::vector<stashed_graph>> gA_stash_;
+    size_t gA_stash_bytes_ = 0, gA_stash_budget_ = 0;   // their compute buffers; QWFN_GRAPH_STASH_MB (default 256)
+    bool   gA_stash_full_logged_ = false;
     void free_graph_stash();
+    static size_t graph_bytes(const layer_graph & g) { return g.ga ? ggml_gallocr_get_buffer_size(g.ga, 0) : 0; }
 
     // Decode-time sparse attention state; see graph_builder::sparse_attn_decode.
     // Per attention layer a cache of pooled block keys; shared static tables,
