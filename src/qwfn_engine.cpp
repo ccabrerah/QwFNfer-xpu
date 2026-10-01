@@ -59,6 +59,10 @@ engine::~engine() {
     if (scr_ctx_) ggml_free(scr_ctx_);
     if (dbuf_) ggml_backend_buffer_free(dbuf_);
     if (dctx_) ggml_free(dctx_);
+    if (mbuf_) ggml_backend_buffer_free(mbuf_);     // the draft head's work sets
+    if (mctx_) ggml_free(mctx_);
+    if (mhbuf_) ggml_backend_buffer_free(mhbuf_);
+    if (mhctx_) ggml_free(mhctx_);
     if (wctx_) ggml_free(wctx_);
     if (hctx_) ggml_free(hctx_);
 }
