@@ -232,10 +232,9 @@ int main(int argc, char ** argv) {
     }
     // Tail slack: qwfn's prefill reader rounds each expert range up to the I/O alignment, which runs
     // past the end of a file whose last tensor is an expert tensor (a short read, reported as an error).
+    if (err_mode) { printf("err mode: no file written\n"); return 0; }   // no output file to pad
     std::vector<uint8_t> tail(1u << 20, 0);
     fwrite(tail.data(), 1, tail.size(), fo);
-
-    if (err_mode) { printf("err mode: no file written\n"); return 0; }
 
     std::vector<uint8_t> meta(meta_size);
     gguf_get_meta_data(gout, meta.data());
