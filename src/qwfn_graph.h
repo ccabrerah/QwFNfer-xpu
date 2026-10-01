@@ -115,8 +115,12 @@ public:
     // The projections of all T positions, computed once (each [dim, T]); a chained call takes its column
     // `col` from them and returns its attention output before the output projection, which the caller then
     // applies once to the T concatenated outputs. None of them reads the caches, so batching changes no order.
-    struct qsa_proj { ggml_tensor * k_raw = nullptr, * q_idx = nullptr, * qg = nullptr, * k = nullptr, * v = nullptr; int64_t col = 0; };
-    qsa_proj sparse_attn_decode_proj(ggml_tensor * cur, int il);
+    // The projections of a verify step's T positions, run once. With inp_pos (the step's T positions, section-major)
+    // the work that reads no cache is batched too: the indexer query, Q and K normed and roped, the attention gate's
+    // sigmoid; sparse_attn_decode then takes column `col` of each and leaves the gate to the caller (gate_sig).
+    struct qsa_proj { ggml_tensor * k_raw = nullptr, * q_idx = nullptr, * qg = nullptr, * k = nullptr, * v = nullptr; int64_t col = 0;
+                      ggml_tensor * qi_n = nullptr, * Q_n = nullptr, * K_n = nullptr, * gate_sig = nullptr; };
+    qsa_proj sparse_attn_decode_proj(ggml_tensor * cur, int il, ggml_tensor * inp_pos = nullptr, const int sections[4] = nullptr);
     ggml_tensor * sparse_attn_decode_out(ggml_tensor * out, int il);   // the output projection of [hd*nh, T]
     ggml_tensor * sparse_attn_decode(ggml_tensor * cur, ggml_tensor * inp_pos, const int sections[4],
                                      int il, const qsa_decode_inputs & qd, qsa_chain * chain = nullptr,

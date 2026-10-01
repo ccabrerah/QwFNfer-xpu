@@ -2210,9 +2210,11 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 // T positions as T chained calls: each reads through the writes of the ones before. The
                 // projections, which read no cache, run once for the T positions (QWFN_QSA_PROJ_EACH=1: per call).
                 static const bool proj_each = getenv("QWFN_QSA_PROJ_EACH") != nullptr;
+                static const bool batch_each = getenv("QWFN_QSA_BATCH_EACH") != nullptr;   // norms/rope/gate per position again
                 graph_builder::qsa_chain ch;
                 graph_builder::qsa_proj pj;
-                if (!proj_each) pj = gbx.sparse_attn_decode_proj(x, (int) l);
+                if (!proj_each) pj = batch_each ? gbx.sparse_attn_decode_proj(x, (int) l)
+                                                : gbx.sparse_attn_decode_proj(x, (int) l, vpos(c), sections);
                 ggml_tensor * out = nullptr;
                 for (int64_t k = 0; k < T; k++) {
                     qsa_decode_inputs & q = k == 0 ? qd_ : qdk_[k - 1];
@@ -2223,6 +2225,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                                                               proj_each ? nullptr : &pj);
                     out = out ? ggml_concat(c, out, ok, 1) : ok;
                 }
+                if (pj.gate_sig) out = ggml_mul(c, out, pj.gate_sig);   // the T positions' gates at once
                 return proj_each ? out : gbx.sparse_attn_decode_out(out, (int) l);
             };
 

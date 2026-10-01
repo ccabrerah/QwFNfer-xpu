@@ -496,13 +496,30 @@ void graph_builder::qsa_pool_rebuild(int il, const qsa_decode_inputs & qd, int64
             ggml_view_2d(ctx0, qd.pool_cache, idx_dim, n_whole, qd.pool_cache->nb[1], 0)));
 }
 
-graph_builder::qsa_proj graph_builder::sparse_attn_decode_proj(ggml_tensor * cur, int il) {
+graph_builder::qsa_proj graph_builder::sparse_attn_decode_proj(ggml_tensor * cur, int il, ggml_tensor * inp_pos,
+                                                                const int sections[4]) {
     qsa_proj p;
     p.k_raw = ggml_mul_mat(ctx0, Wl(il, "indexer.k_proj.weight"), cur);   // [128, T]
     p.q_idx = ggml_mul_mat(ctx0, Wl(il, "indexer.q_proj.weight"), cur);   // [512, T]
     p.qg    = ggml_mul_mat(ctx0, Wl(il, "attn_q.weight"), cur);           // [2*hd*nh, T]
     p.k     = ggml_mul_mat(ctx0, Wl(il, "attn_k.weight"), cur);           // [kv_dim, T]
     p.v     = ggml_mul_mat(ctx0, Wl(il, "attn_v.weight"), cur);           // [kv_dim, T]
+    if (!inp_pos) return p;
+    // Row-wise norms and per-token rope: the same values as the one-position calls, in one kernel each.
+    const int64_t T = cur->ne[1], hd = hp_->n_embd_head_k, nh = hp_->n_head, nh_kv = hp_->n_head_kv;
+    const int64_t idx_dim = hp_->idx_key_len, n_idx_h = hp_->idx_n_head;
+    int secs[4] = { sections[0], sections[1], sections[2], sections[3] };
+    auto rope = [&](ggml_tensor * x) {
+        return ggml_rope_multi(ctx0, x, inp_pos, nullptr, hp_->rope_dim, secs, GGML_ROPE_TYPE_IMROPE,
+                               hp_->n_ctx_train, hp_->rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    };
+    p.qi_n = rope(rms(ggml_reshape_3d(ctx0, p.q_idx, idx_dim, n_idx_h, T), Wl(il, "indexer.q_norm.weight")));   // [128, 4, T]
+    const size_t es = ggml_element_size(p.qg);
+    ggml_tensor * Q = ggml_view_3d(ctx0, p.qg, hd, nh, T, es * hd * 2, p.qg->nb[1], 0);
+    p.Q_n = rope(rms(Q, Wl(il, "attn_q_norm.weight")));                                                     // [hd, nh, T]
+    ggml_tensor * gate = ggml_view_3d(ctx0, p.qg, hd, nh, T, es * hd * 2, p.qg->nb[1], es * hd);
+    p.gate_sig = ggml_sigmoid(ctx0, ggml_cont_2d(ctx0, gate, hd * nh, T));                                // [hd*nh, T]
+    p.K_n = rope(rms(ggml_reshape_3d(ctx0, p.k, hd, nh_kv, T), Wl(il, "attn_k_norm.weight")));            // [hd, nh_kv, T]
     return p;
 }
 
@@ -545,12 +562,22 @@ ggml_tensor * graph_builder::sparse_attn_decode(ggml_tensor * cur, ggml_tensor *
     ggml_build_forward_expand(gf_, pc_w);
 
     // ---- scores over the bucket, top blocks -> cells ----------------------
-    ggml_tensor * q = project(proj ? proj->q_idx : nullptr, "indexer.q_proj.weight");   // [512, 1]
-    q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, 1);
-    q = rms(q, Wl(il, "indexer.q_norm.weight"));
-    q = ggml_rope_multi(ctx0, q, inp_pos, nullptr, hp_->rope_dim, secs,
-                        GGML_ROPE_TYPE_IMROPE, hp_->n_ctx_train, hp_->rope_freq_base,
-                        1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    // a column (position `col`) of a batched [a, b, T] tensor, as [a, b, 1]
+    auto col3 = [&](ggml_tensor * t) {
+        return ggml_view_3d(ctx0, t, t->ne[0], t->ne[1], 1, t->nb[1], t->nb[2], (size_t) proj->col * t->nb[2]);
+    };
+    const bool batched = proj && proj->qi_n;
+    ggml_tensor * q;
+    if (batched) {
+        q = col3(proj->qi_n);
+    } else {
+        q = project(proj ? proj->q_idx : nullptr, "indexer.q_proj.weight");   // [512, 1]
+        q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, 1);
+        q = rms(q, Wl(il, "indexer.q_norm.weight"));
+        q = ggml_rope_multi(ctx0, q, inp_pos, nullptr, hp_->rope_dim, secs,
+                            GGML_ROPE_TYPE_IMROPE, hp_->n_ctx_train, hp_->rope_freq_base,
+                            1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    }
     ggml_tensor * pool_v = ggml_view_2d(ctx0, pc_w, idx_dim, NB, pc_w->nb[1], 0);      // after the write
     ggml_tensor * score = ggml_mul_mat(ctx0, pool_v,
             ggml_reshape_2d(ctx0, ggml_is_contiguous(q) ? q : ggml_cont(ctx0, q), idx_dim, n_idx_h));   // [NB, 4]
@@ -571,20 +598,26 @@ ggml_tensor * graph_builder::sparse_attn_decode(ggml_tensor * cur, ggml_tensor *
     ggml_tensor * mask = ggml_cast(ctx0, ggml_scale_bias(ctx0, ok, 1e30f, -1e30f), GGML_TYPE_F16);  // 0 / -inf
 
     // ---- q, k, v; cache writes; gather the selected cells -----------------
-    ggml_tensor * qg = project(proj ? proj->qg : nullptr, "attn_q.weight");             // [2*hd*nh, 1]
-    const size_t es = ggml_element_size(qg);
-    ggml_tensor * Q = ggml_view_3d(ctx0, qg, hd, nh, 1, es * hd * 2, es * hd * 2 * nh, 0);
-    Q = rms(Q, Wl(il, "attn_q_norm.weight"));
-    ggml_tensor * gate = ggml_view_3d(ctx0, qg, hd, nh, 1, es * hd * 2, es * hd * 2 * nh, es * hd);
-    gate = ggml_cont_2d(ctx0, gate, hd * nh, 1);
-
-    ggml_tensor * K = ggml_reshape_3d(ctx0, project(proj ? proj->k : nullptr, "attn_k.weight"), hd, nh_kv, 1);
-    K = rms(K, Wl(il, "attn_k_norm.weight"));
+    ggml_tensor * Q, * K, * gate = nullptr;
     ggml_tensor * V = ggml_reshape_3d(ctx0, project(proj ? proj->v : nullptr, "attn_v.weight"), hd, nh_kv, 1);
-    Q = ggml_rope_multi(ctx0, Q, inp_pos, nullptr, hp_->rope_dim, secs, GGML_ROPE_TYPE_IMROPE,
-                        hp_->n_ctx_train, hp_->rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    K = ggml_rope_multi(ctx0, K, inp_pos, nullptr, hp_->rope_dim, secs, GGML_ROPE_TYPE_IMROPE,
-                        hp_->n_ctx_train, hp_->rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    if (batched) {   // normed and roped for the T positions at once; the gate is applied by the caller
+        Q = col3(proj->Q_n);
+        K = col3(proj->K_n);
+    } else {
+        ggml_tensor * qg = project(proj ? proj->qg : nullptr, "attn_q.weight");             // [2*hd*nh, 1]
+        const size_t es = ggml_element_size(qg);
+        Q = ggml_view_3d(ctx0, qg, hd, nh, 1, es * hd * 2, es * hd * 2 * nh, 0);
+        Q = rms(Q, Wl(il, "attn_q_norm.weight"));
+        gate = ggml_view_3d(ctx0, qg, hd, nh, 1, es * hd * 2, es * hd * 2 * nh, es * hd);
+        gate = ggml_cont_2d(ctx0, gate, hd * nh, 1);
+
+        K = ggml_reshape_3d(ctx0, project(proj ? proj->k : nullptr, "attn_k.weight"), hd, nh_kv, 1);
+        K = rms(K, Wl(il, "attn_k_norm.weight"));
+        Q = ggml_rope_multi(ctx0, Q, inp_pos, nullptr, hp_->rope_dim, secs, GGML_ROPE_TYPE_IMROPE,
+                            hp_->n_ctx_train, hp_->rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        K = ggml_rope_multi(ctx0, K, inp_pos, nullptr, hp_->rope_dim, secs, GGML_ROPE_TYPE_IMROPE,
+                            hp_->n_ctx_train, hp_->rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    }
 
     ggml_tensor * kc   = st_->k_cache(il);
     ggml_tensor * vc   = st_->v_cache(il);
@@ -612,7 +645,7 @@ ggml_tensor * graph_builder::sparse_attn_decode(ggml_tensor * cur, ggml_tensor *
     ggml_tensor * out = ggml_flash_attn_ext(ctx0, qp, Kg, Vg, mask, 1.0f / sqrtf((float) hd), 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
     out = ggml_reshape_2d(ctx0, out, hd * nh, 1);
-    out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, gate));
+    if (gate) out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, gate));
     if (chain) { chain->ic = ic_w; chain->pc = pc_w; chain->kc = kc_w; chain->vc = vc_w; }
     if (proj) return out;   // the caller projects the T outputs at once
     return ggml_mul_mat(ctx0, Wl(il, "attn_output.weight"), out);
