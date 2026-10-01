@@ -1379,7 +1379,9 @@ bool engine::load_draft_vocab(const char * path, std::string & err) {
     fclose(f);
     const int64_t nv = out->ne[1];
     if (ids.empty()) { err = "mtp draft vocabulary: empty"; return false; }
-    for (int32_t v : ids) if (v < 0 || v >= nv) { err = "mtp draft vocabulary: id " + std::to_string(v) + " outside the vocabulary"; return false; }
+    // Inside both the LM head's rows and the tokenizer's vocabulary (the host scatter writes n_vocab_ entries).
+    const int64_t lim = std::min<int64_t>(nv, n_vocab_);
+    for (int32_t v : ids) if (v < 0 || v >= lim) { err = "mtp draft vocabulary: id " + std::to_string(v) + " outside the vocabulary"; return false; }
     // The rows, gathered on the host (a row of a quantized matrix is contiguous), uploaded once.
     const size_t row = out->nb[1];
     std::vector<uint8_t> buf(row * ids.size());
