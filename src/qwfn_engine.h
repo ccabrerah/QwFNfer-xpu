@@ -453,6 +453,9 @@ private:
     // the block bias and the five per-token inputs. Allocated before the VRAM
     // tier so it is accounted for.
     qsa_decode_inputs          qd_, qdk_[MTP_MAX_DRAFTS];   // qdk_[k-1]: position k of a multi-token decode step (k = 1..)
+    // The same per-position inputs as T-wide tensors (qd_'s and qdk_'s are views into them: column / element k), for
+    // a verify step's attention built once for its T positions; blk_pos here is the T blocks' positions, section-major.
+    qsa_decode_inputs          qdT_;
     ggml_tensor *              inp_pos_one_ = nullptr;   // I32 [4*Bd]: per-position [p,p,p,0] for single-position attention calls
     void qsa_decode_prepare_k(int k, int32_t n_past_k);   // qdk_[k-1]'s inputs: the previous position's bias plus its own window
     void qsa_decode_prepare2(int32_t n_past2) { qsa_decode_prepare_k(1, n_past2); }       // qd2_'s inputs, bias from qd_'s plus its own window; one bucket for both

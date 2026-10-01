@@ -523,6 +523,78 @@ graph_builder::qsa_proj graph_builder::sparse_attn_decode_proj(ggml_tensor * cur
     return p;
 }
 
+ggml_tensor * graph_builder::sparse_attn_decode_T(const qsa_proj & pj, const qsa_decode_inputs & qT, int64_t T,
+                                                  const int sections[4], int il) {
+    const int64_t hd = hp_->n_embd_head_k, nh = hp_->n_head, nh_kv = hp_->n_head_kv, kv_dim = hd * nh_kv;
+    const int64_t idx_dim = hp_->idx_key_len, n_idx_h = hp_->idx_n_head;
+    const int64_t r = qT.ratio, NB = qT.n_bucket, KB = qT.k_blocks, NC = KB * r;
+    int secs[4] = { sections[0], sections[1], sections[2], sections[3] };
+    auto first = [&](ggml_tensor * t, int64_t n) { return ggml_view_1d(ctx0, t, n, 0); };   // first n elements
+
+    // ---- indexer: the T raw keys in, the T positions' blocks pooled -------
+    ggml_tensor * ic = st_->idx_cache(il);
+    ic = ggml_reshape_2d(ctx0, ic, idx_dim, ic->ne[0] / idx_dim);
+    ggml_tensor * ic_w = ggml_set_rows(ctx0, ic, pj.k_raw, first(qT.write_idx, T));                // [128, T] rows
+    ggml_build_forward_expand(gf_, ic_w);
+    ggml_tensor * members = ggml_get_rows(ctx0, ic_w, first(qT.member_idx, r * T));              // [128, r*T]
+    ggml_tensor * pooled  = qsa_pool_blocks(ctx0, hp_, members, idx_dim, r, T,
+                                            Wl(il, "indexer.k_norm.weight"), first(qT.blk_pos, 4 * T), secs);   // [128, T]
+    // Two positions in one block pool the same members (all written above): the same row twice, the same values.
+    ggml_tensor * pc_w = ggml_set_rows(ctx0, qT.pool_cache, pooled, first(qT.blk_idx, T));
+    ggml_build_forward_expand(gf_, pc_w);
+
+    // ---- scores of the T queries over the bucket, top blocks -> cells -----
+    ggml_tensor * pool_v = ggml_view_2d(ctx0, pc_w, idx_dim, NB, pc_w->nb[1], 0);                 // after the writes
+    ggml_tensor * score = ggml_mul_mat(ctx0, pool_v, ggml_reshape_2d(ctx0, pj.qi_n, idx_dim, n_idx_h * T));   // [NB, 4*T]
+    score = ggml_relu(ctx0, score);
+    score = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, score, NB, n_idx_h, T), 1, 0, 2, 3));   // [4, NB, T]
+    score = ggml_sum_rows(ctx0, score);                                                           // [1, NB, T]
+    score = ggml_reshape_2d(ctx0, score, NB, T);
+    score = ggml_add(ctx0, score, ggml_view_2d(ctx0, qT.bias, NB, T, qT.bias->nb[1], 0));        // each position's bias
+    ggml_tensor * top = ggml_top_k(ctx0, score, KB);                                              // [KB, T] I32
+    ggml_tensor * cells = ggml_get_rows(ctx0, qT.blk_cells, ggml_reshape_1d(ctx0, top, KB * T));  // [r, KB*T] I32
+    cells = ggml_reshape_2d(ctx0, cells, NC, T);
+
+    // ---- cell masks: 0 for cells <= that position's n_past, -inf beyond ---
+    ggml_tensor * cp   = ggml_get_rows(ctx0, qT.cell_pos, ggml_reshape_1d(ctx0, cells, NC * T));  // [1, NC*T]
+    cp = ggml_reshape_2d(ctx0, cp, NC, T);
+    ggml_tensor * dpos = ggml_sub(ctx0, cp, ggml_reshape_2d(ctx0, first(qT.npast_f, T), 1, T));  // cell - n_past(k)
+    ggml_tensor * ok   = ggml_step(ctx0, ggml_scale_bias(ctx0, dpos, -1.0f, 0.5f));
+    ggml_tensor * mask = ggml_cast(ctx0, ggml_scale_bias(ctx0, ok, 1e30f, -1e30f), GGML_TYPE_F16);   // [NC, T]
+
+    // ---- K and V of the T positions into the caches ------------------------
+    ggml_tensor * kc = st_->k_cache(il), * vc = st_->v_cache(il);
+    kc = ggml_reshape_2d(ctx0, kc, kv_dim, kc->ne[0] / kv_dim);
+    vc = ggml_reshape_2d(ctx0, vc, kv_dim, vc->ne[0] / kv_dim);
+    ggml_tensor * kc_w = ggml_set_rows(ctx0, kc, ggml_reshape_2d(ctx0, pj.K_n, kv_dim, T), first(qT.write_idx, T));
+    ggml_tensor * vc_w = ggml_set_rows(ctx0, vc, ggml_reshape_2d(ctx0, pj.v, kv_dim, T), first(qT.write_idx, T));
+    ggml_build_forward_expand(gf_, kc_w);
+    ggml_build_forward_expand(gf_, vc_w);
+
+    // ---- each position's attention over its cells: the fused 9-node pattern of the one-position path ----
+    ggml_tensor * out = nullptr;
+    for (int64_t k = 0; k < T; k++) {
+        ggml_tensor * Qk = ggml_view_3d(ctx0, pj.Q_n, hd, nh, 1, pj.Q_n->nb[1], pj.Q_n->nb[2], (size_t) k * pj.Q_n->nb[2]);
+        ggml_tensor * qp = ggml_permute(ctx0, Qk, 0, 2, 1, 3);                                    // [hd, 1, nh]
+        ggml_tensor * mk = ggml_view_2d(ctx0, mask, NC, 1, mask->nb[1], (size_t) k * mask->nb[1]);
+        ggml_build_forward_expand(gf_, qp);
+        ggml_build_forward_expand(gf_, mk);
+        ggml_tensor * ck = ggml_view_1d(ctx0, cells, NC, (size_t) k * cells->nb[1]);
+        auto gather = [&](ggml_tensor * cache_w) {
+            ggml_tensor * g = ggml_get_rows(ctx0, cache_w, ck);                                   // F32 [kv_dim, NC]
+            g = ggml_permute(ctx0, ggml_reshape_3d(ctx0, g, hd, nh_kv, NC), 0, 2, 1, 3);          // [hd, NC, nh_kv]
+            return ggml_cast(ctx0, g, GGML_TYPE_F16);
+        };
+        ggml_tensor * Kg = gather(kc_w);
+        ggml_tensor * Vg = gather(vc_w);
+        ggml_tensor * o = ggml_flash_attn_ext(ctx0, qp, Kg, Vg, mk, 1.0f / sqrtf((float) hd), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+        o = ggml_reshape_2d(ctx0, o, hd * nh, 1);
+        out = out ? ggml_concat(ctx0, out, o, 1) : o;
+    }
+    return out;
+}
+
 ggml_tensor * graph_builder::sparse_attn_decode_out(ggml_tensor * out, int il) {
     return ggml_mul_mat(ctx0, Wl(il, "attn_output.weight"), out);
 }

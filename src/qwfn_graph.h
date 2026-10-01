@@ -122,6 +122,13 @@ public:
                       ggml_tensor * qi_n = nullptr, * Q_n = nullptr, * K_n = nullptr, * gate_sig = nullptr; };
     qsa_proj sparse_attn_decode_proj(ggml_tensor * cur, int il, ggml_tensor * inp_pos = nullptr, const int sections[4] = nullptr);
     ggml_tensor * sparse_attn_decode_out(ggml_tensor * out, int il);   // the output projection of [hd*nh, T]
+    // A verify step's T positions in one graph (proj built with inp_pos): the cache writes of all T first (K, V, the
+    // raw indexer key, the pooled tail blocks), then one scoring, top-k and cell mask for the T queries, then each
+    // position's fused attention over its own cells. Position k reads the rows of later positions only where its
+    // mask hides them (cells past its own n_past), and a tail block is always selected (bias 1e9), so the result is
+    // the chained calls'. qT: the T-wide inputs (engine qdT_). Returns [hd*nh, T] before the gate.
+    ggml_tensor * sparse_attn_decode_T(const qsa_proj & pj, const qsa_decode_inputs & qT, int64_t T,
+                                       const int sections[4], int il);
     ggml_tensor * sparse_attn_decode(ggml_tensor * cur, ggml_tensor * inp_pos, const int sections[4],
                                      int il, const qsa_decode_inputs & qd, qsa_chain * chain = nullptr,
                                      const qsa_proj * proj = nullptr);

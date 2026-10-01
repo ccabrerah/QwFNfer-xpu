@@ -410,7 +410,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
                 { qsa_ratio_ = (uint32_t) hp_.compress_ratios[il]; break; }
     if (qsa_ratio_ && !getenv("QWFN_LEGACY_QSA_DECODE")) {
         const int64_t r = qsa_ratio_, NBmax = (cfg.n_ctx + r - 1) / r, idx_dim = hp_.idx_key_len;
-        ggml_init_params qp{}; qp.mem_size = ggml_tensor_overhead() * (hp_.n_layer + 32); qp.no_alloc = true;
+        ggml_init_params qp{}; qp.mem_size = ggml_tensor_overhead() * (hp_.n_layer + 64); qp.no_alloc = true;
         qctx_ = ggml_init(qp);
         pool_cache_.assign(hp_.n_layer, nullptr);
         for (uint32_t il = 0; il < hp_.n_layer; il++)
@@ -418,21 +418,33 @@ bool engine::init(const model_index * hot, const model_index * cold,
         qd_.bias       = ggml_new_tensor_1d(qctx_, GGML_TYPE_F32, NBmax);
         qd_.blk_cells  = ggml_new_tensor_2d(qctx_, GGML_TYPE_I32, r, NBmax);
         qd_.cell_pos   = ggml_new_tensor_2d(qctx_, GGML_TYPE_F32, 1, cfg.n_ctx);
-        qd_.write_idx  = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 1);
-        qd_.member_idx = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, r);
-        qd_.blk_pos    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 4);
-        qd_.blk_idx    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 1);
-        qd_.npast_f    = ggml_new_tensor_1d(qctx_, GGML_TYPE_F32, 1);
+        // Per-position inputs live in T-wide tensors (qdT_), position k's being views of column / element k:
+        // the T=1 graph and the chained verify step read their own view, the batched verify step the first T.
+        const int64_t MT = 1 + MTP_MAX_DRAFTS;
+        qdT_ = qd_;
+        qdT_.bias       = ggml_new_tensor_2d(qctx_, GGML_TYPE_F32, NBmax, MT);
+        qdT_.write_idx  = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, MT);
+        qdT_.member_idx = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, r * MT);
+        qdT_.blk_pos    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 4 * MT);
+        qdT_.blk_idx    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, MT);
+        qdT_.npast_f    = ggml_new_tensor_1d(qctx_, GGML_TYPE_F32, MT);
+        auto pos_view = [&](ggml_tensor * t, int64_t n, int64_t k) {
+            return ggml_view_1d(qctx_, t, n, (size_t) (k * n) * ggml_element_size(t));
+        };
+        auto bind_pos = [&](qsa_decode_inputs & q, int64_t k) {
+            q.bias       = pos_view(qdT_.bias, NBmax, k);
+            q.write_idx  = pos_view(qdT_.write_idx, 1, k);
+            q.member_idx = pos_view(qdT_.member_idx, r, k);
+            q.blk_pos    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 4);   // one block's [p, p, p, p]
+            q.blk_idx    = pos_view(qdT_.blk_idx, 1, k);
+            q.npast_f    = pos_view(qdT_.npast_f, 1, k);
+        };
+        bind_pos(qd_, 0);
         // The later positions of a multi-token decode step: their own per-token
         // inputs and bias; the block tables and pooled keys are shared.
         for (int k = 0; k < MTP_MAX_DRAFTS; k++) {
             qdk_[k] = qd_;
-            qdk_[k].bias       = ggml_new_tensor_1d(qctx_, GGML_TYPE_F32, NBmax);
-            qdk_[k].write_idx  = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 1);
-            qdk_[k].member_idx = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, r);
-            qdk_[k].blk_pos    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 4);
-            qdk_[k].blk_idx    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 1);
-            qdk_[k].npast_f    = ggml_new_tensor_1d(qctx_, GGML_TYPE_F32, 1);
+            bind_pos(qdk_[k], k + 1);
         }
         qbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(qctx_, w_.buft());
         if (!qbuf_) {
@@ -443,6 +455,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
             std::vector<int32_t> bc((size_t) r * NBmax);
             for (int64_t b = 0; b < NBmax; b++) for (int64_t k = 0; k < r; k++) bc[b * r + k] = (int32_t) (b * r + k);
             ggml_backend_tensor_set(qd_.blk_cells, bc.data(), 0, bc.size() * 4);
+            qdT_.blk_cells = qd_.blk_cells; qdT_.cell_pos = qd_.cell_pos;
             std::vector<float> cp(cfg.n_ctx);
             for (uint32_t i = 0; i < cfg.n_ctx; i++) cp[i] = (float) i;
             ggml_backend_tensor_set(qd_.cell_pos, cp.data(), 0, cp.size() * 4);
@@ -452,6 +465,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
             qd_.ratio    = qsa_ratio_;
             qd_.k_blocks = (int64_t) ((hp_.idx_top_k + r - 1) + r - 1) / r;   // ceil(width / r)
             for (int k = 0; k < MTP_MAX_DRAFTS; k++) { qdk_[k].ratio = qd_.ratio; qdk_[k].k_blocks = qd_.k_blocks; }
+            qdT_.ratio = qd_.ratio; qdT_.k_blocks = qd_.k_blocks;
             fprintf(stderr, "[qwfn] decode QSA state: %.1f MB (pooled block keys for %lld blocks, %lld kept)\n",
                     ggml_backend_buffer_get_size(qbuf_) / 1e6, (long long) NBmax, (long long) qd_.k_blocks);
         }
@@ -2018,6 +2032,13 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     if (use_qd) qsa_decode_prepare((int32_t) n_past);
 
     if (use_qd && decode) for (int64_t k = 1; k < T; k++) qsa_decode_prepare_k((int) k, (int32_t) (n_past + k));
+    if (use_qd && decode && T >= 2) {   // the T positions' blocks, section-major, for the batched verify attention
+        const int32_t r = (int32_t) qsa_ratio_;
+        int32_t bp[4 * (1 + MTP_MAX_DRAFTS)];
+        for (int s = 0; s < 4; s++)
+            for (int64_t k = 0; k < T; k++) bp[s * T + k] = (int32_t) ((n_past + k) / r) * r;
+        ggml_backend_tensor_set(qdT_.blk_pos, bp, 0, (size_t) 4 * T * sizeof(int32_t));
+    }
     if (!use_qd) {
         std::vector<uint16_t> m((size_t) n_kv * T, f16_of(-INFINITY));
         for (int64_t i = 0; i < T; i++)
@@ -2237,6 +2258,15 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 graph_builder::qsa_proj pj;
                 if (!proj_each) pj = batch_each ? gbx.sparse_attn_decode_proj(x, (int) l)
                                                 : gbx.sparse_attn_decode_proj(x, (int) l, vpos(c), sections);
+                // The whole step in one graph: cache writes, scoring, top-k and masks once for the T positions
+                // (QWFN_QSA_CHAIN=1: the T chained one-position calls).
+                static const bool chain_each = getenv("QWFN_QSA_CHAIN") != nullptr;
+                if (pj.qi_n && !chain_each) {
+                    qsa_decode_inputs qT = qdT_;
+                    qT.pool_cache = pool_cache_[l]; qT.n_bucket = qd_.n_bucket; qT.k_blocks = qd_.k_blocks;
+                    ggml_tensor * outT = gbx.sparse_attn_decode_T(pj, qT, T, sections, (int) l);
+                    return gbx.sparse_attn_decode_out(ggml_mul(c, outT, pj.gate_sig), (int) l);
+                }
                 ggml_tensor * out = nullptr;
                 for (int64_t k = 0; k < T; k++) {
                     qsa_decode_inputs & q = k == 0 ? qd_ : qdk_[k - 1];
