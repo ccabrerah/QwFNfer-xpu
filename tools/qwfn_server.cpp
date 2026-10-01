@@ -1105,7 +1105,7 @@ int main(int argc, char ** argv) {
         std::lock_guard<std::mutex> lk(S.live.mu);
         S.live.prompt_done = S.live.prompt_base + (double) T * (il + 1) / nl;
     };
-    S.eng.set_mtp_logits(true);   // the draft is sampled from the head's distribution at temperature
+    // set_mtp_logits: per request, in generate (the draft is sampled from the head's distribution at temperature)
     if (!mmproj_path.empty()) {
         S.vis_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!S.vis_backend) { fprintf(stderr, "vision: no CPU backend\n"); return 1; }
@@ -1581,6 +1581,9 @@ int main(int argc, char ** argv) {
                         const std::function<bool(const std::string &, bool)> & on_delta,
                         gen_result & R, std::string & e, int reasoning_budget = 0,
                         const std::function<void()> & on_tick = nullptr) -> bool {
+        // The head's logits come back to the host only when this request samples its drafts (temperature); a
+        // greedy request takes the head's argmax and its probability, read on the device.
+        S.eng.set_mtp_logits(smp.cfg.temp > 0.0f && getenv("QWFN_MTP_ARGMAX_DRAFT") == nullptr);
         // Prefix continuation: only valid when the new prompt strictly extends
         // what the engine already holds.
         if (prefix_reuse(P) == 0) {

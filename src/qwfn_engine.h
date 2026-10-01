@@ -621,6 +621,12 @@ private:
     // Persistent tensors of the split head: device outputs of the first half, host
     // inputs/outputs of the CPU MoE, the partial's device landing.
     ggml_context * mctx_ = nullptr; ggml_backend_buffer_t mbuf_ = nullptr;
+    // Draft vocabulary (QWFN_MTP_DRAFT_VOCAB, int32 token ids): the head's LM head over those rows of output.weight
+    // only. Its argmax and softmax are over the subset; ids map back through mtp_vocab_ids_.
+    std::vector<int32_t> mtp_vocab_ids_;
+    ggml_tensor * t_mtp_out_ = nullptr;
+    ggml_context * dvctx_ = nullptr; ggml_backend_buffer_t dvbuf_ = nullptr;
+    bool load_draft_vocab(const char * path, std::string & err);
     ggml_tensor  * t_m_res_ = nullptr, * t_m_cur_ = nullptr, * t_m_inject_ = nullptr, * t_m_sel_ = nullptr,
                  * t_m_w_ = nullptr, * t_m_sh_ = nullptr, * t_m_pc_ = nullptr;
     ggml_context * mhctx_ = nullptr; ggml_backend_buffer_t mhbuf_ = nullptr;

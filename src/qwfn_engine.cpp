@@ -60,6 +60,8 @@ engine::~engine() {
     if (scr_ctx_) ggml_free(scr_ctx_);
     if (dbuf_) ggml_backend_buffer_free(dbuf_);
     if (dctx_) ggml_free(dctx_);
+    if (dvbuf_) ggml_backend_buffer_free(dvbuf_);   // the draft vocabulary's LM head rows
+    if (dvctx_) ggml_free(dvctx_);
     if (mbuf_) ggml_backend_buffer_free(mbuf_);     // the draft head's work sets
     if (mctx_) ggml_free(mctx_);
     if (mhbuf_) ggml_backend_buffer_free(mhbuf_);
@@ -147,6 +149,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
         state_config scm; scm.n_ctx = cfg.n_ctx; scm.type_k = cfg.type_k; scm.type_v = cfg.type_v;
         if (!st_mtp_.init(&hpm_, scm, w_.buft(), err)) return false;
         mtp_on_ = true;
+        if (getenv("QWFN_MTP_DRAFT_VOCAB") && !load_draft_vocab(getenv("QWFN_MTP_DRAFT_VOCAB"), err)) return false;
         fprintf(stderr, "[qwfn] mtp: nextn block %u of %s: %.2f GB on %s%s\n",
                 hpm_.n_layer - 1, cfg.mtp_path.c_str(), wm_.bytes() / 1e9, wm_.dev_name(),
                 mtp_experts_host_ ? (", its " + std::to_string((long long) (wmh_.bytes() / 1e6)) + " MB of experts in host memory (computed on the CPU per draft)").c_str() : ", experts included");
@@ -1363,6 +1366,33 @@ bool engine::spec_layer0(const int32_t * hist, int32_t n_hist, int32_t T, std::s
     t_spec_l0 += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     n_spec_l0++;
     (void) err;
+    return true;
+}
+
+bool engine::load_draft_vocab(const char * path, std::string & err) {
+    ggml_tensor * out = w_.get("output.weight");
+    if (!out) { fprintf(stderr, "[qwfn] mtp: draft vocabulary ignored: output.weight is not among the device weights\n"); return true; }
+    FILE * f = fopen(path, "rb");
+    if (!f) { err = std::string("mtp draft vocabulary: cannot open ") + path; return false; }
+    std::vector<int32_t> ids;
+    for (int32_t v; fread(&v, sizeof v, 1, f) == 1;) ids.push_back(v);
+    fclose(f);
+    const int64_t nv = out->ne[1];
+    if (ids.empty()) { err = "mtp draft vocabulary: empty"; return false; }
+    for (int32_t v : ids) if (v < 0 || v >= nv) { err = "mtp draft vocabulary: id " + std::to_string(v) + " outside the vocabulary"; return false; }
+    // The rows, gathered on the host (a row of a quantized matrix is contiguous), uploaded once.
+    const size_t row = out->nb[1];
+    std::vector<uint8_t> buf(row * ids.size());
+    for (size_t i = 0; i < ids.size(); i++) ggml_backend_tensor_get(out, buf.data() + i * row, (size_t) ids[i] * row, row);
+    ggml_init_params ip{}; ip.mem_size = ggml_tensor_overhead() * 2; ip.no_alloc = true;
+    dvctx_ = ggml_init(ip);
+    t_mtp_out_ = ggml_new_tensor_2d(dvctx_, out->type, out->ne[0], (int64_t) ids.size());
+    dvbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(dvctx_, w_.buft());
+    if (!dvbuf_) { err = "mtp draft vocabulary: no device memory"; return false; }
+    ggml_backend_tensor_set(t_mtp_out_, buf.data(), 0, buf.size());
+    mtp_vocab_ids_ = std::move(ids);
+    fprintf(stderr, "[qwfn] mtp: draft vocabulary %s: %zu of %lld ids, %.1f MB (%s rows)\n", path, mtp_vocab_ids_.size(),
+            (long long) nv, buf.size() / 1e6, ggml_type_name(out->type));
     return true;
 }
 
@@ -3362,7 +3392,7 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
     ggml_init_params ip{}; ip.mem_size = ggml_tensor_overhead() * 1024 + ggml_graph_overhead_custom(1024, false); ip.no_alloc = true;
     ggml_context * c = ggml_init(ip);
     ggml_cgraph *  g = ggml_new_graph_custom(c, 1024, false);
-    graph_builder gb(c, &hpm_, &wm_, &w_); gb.bind(&st_mtp_, g, pos);
+    graph_builder gb(c, &hpm_, &wm_, &w_); gb.bind(&st_mtp_, g, pos); gb.mtp_out = t_mtp_out_;
     // The head's attention is dense over its own cache. One query sees every key
     // written so far, so it needs no mask at all; two positions (after an accepted
     // pair) need one -inf, at the second position's own key for the first row, on
@@ -3457,7 +3487,7 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
         ggml_init_params ip3{}; ip3.mem_size = ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(256, false); ip3.no_alloc = true;
         c = ggml_init(ip3);
         g = ggml_new_graph_custom(c, 256, false);
-        graph_builder gb3(c, &hpm_, &wm_, &w_); gb3.bind(&st_mtp_, g, pos);
+        graph_builder gb3(c, &hpm_, &wm_, &w_); gb3.bind(&st_mtp_, g, pos); gb3.mtp_out = t_mtp_out_;
         ggml_tensor * res3 = ggml_view_3d(c, t_m_res_, n_embd, hc, n, t_m_res_->nb[1], t_m_res_->nb[2], 0);
         ggml_tensor * moe3 = ggml_add(c, v(t_m_sh_), v(t_m_pc_));
         ggml_tensor * hres = nullptr;
@@ -3480,17 +3510,25 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
     // caller samples the draft itself, which needs the last position's logits.
     std::vector<int32_t> top((size_t) n);
     ggml_backend_tensor_get(am, top.data(), 0, top.size() * sizeof(int32_t));
-    if (probs) {   // 4 bytes: the last position's probability at its argmax
+    if (probs) {   // 4 bytes: the last position's probability at its argmax (over the draft vocabulary, when there is one)
         const int64_t nv = probs->ne[0];
         ggml_backend_tensor_get(probs, &mtp_p_, ((size_t) (n - 1) * nv + (size_t) top[n - 1]) * sizeof(float), sizeof(float));
     }
     mtp_have_logits_ = false;
     if (mtp_want_logits_ && !actual) {
         const int64_t nv = logits->ne[0];
-        mtp_logits_.resize((size_t) nv);
-        ggml_backend_tensor_get(logits, mtp_logits_.data(), (size_t) (n - 1) * nv * sizeof(float), (size_t) nv * sizeof(float));
+        if (mtp_vocab_ids_.empty()) {
+            mtp_logits_.resize((size_t) nv);
+            ggml_backend_tensor_get(logits, mtp_logits_.data(), (size_t) (n - 1) * nv * sizeof(float), (size_t) nv * sizeof(float));
+        } else {   // the subset's logits, scattered into the full vocabulary (-inf elsewhere: never drafted)
+            std::vector<float> sub((size_t) nv);
+            ggml_backend_tensor_get(logits, sub.data(), (size_t) (n - 1) * nv * sizeof(float), (size_t) nv * sizeof(float));
+            mtp_logits_.assign((size_t) n_vocab_, -INFINITY);
+            for (int64_t i = 0; i < nv; i++) mtp_logits_[(size_t) mtp_vocab_ids_[(size_t) i]] = sub[(size_t) i];
+        }
         mtp_have_logits_ = true;
     }
+    if (!mtp_vocab_ids_.empty()) for (auto & t : top) t = mtp_vocab_ids_[(size_t) t];   // subset index -> token id
     for (int64_t j = 0; j < n; j++) {
         if (actual) {
             if (j < n_actual) { mtp_prompt_n++; if (actual[j] == top[j]) mtp_prompt_acc++; }

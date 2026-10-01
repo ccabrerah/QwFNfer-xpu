@@ -64,6 +64,8 @@ class graph_builder {
 public:
     // Router gate threshold (see engine_config::gate_drop); applied by moe_route when > 0.
     float gate_drop = 0.0f;
+    // The draft head's LM head when it drafts over a vocabulary subset (rows of output.weight); nullptr: the full one.
+    ggml_tensor * mtp_out = nullptr;
     // `alt` is consulted for names `w` does not hold. The dense core lives in a
     // CUDA buffer while the PLE table stays mmap'd on the host, so a graph needs
     // to resolve tensors across both; ggml_backend_sched then places each op on

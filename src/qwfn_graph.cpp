@@ -834,7 +834,7 @@ ggml_tensor * graph_builder::mtp_head_post(ggml_tensor * res, ggml_tensor * moe_
     // The head's own mixer collapses the streams and doubles as the output norm.
     ggml_tensor * o = hc_mix_w(res, Wl(il, "nextn.hc_head_norm.weight"), Wl(il, "nextn.hc_head_down.weight"),
                                Wl(il, "nextn.hc_head_up.weight"), nullptr, nullptr);
-    return ggml_mul_mat(ctx0, W("output.weight"), o);                                        // the trunk's LM head, via alt
+    return ggml_mul_mat(ctx0, mtp_out ? mtp_out : W("output.weight"), o);                    // the trunk's LM head (or its draft-vocabulary rows), via alt
 }
 
 void graph_builder::mtp_head_pre(ggml_tensor * h, ggml_tensor * emb, ggml_tensor * inp_pos, ggml_tensor * kq_mask,
