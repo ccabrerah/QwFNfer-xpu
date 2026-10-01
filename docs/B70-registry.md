@@ -64,6 +64,23 @@ split (`tools/perf/decab.py`):
 | expert I/O | ~7.6 (7-13 between starts) | waiting for missed experts read from the NVMe (~4 misses/token; 51% of expert blocks fit in VRAM) |
 | host | ~6.5 | CPU-computed experts (~7/token), routing readback, promotions |
 
+## MTP, the Strata recipe (2026-10)
+
+Ideas from [Strata](https://github.com/Niko1221/Strata) (a CUDA/HIP engine for this model) ported to this engine,
+measured on overlay v2 (stock GSQ-RCO Q2_0 + Unsloth tensors), vision loaded, one draft per step.
+
+| Change | Measured | Status |
+|---|---|---|
+| Head with Q2_0 experts (per-block least-squares scale), all on the device, 0.81 GB | ~35% relative RMS on the experts (the 2-bit optimum); ~80% acceptance | adopted |
+| Confidence gate (p >= 0.5), up to 3 drafts | 2.4-2.8 tokens per step, but T changes every step: graphs rebuilt per step, or a per-T graph cache that needs more device memory than `--vram 24` leaves; one device-lost fault under it | rejected for now (revisit with VRAM headroom) |
+| Head logits read back only when sampling; draft vocabulary; no layer-0 prefetch pass | host time per step ~9.5 -> ~4.4 ms; the prefetch pass's speculative reads also crowded the drive | adopted |
+| Draft vocabulary: English/code (40,525 ids) vs + Latin-script tokens (74,557) | Spanish acceptance ~46% -> ~66% (78% with the full vocabulary) for +0.3 ms of head | the Latin-script one |
+| AVX2 Q2_0 dot product (patch 23) | 2.6x per core; end to end the CPU expert time -12% (per-call overhead dominates) | adopted |
+| Verify-step attention: cache-free work, then indexer/scoring/top-k/masks batched over the positions | 167 -> 126 kernels per attention graph at T=2, layer graphs 28.4 -> 27.4 ms per step, identical answers | adopted |
+| Promotion budget kept at the one-token value for verify steps | no change | rejected |
+| Prefix cache with the head (checkpoints carry its state) | restores in ~110 ms, drafting continues | adopted |
+| **The configuration** (`--vram 24` + head vs `--vram 25` without) | ~+13% short-prompt decode; at the limit (image + 126K document) ~0.45 GB free, nothing evicted | adopted |
+
 ## Ideas -- not yet tried
 
 Ranked by expected gain for the preferred config (overlay v4, patches 01-21, `--vram 25`) per effort. Decode is now
@@ -83,6 +100,10 @@ above. Effort: S = a kernel, a switch or one measurement session, M = a few days
 | Prefill DeltaNet | a few % prefill | M | yes | per-kernel profile at 40K |
 | XMX grouped MoE kernel past 20 TFLOP/s | a few seconds per 40K prefill | L | yes | tile and SLM layout profile |
 | GSQ-RCO IQ3_S (3.50 bpw) as a base model | quality/speed vs v4 unknown | M | maybe | NLL through the decode path + decode speed vs v4 |
-| MTP draft head, re-check | unknown | L | yes | a verify step cost 2.1-2.4x a plain step before patches 18-21 |
 | One graph per token (instead of 48 per-layer graphs) | small now that decode is GPU-bound | L | small | only if the host is back on the critical path |
 | Patch 17's local-memory table for MXFP4 / IQ4_XS | several-x faster kernels for those types; upstreamable | S-M | no (v4 uses neither) | port the lookup, bench against the CPU with a 64-matmul graph |
+| Host RAM large enough for every expert not in VRAM (~22 GB on top of the system) *(Strata's design)* | takes the NVMe out of decode: est. +15-20% short-prompt decode, more at long context, and no read variance | hardware | yes | re-size `--ram` with an A-B-B-A after the upgrade |
+| Gathered sparse attention for prefill *(Strata)* | the dense masked attention is ~27% of 89K prefill device time; a per-query gather of the ~2,051 selected cells cuts the math ~10x: est. ~+20% at 89K | M-L | yes | SYCL gather kernel over the q8_0 cache; prefill-then-decode NLL against decode-only |
+| Startup expert profile *(Strata)* | warm first requests after a model switch | S-M | maybe | rank (layer, expert) pairs from a routing dump; pre-fill the VRAM tier at load |
+| The CPU experts' per-call overhead | ~0.3 ms per CPU-computed expert of which the dot products are ~0.05-0.1 (thread wake-up, activation quantization, the CPU graph) | M | yes | per-call timing of the CPU MoE path; a persistent worker pool |
+| Gated-delta-net writing its rollback snapshot itself at T=2 | ~1 ms per verify step (36 x 3 MB copies and their kernels) | M | MTP | the state and its snapshot in one allocation, so the existing fused cache write applies |

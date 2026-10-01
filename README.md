@@ -16,6 +16,14 @@ Against the first B70 enablement (2026-09-15: stock llama.cpp SYCL backend, Unsl
 natural-text NLL ~1.5 against 2.02 for the validated overlay -- and with patches 18-21 and `--vram 25` runs at
 **28-33 tok/s short-prompt decode, ~510 / ~600 / ~500-515 tok/s prefill at 20K / 40K / 89K**.
 
+**2026-10: the MTP draft head.** The model's own multi-token-prediction head now drafts one token per step and the
+trunk verifies the pair (exact: the output is the trunk's). The recipe -- a small all-on-GPU head with 2-bit experts,
+a draft vocabulary, cheap verify steps, an AVX2 CPU kernel for Q2_0 -- comes from
+[Strata](https://github.com/Niko1221/Strata), a CUDA/HIP engine for this model; the rows marked *(Strata)* below are
+those ideas ported to this engine and the B70. On the stock-quant overlay v2 (`--vram 24` + the head against
+`--vram 25` without it): **~+13% short-prompt decode** (essay ~35, code ~40 tok/s), ~39.5 tok/s on long answers, the
+prefix cache and vision unchanged. Configuration: [`docs/B70-config.md`](docs/B70-config.md), "MTP".
+
 | Change | Where | Measured effect |
 |---|---|---|
 | q2_0 experts stored as [codes][scales] so the MoE kernel uses aligned vector loads | patch 09 + engine (`QWFN_Q2_SOA`) | decode layer graphs -18%, 40K decode +20% |
@@ -37,6 +45,12 @@ natural-text NLL ~1.5 against 2.02 for the validated overlay -- and with patches
 | locked, driver-registered host memory for the RAM tier and prefill staging | engine (`QWFN_LOCK_HOST`) | 89K prefill 425 -> 482 tok/s |
 | fix: the prefill's sparse-attention selection no longer spends its slots on blocks after the query (backend-neutral; offered upstream) | engine | usable cells per query 823 -> 1,998 of 2,052 (40K); 118K prompt, 8 notes to list in order: 0-1/8 placed right in 5 of 5 runs without it, 8/8 in 7 of 7 with it; no speed cost |
 | dense overlay v2: Unsloth's bits for the tensors GSQ-RCO cut to 2 bits | `scripts/b70/build-overlay.sh` | natural-text NLL -0.034 (about 10x the run spread) |
+| *(Strata)* MTP draft head with its routed experts re-encoded to Q2_0 (per-block least-squares scale), all 0.81 GB on the device, one draft per step | `tools/overlay/gguf_requant.cpp` (rule `mtpq2`), engine (`--mtp`, `QWFN_MTP_EXPERTS_VRAM`) | decode ~+13% against the same model without it; ~80% of drafts accepted (greedy and at temperature 0.7) |
+| *(Strata)* draft vocabulary: the head projects onto a subset of the LM head's rows (English and code, Latin-script tokens) | engine (`QWFN_MTP_DRAFT_VOCAB`) | the head's cost halved (2.6 -> 1.3-1.7 ms per step); Spanish keeps ~66% acceptance (78% with the full vocabulary) |
+| *(Strata)* cheaper verify steps: the head's logits read back only when sampling, no layer-0 prefetch pass with drafts, the confidence gate as an option | engine + server (`QWFN_NO_SPEC_L0`, `QWFN_MTP_MIN_P`) | host time per step ~9.5 -> ~4.4 ms |
+| verify-step kernels and graph: wide bf16 matvec, fused q2_0 MoE GLU and small-K matmul for 1-4 tokens; the attention's cache writes, scoring, top-k and masks built once for the step's positions | patch 22, engine (`QWFN_QSA_CHAIN=1` restores the per-position calls) | verify-step layer graphs 28.4 -> 27.4 ms; identical answers and acceptance |
+| prefix cache with the draft head: checkpoints carry the head's caches and last residual | engine | 20K-token restores in ~110 ms with drafting going on after them (before: `--prefix-cache` refused `--mtp`) |
+| *(Strata)* AVX2 Q2_0 x Q8_0 dot product for the CPU-computed experts (x86 had only the scalar loop) | patch 23 | 2.6x per core (394 -> 150 us for one expert's gate+up); CPU expert time -12% end to end; NLL unchanged |
 
 Every change is off by default in the patched ggml tree and checked with `test-backend-ops`; the details and the
 rejected alternatives are in [`docs/B70-SYCL.md`](docs/B70-SYCL.md) and [`docs/B70-config.md`](docs/B70-config.md), and
@@ -168,7 +182,10 @@ Qwen3.8-Flash-Next ships the Qwen4-generation design, `qwen4exp` in the GGUF, an
 
 ## Acknowledgment
 
-Built on [ggml](https://github.com/ggml-org/ggml) (quantized kernels, CUDA backend) and [llama.cpp](https://github.com/ggml-org/llama.cpp) (tokenizer, and the bit-exact reference the forward pass is validated against). Model: Qwen3.8-Flash-Next by the [Qwen](https://huggingface.co/Qwen) team; quantized GGUFs by [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), whose Studio served as the harness for testing. The engine itself is [QwFNfer](https://github.com/Apolog1ze-Dev/QwFNfer); this fork only adds the Intel
+Built on [ggml](https://github.com/ggml-org/ggml) (quantized kernels, CUDA backend) and [llama.cpp](https://github.com/ggml-org/llama.cpp) (tokenizer, and the bit-exact reference the forward pass is validated against). Model: Qwen3.8-Flash-Next by the [Qwen](https://huggingface.co/Qwen) team; quantized GGUFs by [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), whose Studio served as the harness for testing. The MTP recipe (rows marked *(Strata)*) follows
+[Strata](https://github.com/Niko1221/Strata) by Niko1221, MIT: its paper and code showed what makes a draft head pay
+on a small GPU; its AVX2 Q2_0 row kernel is the model for patch 23, and its English/code draft vocabulary the base of
+ours. The engine itself is [QwFNfer](https://github.com/Apolog1ze-Dev/QwFNfer); this fork only adds the Intel
 work on top of it. Base weights: [GSQ-RCO Q2_0](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
 by ISTA-DASLab. The SYCL backend is ggml's, built with Intel oneAPI and oneDNN.
 
