@@ -32,6 +32,7 @@ engine::~engine() {
         if (lg.ga)  ggml_gallocr_free(lg.ga);
         if (lg.ctx) ggml_free(lg.ctx);
     }
+    free_graph_stash();
     for (auto & mg : gM_) {
         if (mg.ga)  ggml_gallocr_free(mg.ga);
         if (mg.ctx) ggml_free(mg.ctx);
@@ -596,6 +597,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
 
     gA_.assign(hp_.n_layer, layer_graph{});
     gA_bucket_.assign(hp_.n_layer, -1);
+    if (!getenv("QWFN_NO_GRAPH_STASH")) gA_stash_.assign(2 + MTP_MAX_DRAFTS, std::vector<stashed_graph>(hp_.n_layer));
     gM_.assign(hp_.n_layer, moe_graph{});
     if (getenv("QWFN_VRAM_AUDIT")) {
         // Every device buffer the engine holds at the end of init, and what the
@@ -1363,9 +1365,20 @@ bool engine::spec_layer0(const int32_t * hist, int32_t n_hist, int32_t T, std::s
     return true;
 }
 
+void engine::free_graph_stash() {
+    for (auto & per_t : gA_stash_)
+        for (auto & s : per_t) {
+            if (s.g.ga)  ggml_gallocr_free(s.g.ga);
+            if (s.g.ctx) ggml_free(s.g.ctx);
+            s = stashed_graph{};
+        }
+}
+
 void engine::graph_buffer_bytes(size_t & a_bytes, int & a_graphs, size_t & m_bytes, int & m_graphs) const {
     a_bytes = m_bytes = 0; a_graphs = m_graphs = 0;
     for (const auto & g : gA_) if (g.ga) { a_bytes += ggml_gallocr_get_buffer_size(g.ga, 0); a_graphs++; }
+    for (const auto & per_t : gA_stash_)
+        for (const auto & s : per_t) if (s.g.ga) { a_bytes += ggml_gallocr_get_buffer_size(s.g.ga, 0); a_graphs++; }
     for (const auto & g : gM_) if (g.ga) { m_bytes += ggml_gallocr_get_buffer_size(g.ga, 0); m_graphs++; }
 }
 
@@ -1464,6 +1477,7 @@ void engine::sync_tier_epoch() {
     // The dynamic tier moved: every replayed graph that folds an expert
     // matmul over it holds stale pointers. Rebuild them all next token.
     for (auto & lg : gA_) { if (lg.ga) ggml_gallocr_free(lg.ga); if (lg.ctx) ggml_free(lg.ctx); lg = layer_graph{}; }
+    free_graph_stash();   // parked graphs hold the same stale pointers
     for (auto & mg : gM_) { if (mg.ga) ggml_gallocr_free(mg.ga); if (mg.ctx) ggml_free(mg.ctx); mg = moe_graph{}; }
     std::fill(gA_bucket_.begin(), gA_bucket_.end(), -1);
     tier_epoch_seen_ = ec_.tier_epoch();
@@ -2076,6 +2090,22 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         // A graph that speculatively runs an attention successor's block is shaped by the bucket too.
         const bool spec_attn_next = cfg_.spec_block && decode && use_qd && il + 1 < hp_.n_layer
                                     && hp_.is_attn_layer(il + 1) && spec_block_mask_[il + 1];
+        if (replayable && !gA_stash_.empty() && gA_T_[il] != (uint8_t) T) {
+            // Park the graph cached for another T (an MTP step's T varies), then take back this T's, if parked.
+            const size_t told = gA_T_[il];
+            if (gA_[il].gf && told >= 1 && told < gA_stash_.size()) {
+                stashed_graph & s = gA_stash_[told][il];
+                if (s.g.ga)  ggml_gallocr_free(s.g.ga);
+                if (s.g.ctx) ggml_free(s.g.ctx);
+                s = stashed_graph{ gA_[il], gA_bucket_[il], gA_pack_[il] };
+                gA_[il] = layer_graph{};
+            }
+            if (T >= 1 && (size_t) T < gA_stash_.size() && gA_stash_[T][il].g.gf) {
+                stashed_graph & r = gA_stash_[T][il];
+                gA_[il] = r.g; gA_bucket_[il] = r.bucket; gA_pack_[il] = r.pack; gA_T_[il] = (uint8_t) T;
+                r = stashed_graph{};
+            }
+        }
         if (replayable && gA_[il].gf && (((hp_.is_attn_layer(il) || spec_attn_next) && gA_bucket_[il] != qd_.n_bucket) || gA_T_[il] != (uint8_t) T)) {
             if (gA_[il].ga)  ggml_gallocr_free(gA_[il].ga);
             if (gA_[il].ctx) ggml_free(gA_[il].ctx);
@@ -3360,6 +3390,7 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
         ggml_set_output(am);
         ggml_build_forward_expand(g, am);
         if (!actual) {
+            ggml_set_output(logits);   // read back for sampling: no in-place softmax over it (ggml-alloc would)
             probs = ggml_soft_max(c, logits);
             ggml_set_output(probs);
             ggml_build_forward_expand(g, probs);
@@ -3421,6 +3452,7 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
         // Kept for a second draft from the head's own residual (mtp_draft_next).
         if (!actual) {
             ggml_build_forward_expand(g, ggml_cpy(c, hres, ggml_view_3d(c, t_m_hres_, n_embd, hc, n, t_m_hres_->nb[1], t_m_hres_->nb[2], 0)));
+            ggml_set_output(logits);   // read back for sampling: no in-place softmax over it (ggml-alloc would)
             probs = ggml_soft_max(c, logits);
             ggml_set_output(probs);
             ggml_build_forward_expand(g, probs);

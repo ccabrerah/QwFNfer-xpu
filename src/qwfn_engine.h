@@ -432,6 +432,12 @@ private:
     };
     std::vector<layer_graph> gA_;
     std::vector<int64_t>     gA_bucket_;   // attention layers: the block bucket the graph was built for
+    // Per-T cache of the decode layer graphs (an MTP step's T changes from step to step: 1 + accepted/gated
+    // drafts). A graph built for another T is parked here, under its T, instead of freed, and restored when
+    // that T comes back; index [T][layer], T = 1..1 + MTP_MAX_DRAFTS. QWFN_NO_GRAPH_STASH=1: the old rebuild.
+    struct stashed_graph { layer_graph g; int64_t bucket = -1; uint8_t pack = 0; };
+    std::vector<std::vector<stashed_graph>> gA_stash_;
+    void free_graph_stash();
 
     // Decode-time sparse attention state; see graph_builder::sparse_attn_decode.
     // Per attention layer a cache of pooled block keys; shared static tables,
