@@ -3,7 +3,7 @@ Subject: [PATCH 22] ggml-sycl: one-token decode kernels for 1-4 tokens (the MTP 
 
 mmvw (bf16/f16 wide matvec) templated on 1-4 columns, each weight row read once; the fused q2_0 MoE gate+up+SwiGLU
 with a token dimension; smallk with a batch dimension. A T-token call gives the same bits as T one-token calls
-(apply_mmvw_nt_v17.py, apply_moe_glu_nt.py, apply_smallk_batch.py in the research scripts).
+(the MTP verify step runs T = 2..4 positions through them).
 
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp

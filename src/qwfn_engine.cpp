@@ -3682,8 +3682,8 @@ const float * engine::eval_decode(const int32_t * hist, int32_t n_hist, int32_t 
     if (n_past_ + n_new > (int32_t) cfg_.n_ctx) { err = "context exhausted"; return nullptr; }
     if (n_new >= 2 && cfg_.skip_miss) { err = "eval_decode: a verified step and --skip-miss do not combine"; return nullptr; }
     // A step of n positions looks up more experts per layer, so it may promote n times as many: each promotion is an
-    // expert upload on the compute queue (window167: a verify step ran 270 pinned-host uploads against 155, +12 ms of
-    // device copies per step under tracing). QWFN_PROMOTE_T1=1 keeps the one-token budget for verify steps.
+    // expert upload on the compute queue (a unitrace profile: 270 pinned-host uploads per verify step against 155 per
+    // token). Measured without effect on the step's time; QWFN_PROMOTE_T1=1 keeps the one-token budget for verify steps.
     static const bool promote_t1 = getenv("QWFN_PROMOTE_T1") != nullptr;
     ec_.set_max_promotions(cfg_.promote_per_layer * (promote_t1 ? 1u : (uint32_t) n_new));
     const bool ok = eval_batch(hist, n_hist, n_new, err, /*cache_batched=*/false, /*force_decode=*/true);
