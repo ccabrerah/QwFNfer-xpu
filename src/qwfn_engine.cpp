@@ -2377,7 +2377,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                                    : op == GGML_OP_GLU ? std::string("glu") : ggml_op_name(op);
                     hist[nm]++; n_real++;
                 }
-                fprintf(stderr, "[graph-stats] layer %u (%s): %d nodes, %d kernels:", il, hp_.is_attn_layer(il) ? "attention" : "recurrent", ggml_graph_n_nodes(g), n_real);
+                fprintf(stderr, "[graph-stats] layer %u (%s) T=%d: %d nodes, %d kernels:", il, hp_.is_attn_layer(il) ? "attention" : "recurrent", (int) T, ggml_graph_n_nodes(g), n_real);
                 for (auto & kv : hist) fprintf(stderr, " %s x%d", kv.first.c_str(), kv.second);
                 fprintf(stderr, "\n");
                 if (atoi(getenv("QWFN_GRAPH_STATS")) >= 2 && il == 1) {   // the op sequence, views included, to check fusion adjacency
