@@ -1697,7 +1697,11 @@ int main(int argc, char ** argv) {
         // a single-token step, measured). Capped by --mtp-drafts.
         static float acc_at[engine::MTP_MAX_DRAFTS] = { 0.85f, 0.80f, 0.75f };
         static const float draft_cost = getenv("QWFN_DRAFT_COST") ? (float) atof(getenv("QWFN_DRAFT_COST")) : 0.7f;   // measured: a position costs ~0.6 of a single-token step, more as the queue deepens
+        // Confidence gate (Strata's rule): a draft enters the step only while the head gives it at least min_p
+        // (its own softmax at temperature 1); the step then takes up to --mtp-drafts. 0 = the cost model above.
+        static const float min_p = getenv("QWFN_MTP_MIN_P") ? (float) atof(getenv("QWFN_MTP_MIN_P")) : 0.0f;
         auto drafts_wanted = [&]() {
+            if (min_p > 0.0f) return (int) std::min<uint32_t>(S.mtp_drafts, (uint32_t) engine::MTP_MAX_DRAFTS);
             // The k that maximises expected tokens per unit of step cost: tokens(k) =
             // 1 + a1 + a1 a2 + ... , cost(k) = 1 + k * draft_cost.
             const int cap = (int) std::min<uint32_t>(S.mtp_drafts, (uint32_t) engine::MTP_MAX_DRAFTS);
@@ -1792,10 +1796,14 @@ int main(int argc, char ** argv) {
             if (S.eng.mtp_draft_id() >= 0) {
                 const int want = drafts_wanted();
                 if (!sampled) {
-                    if (!S.eng.mtp_draft_more(want, e)) return false;
-                    for (int k = 0; k < S.eng.mtp_draft_count(); k++) drafts.push_back(S.eng.mtp_draft_k(k));
+                    if (!S.eng.mtp_draft_more(want, e, min_p)) return false;
+                    for (int k = 0; k < S.eng.mtp_draft_count(); k++) {
+                        if (S.eng.mtp_draft_p_k(k) < min_p) break;
+                        drafts.push_back(S.eng.mtp_draft_k(k));
+                    }
                 } else {
                     for (int k = 0; k < want; k++) {
+                        if (S.eng.mtp_draft_p_k(k) < min_p) break;
                         const float * hl = S.eng.mtp_logits_k(k);
                         if (!hl) break;
                         auto qd = smp.dist(hl, S.eng.n_vocab());

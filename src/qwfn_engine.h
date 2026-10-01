@@ -259,8 +259,10 @@ public:
     int           mtp_draft_count() const { return mtp_n_drafts_; }
     int32_t       mtp_draft_k(int k) const { return k < mtp_n_drafts_ ? mtp_drafts_[k] : -1; }
     const float * mtp_logits_k(int k) const { return k < mtp_n_drafts_ && mtp_have_logits_k_[k] ? mtp_logits_k_[k].data() : nullptr; }
+    // The head's probability for draft k (its softmax at its argmax, temperature 1): the confidence gate.
+    float         mtp_draft_p_k(int k) const { return k < mtp_n_drafts_ ? mtp_p_k_[k] : 0.0f; }
     // Extend the current step's drafts to k (each from the previous draft's residual).
-    bool          mtp_draft_more(int k, std::string & err);
+    bool          mtp_draft_more(int k, std::string & err, float min_p = 0.0f);   // chain until k drafts, or one under min_p
     bool    mtp_on() const { return mtp_on_; }
     // The head's logits at the draft position, read back only when asked for
     // (the server samples the draft from them at temperature); nullptr otherwise.
@@ -624,6 +626,7 @@ private:
     int32_t       mtp_drafts_[MTP_MAX_DRAFTS] = { -1, -1, -1 }; int mtp_n_drafts_ = 0;
     std::vector<float> mtp_logits_k_[MTP_MAX_DRAFTS]; bool mtp_have_logits_k_[MTP_MAX_DRAFTS] = { false, false, false };
     std::vector<float> mtp_logits2_; bool mtp_have_logits2_ = false;   // the second draft's distribution, when logits are wanted
+    float         mtp_p_ = 0.0f, mtp_p2_ = 0.0f, mtp_p_k_[MTP_MAX_DRAFTS] = { 0.0f, 0.0f, 0.0f };   // the drafts' own probabilities
     bool          mtp_want_logits_ = false, mtp_have_logits_ = false;
     std::vector<float> mtp_logits_;
     // Run the head for n positions starting at `pos`, reading rows h_row.. of

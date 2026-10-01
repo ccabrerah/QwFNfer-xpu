@@ -235,7 +235,7 @@ public:
     // head. Returns logits [n_vocab, T] for token p+2. `il` is the block's
     // index in the MTP file; its tensors come from `w`, the LM head through `alt`.
     ggml_tensor * mtp_head(ggml_tensor * h, ggml_tensor * emb, ggml_tensor * inp_pos,
-                           ggml_tensor * kq_mask, const int sections[4], int il);
+                           ggml_tensor * kq_mask, const int sections[4], int il, ggml_tensor ** hres_out = nullptr);
     // The same head in two halves around its routed MoE, for experts that live
     // elsewhere (host memory): the first half returns the wide residual after
     // the attention block, the FFN input, its inject, the routing and the shared

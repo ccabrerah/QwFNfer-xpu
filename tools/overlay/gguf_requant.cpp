@@ -10,6 +10,7 @@
 //                                                              dense5 (Unsloth's selection: attn/shexp gate+up -> Q5_K,
 //                                                                      ssm_out -> Q6_K, the rest left alone)
 //                                                              down41 (expert down -> Q4_1)
+//                                                              mtpq2  (an MTP head's experts -> Q2_0, MSE-optimal scale)
 #include "ggml.h"
 #include "gguf.h"
 
@@ -50,7 +51,62 @@ static ggml_type target_type(const std::string & rule, const char * name, ggml_t
         if (nm.find("ffn_down_exps.weight") == std::string::npos) return GGML_TYPE_COUNT;
         return GGML_TYPE_Q4_1;
     }
+    if (rule == "mtpq2") {
+        // The draft head's routed experts -> Q2_0, the trunk's expert format, small enough (~0.7 GB) to stay on
+        // the device. Encoded by q2_0_mse below, not by ggml's reference.
+        if (nm.find("_exps.weight") == std::string::npos || ne0 % 64 != 0) return GGML_TYPE_COUNT;
+        return GGML_TYPE_Q2_0;
+    }
     fprintf(stderr, "unknown rule %s\n", rule.c_str()); exit(1);
+}
+
+// Q2_0 with the scale that minimizes the block's squared error. ggml's reference takes d = max|w|, so the +2
+// level is never used and everything under max/2 rounds to 0. Here d may be negative (the 2d level then lands
+// on the negative tail), each candidate is refitted by least squares once, and the best block wins.
+// Layout as ggml's block_q2_0: fp16 d, then 64 2-bit codes (value j in byte j/4 at bits 2*(j%4)), code = level + 1.
+static void q2_0_mse(const float * x, uint8_t * out, int64_t n) {
+    constexpr int QK = 64;
+    for (int64_t b = 0; b < n / QK; b++, x += QK, out += 2 + QK / 4) {
+        float amax = 0;
+        for (int j = 0; j < QK; j++) amax = std::max(amax, std::fabs(x[j]));
+        float best_d = 0, best_e = 0;
+        for (int j = 0; j < QK; j++) best_e += x[j] * x[j];   // d = 0
+        auto levels = [&](float d, int8_t * q) {
+            const float id = 1.0f / d;
+            for (int j = 0; j < QK; j++) q[j] = (int8_t) std::min(2, std::max(-1, (int) std::lround(x[j] * id)));
+        };
+        auto error = [&](float d, const int8_t * q) {
+            float e = 0;
+            for (int j = 0; j < QK; j++) { const float r = x[j] - d * q[j]; e += r * r; }
+            return e;
+        };
+        if (amax > 0) {
+            int8_t q[QK];
+            for (int s = -1; s <= 1; s += 2)
+                for (int k = 0; k <= 40; k++) {
+                    float d = s * amax * (0.25f + 0.025f * k);
+                    levels(d, q);
+                    float sxq = 0, sqq = 0;
+                    for (int j = 0; j < QK; j++) { sxq += x[j] * q[j]; sqq += (float) (q[j] * q[j]); }
+                    if (sqq > 0 && sxq * d > 0) { d = sxq / sqq; levels(d, q); }
+                    d = ggml_fp16_to_fp32(ggml_fp32_to_fp16(d));   // judge it as stored
+                    if (d == 0) continue;
+                    const float e = error(d, q);
+                    if (e < best_e) { best_e = e; best_d = d; }
+                }
+        }
+        const ggml_fp16_t dh = ggml_fp32_to_fp16(best_d);
+        memcpy(out, &dh, 2);
+        uint8_t * qs = out + 2;
+        memset(qs, 0, QK / 4);
+        if (best_d != 0) {
+            int8_t q[QK];
+            levels(best_d, q);
+            for (int j = 0; j < QK; j++) qs[j / 4] |= (uint8_t) ((q[j] + 1) << (2 * (j % 4)));
+        } else {
+            for (int j = 0; j < QK; j++) qs[j / 4] |= (uint8_t) (1 << (2 * (j % 4)));   // code 1 = level 0
+        }
+    }
 }
 
 int main(int argc, char ** argv) {
@@ -138,7 +194,8 @@ int main(int argc, char ** argv) {
                 const ssize_t r = pread(fds[jb.shard], src.data(), in_slice, (off_t) (jb.in_off + e * in_slice));
                 if (r != (ssize_t) in_slice) { fail = true; return; }
                 to_float(src.data(), f.data(), ne0 * ne1);
-                ggml_quantize_chunk(jb.out_type, f.data(), out.data() + e * out_slice, 0, ne1, ne0, nullptr);
+                if (rule == "mtpq2") q2_0_mse(f.data(), out.data() + e * out_slice, ne0 * ne1);
+                else ggml_quantize_chunk(jb.out_type, f.data(), out.data() + e * out_slice, 0, ne1, ne0, nullptr);
                 if (err_mode && e < 2) {   // two slices per tensor is plenty for an RMS
                     std::vector<float> back((size_t) (ne0 * ne1));
                     ggml_get_type_traits(jb.out_type)->to_float(out.data() + e * out_slice, back.data(), ne0 * ne1);

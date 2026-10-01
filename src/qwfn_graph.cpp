@@ -795,7 +795,7 @@ ggml_tensor * graph_builder::moe_route_predict_x(ggml_tensor * cur, int il_next,
 }
 
 ggml_tensor * graph_builder::mtp_head(ggml_tensor * h, ggml_tensor * emb, ggml_tensor * inp_pos,
-                                      ggml_tensor * kq_mask, const int sections[4], int il) {
+                                      ggml_tensor * kq_mask, const int sections[4], int il, ggml_tensor ** hres_out) {
     const int64_t hc = hp_->hc_count, n_embd = hp_->n_embd, hc_dim = hc * n_embd;
     const int64_t T  = emb->ne[1];
 
@@ -825,7 +825,7 @@ ggml_tensor * graph_builder::mtp_head(ggml_tensor * h, ggml_tensor * emb, ggml_t
     res = hc_combine(res, cur, inject);
     cur = hc_mix(res, il, /*ffn=*/true, &inject);
     cur = moe(cur, il);                                                                       // the head's 512 experts, resident
-    return mtp_head_post(res, cur, inject, il);
+    return mtp_head_post(res, cur, inject, il, hres_out);
 }
 
 ggml_tensor * graph_builder::mtp_head_post(ggml_tensor * res, ggml_tensor * moe_out, ggml_tensor * inject, int il, ggml_tensor ** hres_out) {

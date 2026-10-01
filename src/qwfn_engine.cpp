@@ -332,7 +332,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
     if (cfg.skip_miss) t_rscale_ = ggml_new_tensor_1d(wctx_, GGML_TYPE_F32, 1);
     wbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(wctx_, w_.buft());
     { std::vector<float> m(hc, 1.0f / (float) hc); ggml_backend_tensor_set(t_hcmean_, m.data(), 0, m.size() * sizeof(float)); }
-    if (mtp_on_ && mtp_experts_host_) {
+    if (mtp_on_) {   // the device half; the head residual (t_m_hres_) chains drafts in both expert placements
         ggml_init_params mp{}; mp.mem_size = ggml_tensor_overhead() * 8; mp.no_alloc = true;
         mctx_ = ggml_init(mp);
         t_m_res_    = ggml_new_tensor_3d(mctx_, GGML_TYPE_F32, n_embd, hc, Bd);
@@ -345,6 +345,8 @@ bool engine::init(const model_index * hot, const model_index * cold,
         t_m_hres_   = ggml_new_tensor_3d(mctx_, GGML_TYPE_F32, n_embd, hc, Bd);
         mbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(mctx_, w_.buft());
         if (!mbuf_) { err = "no device memory for the head's work set"; return false; }
+    }
+    if (mtp_on_ && mtp_experts_host_) {
         ggml_init_params hp2{}; hp2.mem_size = ggml_tensor_overhead() * 8; hp2.no_alloc = true;
         mhctx_ = ggml_init(hp2);
         h_m_cur_     = ggml_new_tensor_2d(mhctx_, GGML_TYPE_F32, n_embd, Bd);
@@ -3346,11 +3348,20 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
     const int64_t U = hp_.n_expert_used;
     ggml_tensor * logits = nullptr;
     ggml_tensor * am = nullptr;   // the argmax of each position's logits, on the device
+    ggml_tensor * probs = nullptr;   // the head's softmax: the draft's own probability for the confidence gate
     if (!mtp_experts_host_) {
-        logits = gb.mtp_head(h, e, pv, mask, sections, il);
+        ggml_tensor * hres = nullptr;
+        logits = gb.mtp_head(h, e, pv, mask, sections, il, &hres);
         am = ggml_argmax(c, logits);
         ggml_set_output(am);
         ggml_build_forward_expand(g, am);
+        if (!actual) {
+            probs = ggml_soft_max(c, logits);
+            ggml_set_output(probs);
+            ggml_build_forward_expand(g, probs);
+            // Kept for a chained draft from the head's own residual (mtp_draft_next).
+            ggml_build_forward_expand(g, ggml_cpy(c, hres, ggml_view_3d(c, t_m_hres_, n_embd, hc, n, t_m_hres_->nb[1], t_m_hres_->nb[2], 0)));
+        }
         run_on(g, true);
     } else {
         // First half on the GPU: up to the routing and the shared expert.
@@ -3404,7 +3415,12 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
         ggml_set_output(am);
         ggml_build_forward_expand(g, am);
         // Kept for a second draft from the head's own residual (mtp_draft_next).
-        if (!actual) ggml_build_forward_expand(g, ggml_cpy(c, hres, ggml_view_3d(c, t_m_hres_, n_embd, hc, n, t_m_hres_->nb[1], t_m_hres_->nb[2], 0)));
+        if (!actual) {
+            ggml_build_forward_expand(g, ggml_cpy(c, hres, ggml_view_3d(c, t_m_hres_, n_embd, hc, n, t_m_hres_->nb[1], t_m_hres_->nb[2], 0)));
+            probs = ggml_soft_max(c, logits);
+            ggml_set_output(probs);
+            ggml_build_forward_expand(g, probs);
+        }
         run_on(g, true);
         t_mtp_post += std::chrono::duration<double>(std::chrono::steady_clock::now() - tq2).count();
     }
@@ -3412,6 +3428,10 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
     // caller samples the draft itself, which needs the last position's logits.
     std::vector<int32_t> top((size_t) n);
     ggml_backend_tensor_get(am, top.data(), 0, top.size() * sizeof(int32_t));
+    if (probs) {   // 4 bytes: the last position's probability at its argmax
+        const int64_t nv = probs->ne[0];
+        ggml_backend_tensor_get(probs, &mtp_p_, ((size_t) (n - 1) * nv + (size_t) top[n - 1]) * sizeof(float), sizeof(float));
+    }
     mtp_have_logits_ = false;
     if (mtp_want_logits_ && !actual) {
         const int64_t nv = logits->ne[0];
@@ -3437,7 +3457,7 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
 
 bool engine::mtp_draft_next(std::string & err, int32_t from_tok) {
     mtp_draft2_ = -1;
-    if (!mtp_ready() || !mtp_experts_host_ || mtp_draft_ < 0 || mtp_hres_rows_ < 1 || !t_m_hres_) return true;
+    if (!mtp_ready() || mtp_draft_ < 0 || mtp_hres_rows_ < 1 || !t_m_hres_) return true;
     const int64_t n_embd = hp_.n_embd;
     const int32_t d1 = mtp_draft_;
     const int32_t dlast = from_tok >= 0 ? from_tok : mtp_n_drafts_ >= 1 ? mtp_drafts_[mtp_n_drafts_ - 1] : d1;   // chain from the last draft, or the caller's
@@ -3461,16 +3481,17 @@ bool engine::mtp_draft_next(std::string & err, int32_t from_tok) {
     const bool want = mtp_want_logits_;
     std::vector<float> keep;
     if (want && mtp_have_logits_) keep = mtp_logits_;   // the first draft's distribution, restored below
+    const float p1 = mtp_p_;
     if (!mtp_draft(pos2, 1, hrow, t_mtp_emb_, 0, nullptr, 0, err, t_m_hres_)) return false;
-    mtp_draft2_ = mtp_draft_;
-    mtp_draft_  = d1;
+    mtp_draft2_ = mtp_draft_; mtp_p2_ = mtp_p_;
+    mtp_draft_  = d1;         mtp_p_  = p1;
     mtp_hres_rows_ = 1; mtp_last_pos_ = pos2;
     if (want) { mtp_logits2_ = mtp_logits_; mtp_have_logits2_ = mtp_have_logits_; if (!keep.empty()) { mtp_logits_ = keep; mtp_have_logits_ = true; } }
     if (from_tok >= 0 && mtp_n_drafts_ >= 1 && mtp_n_drafts_ < MTP_MAX_DRAFTS) {
         // The caller replaced the last draft by its sample; record the chained one after it.
         mtp_drafts_[mtp_n_drafts_ - 1] = from_tok;
         const int j = mtp_n_drafts_;
-        mtp_drafts_[j] = mtp_draft2_; mtp_n_drafts_ = j + 1;
+        mtp_drafts_[j] = mtp_draft2_; mtp_p_k_[j] = mtp_p2_; mtp_n_drafts_ = j + 1;
         mtp_have_logits_k_[j] = mtp_have_logits2_;
         if (mtp_have_logits2_) mtp_logits_k_[j] = mtp_logits2_;
     }
@@ -3570,19 +3591,19 @@ bool engine::mtp_step(const int32_t * next_toks, int n, std::string & err) {
     ggml_backend_tensor_set(t_mtp_emb_, xfer_.data(), 0, (size_t) n * n_embd * sizeof(float));
     if (!mtp_draft(n_past_ - n, n, mtp_h_rows_ - n, t_mtp_emb_, 0, nullptr, 0, err)) return false;
     if (mtp_draft_ >= 0) {
-        mtp_drafts_[0] = mtp_draft_; mtp_n_drafts_ = 1;
+        mtp_drafts_[0] = mtp_draft_; mtp_p_k_[0] = mtp_p_; mtp_n_drafts_ = 1;
         mtp_have_logits_k_[0] = mtp_have_logits_;
         if (mtp_have_logits_) mtp_logits_k_[0] = mtp_logits_;
     }
     return true;
 }
 
-bool engine::mtp_draft_more(int k, std::string & err) {
-    while (mtp_n_drafts_ >= 1 && mtp_n_drafts_ < std::min(k, MTP_MAX_DRAFTS)) {
+bool engine::mtp_draft_more(int k, std::string & err, float min_p) {
+    while (mtp_n_drafts_ >= 1 && mtp_n_drafts_ < std::min(k, MTP_MAX_DRAFTS) && mtp_p_k_[mtp_n_drafts_ - 1] >= min_p) {
         if (!mtp_draft_next(err)) return false;
         if (mtp_draft2_ < 0) break;
         const int j = mtp_n_drafts_;
-        mtp_drafts_[j] = mtp_draft2_; mtp_n_drafts_ = j + 1;
+        mtp_drafts_[j] = mtp_draft2_; mtp_p_k_[j] = mtp_p2_; mtp_n_drafts_ = j + 1;
         mtp_have_logits_k_[j] = mtp_have_logits2_;
         if (mtp_have_logits2_) mtp_logits_k_[j] = mtp_logits2_;
     }
