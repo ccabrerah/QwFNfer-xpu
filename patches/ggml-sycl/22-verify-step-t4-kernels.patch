@@ -1,0 +1,325 @@
+From: Carlos Cabrera H. <6750732+ccabrerah@users.noreply.github.com>
+Subject: [PATCH 22] ggml-sycl: one-token decode kernels for 1-4 tokens (the MTP verify step)
+
+mmvw (bf16/f16 wide matvec) templated on 1-4 columns, each weight row read once; the fused q2_0 MoE gate+up+SwiGLU
+with a token dimension; smallk with a batch dimension. A T-token call gives the same bits as T one-token calls
+(apply_mmvw_nt_v17.py, apply_moe_glu_nt.py, apply_smallk_batch.py in the research scripts).
+
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -5275,23 +5275,34 @@
+     const ggml_tensor_extra_gpu * eu = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
+     if ((eg && eg->optimized_feature.reorder) || (eu && eu->optimized_feature.reorder)) return false;
+     if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) return false;
+-    // one token, one input row shared by every expert: x [K, 1, 1], ids [n, 1]
+-    if (x->ne[1] != 1 || x->ne[2] != 1 || x->ne[3] != 1 || ids->ne[1] != 1) return false;
++    // 1-4 tokens, one input row per token shared by its experts: x [K, 1, T], ids [n, T]
++    constexpr int MOE_GLU_MAX_T = 4;
++    const int64_t T = x->ne[2];
++    if (x->ne[1] != 1 || T < 1 || T > MOE_GLU_MAX_T || x->ne[3] != 1 || ids->ne[1] != T) return false;
++    if (ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) || ids->nb[1] % sizeof(int32_t) != 0) return false;
+     const int64_t K = x->ne[0];
+     if (wg->ne[0] != K || wu->ne[0] != K || K % QK2_0 != 0 || K % QK8_1 != 0) return false;
+     if (wg->ne[1] != wu->ne[1] || wg->ne[2] != wu->ne[2]) return false;
+     if (wg->nb[1] != (size_t) (K / QK2_0) * sizeof(block_q2_0) || wu->nb[1] != wg->nb[1]) return false;   // packed rows
+-    if (glu->type != GGML_TYPE_F32 || glu->ne[0] != wg->ne[1] || glu->ne[1] != ids->ne[0] || glu->ne[2] != 1) return false;
++    if (glu->type != GGML_TYPE_F32 || glu->ne[0] != wg->ne[1] || glu->ne[1] != ids->ne[0] || glu->ne[2] != T) return false;
+     if (glu->nb[0] != sizeof(float)) return false;
+ 
+     scope_op_debug_print scope_dbg_print(__func__, glu, /*num_src=*/2, " : q2_0 MoE gate + up + swiglu");
+     const queue_ptr stream = ctx.stream();
+     const int padded = GGML_PAD((int) K, MATRIX_ROW_PADDING);
+-    ggml_sycl_pool_alloc<char> q8(ctx.pool(), (size_t) padded * sizeof(block_q8_1) / QK8_1);
+-    quantize_row_q8_1_sycl<quantize_q8_1>((const float *) x->data, q8.get(), (int) K, 1, padded, stream);
++    const int y_tok_blocks = padded / QK8_1;
++    ggml_sycl_pool_alloc<char> q8(ctx.pool(), (size_t) T * padded * sizeof(block_q8_1) / QK8_1);
++    if (T == 1 || padded == K) {   // the rows are one flat run of 32-value blocks
++        quantize_row_q8_1_sycl<quantize_q8_1>((const float *) x->data, q8.get(), (int) K, (int) T, padded, stream);
++    } else {
++        for (int64_t t = 0; t < T; t++)
++            quantize_row_q8_1_sycl<quantize_q8_1>((const float *) ((const char *) x->data + t * x->nb[2]),
++                q8.get() + (size_t) t * y_tok_blocks * sizeof(block_q8_1), (int) K, 1, padded, stream);
++    }
+     ggml_sycl_mul_mat_vec_q2_0_moe_glu(wg->data, wu->data, q8.get(), (const int32_t *) ids->data, (float *) glu->data,
+                                        (int) K, (int) wg->ne[1], (int) ids->ne[0], wg->nb[2], wu->nb[2], glu->nb[1], stream,
+-                                       wg->type == GGML_TYPE_Q2_0_SOA);
++                                       wg->type == GGML_TYPE_Q2_0_SOA, (int) T, y_tok_blocks,
++                                       (int) (ids->nb[1] / sizeof(int32_t)), glu->nb[2]);
+     return true;
+ }
+ 
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -3137,15 +3137,17 @@
+ static void mul_mat_vec_q2_0_moe_glu_wide(
+     const void * __restrict__ vx_gate, const void * __restrict__ vx_up, const void * __restrict__ vy,
+     float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev, const int ncols, const int nrows,
+-    const size_t stride_gate, const size_t stride_up, const size_t dst_row_stride, const sycl::nd_item<3> & it) {
++    const size_t stride_gate, const size_t stride_up, const size_t dst_row_stride, const int n_used,
++    const int y_tok_blocks, const int ids_tok_stride, const size_t dst_tok_stride, const sycl::nd_item<3> & it) {
+     constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
+-    const int expert_idx = it.get_group(1);
+-    const int i02        = ids_dev[expert_idx];
++    const int tok        = it.get_group(1) / n_used;
++    const int expert_idx = it.get_group(1) % n_used;
++    const int i02        = ids_dev[tok * ids_tok_stride + expert_idx];
+     const int lane       = it.get_local_id(2);
+     const int row        = (it.get_group(2) * it.get_local_range(1) + it.get_local_id(1)) * ROWS_PER_SG + lane / LPR;
+     const int t          = lane % LPR;
+-    const block_q8_1 * y = (const block_q8_1 *) vy;              // one input, shared by every expert
+-    float * dst = (float *) ((char *) dst_base + (size_t) expert_idx * dst_row_stride);
++    const block_q8_1 * y = (const block_q8_1 *) vy + (size_t) tok * y_tok_blocks;   // the token's input, shared by its experts
++    float * dst = (float *) ((char *) dst_base + (size_t) tok * dst_tok_stride + (size_t) expert_idx * dst_row_stride);
+ 
+     const int blocks_per_row = ncols / QK2_0;
+     float g = 0.0f, u = 0.0f;
+@@ -3176,22 +3178,22 @@
+ void ggml_sycl_mul_mat_vec_q2_0_moe_glu(const void * vx_gate, const void * vx_up, const void * vy, const int32_t * ids_dev,
+                                         float * dst_base, int ncols, int nrows, int n_experts_used,
+                                         size_t stride_gate, size_t stride_up, size_t dst_row_stride, dpct::queue_ptr stream,
+-                                        bool soa) {
++                                        bool soa, int n_tokens, int y_tok_blocks, int ids_tok_stride, size_t dst_tok_stride) {
+     const int blocks_per_row = ncols / QK2_0;
+     constexpr int SG_PER_WG = 4;
+     auto go = [&](auto lpr_tag) {
+         constexpr int LPR = decltype(lpr_tag)::value;
+         constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
+         const int n_sg = (nrows + ROWS_PER_SG - 1) / ROWS_PER_SG;
+-        const sycl::range<3> block_nums(1, (unsigned) n_experts_used, (unsigned) ((n_sg + SG_PER_WG - 1) / SG_PER_WG));
++        const sycl::range<3> block_nums(1, (unsigned) (n_experts_used * n_tokens), (unsigned) ((n_sg + SG_PER_WG - 1) / SG_PER_WG));
+         const sycl::range<3> block_dims(1, SG_PER_WG, WARP_SIZE);
+         stream->submit([&](sycl::handler & cgh) {
+             cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                 [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                     if (soa) mul_mat_vec_q2_0_moe_glu_wide<LPR, true>(vx_gate, vx_up, vy, dst_base, ids_dev, ncols, nrows,
+-                        stride_gate, stride_up, dst_row_stride, item);
++                        stride_gate, stride_up, dst_row_stride, n_experts_used, y_tok_blocks, ids_tok_stride, dst_tok_stride, item);
+                     else     mul_mat_vec_q2_0_moe_glu_wide<LPR, false>(vx_gate, vx_up, vy, dst_base, ids_dev, ncols, nrows,
+-                        stride_gate, stride_up, dst_row_stride, item);
++                        stride_gate, stride_up, dst_row_stride, n_experts_used, y_tok_blocks, ids_tok_stride, dst_tok_stride, item);
+                 });
+         });
+     };
+diff --git a/ggml/src/ggml-sycl/mmvq.hpp b/ggml/src/ggml-sycl/mmvq.hpp
+--- a/ggml/src/ggml-sycl/mmvq.hpp
++++ b/ggml/src/ggml-sycl/mmvq.hpp
+@@ -89,4 +89,4 @@
+ void ggml_sycl_mul_mat_vec_q2_0_moe_glu(const void * vx_gate, const void * vx_up, const void * vy, const int32_t * ids_dev,
+                                         float * dst_base, int ncols, int nrows, int n_experts_used,
+                                         size_t stride_gate, size_t stride_up, size_t dst_row_stride, dpct::queue_ptr stream,
+-                                        bool soa = false);
++                                        bool soa = false, int n_tokens = 1, int y_tok_blocks = 0, int ids_tok_stride = 0, size_t dst_tok_stride = 0);
+diff --git a/ggml/src/ggml-sycl/mmvw.cpp b/ggml/src/ggml-sycl/mmvw.cpp
+--- a/ggml/src/ggml-sycl/mmvw.cpp
++++ b/ggml/src/ggml-sycl/mmvw.cpp
+@@ -14,14 +14,16 @@
+ namespace {
+ 
+ constexpr int MMVW_WG = 256;
++constexpr int MMVW_MAX_NT = 4;   // tokens per call (the MTP verify step)
+ 
+ template <typename T> inline float mmvw_to_f32(T v);
+ template <> inline float mmvw_to_f32<sycl::half>(sycl::half v) { return (float) v; }
+ template <> inline float mmvw_to_f32<sycl::ext::oneapi::bfloat16>(sycl::ext::oneapi::bfloat16 v) { return (float) v; }
+ 
+-template <typename T, int TPR, bool SILU = false>
++template <typename T, int TPR, int NT, bool SILU = false>
+ void mmvw_kernel(const T * __restrict__ W, const float * __restrict__ x, float * __restrict__ y,
+                  const int64_t ncols, const int64_t nrows, const int64_t row_stride,
++                 const int64_t xs, const int64_t ys,
+                  const sycl::nd_item<1> & it, float * slm) {
+     constexpr int RPW = MMVW_WG / TPR;            // rows per work-group
+     constexpr int SG_PER_ROW = TPR / WARP_SIZE;
+@@ -30,42 +32,55 @@
+     const int t = lid % TPR;
+     const int64_t row = (int64_t) it.get_group(0) * RPW + r_local;
+ 
+-    float acc = 0.0f;
++    float acc[NT];
++#pragma unroll
++    for (int c = 0; c < NT; c++) acc[c] = 0.0f;
+     if (row < nrows) {
+         const T * wr = W + row * row_stride;
+         for (int64_t k = (int64_t) t * 8; k < ncols; k += (int64_t) TPR * 8) {
+             const sycl::vec<uint16_t, 8> wv = *reinterpret_cast<const sycl::vec<uint16_t, 8> *>(wr + k);
+-            const sycl::float4 x0 = *reinterpret_cast<const sycl::float4 *>(x + k);
+-            const sycl::float4 x1 = *reinterpret_cast<const sycl::float4 *>(x + k + 4);
+             T w8[8];
+ #pragma unroll
+             for (int j = 0; j < 8; j++) w8[j] = sycl::bit_cast<T>(wv[j]);
+-            acc += mmvw_to_f32(w8[0]) * x0.x() + mmvw_to_f32(w8[1]) * x0.y() + mmvw_to_f32(w8[2]) * x0.z() + mmvw_to_f32(w8[3]) * x0.w()
+-                 + mmvw_to_f32(w8[4]) * x1.x() + mmvw_to_f32(w8[5]) * x1.y() + mmvw_to_f32(w8[6]) * x1.z() + mmvw_to_f32(w8[7]) * x1.w();
++#pragma unroll
++            for (int c = 0; c < NT; c++) {   // the one-token expression, per column
++                const sycl::float4 x0 = *reinterpret_cast<const sycl::float4 *>(x + c * xs + k);
++                const sycl::float4 x1 = *reinterpret_cast<const sycl::float4 *>(x + c * xs + k + 4);
++                acc[c] += mmvw_to_f32(w8[0]) * x0.x() + mmvw_to_f32(w8[1]) * x0.y() + mmvw_to_f32(w8[2]) * x0.z() + mmvw_to_f32(w8[3]) * x0.w()
++                        + mmvw_to_f32(w8[4]) * x1.x() + mmvw_to_f32(w8[5]) * x1.y() + mmvw_to_f32(w8[6]) * x1.z() + mmvw_to_f32(w8[7]) * x1.w();
++            }
+         }
+     }
+     // A subgroup never straddles two rows: TPR is a multiple of the subgroup size.
+     auto sg = it.get_sub_group();
+-    acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
++#pragma unroll
++    for (int c = 0; c < NT; c++) acc[c] = sycl::reduce_over_group(sg, acc[c], sycl::plus<float>());
+     if constexpr (SG_PER_ROW == 1) {
+-        if (row < nrows && sg.get_local_linear_id() == 0) y[row] = SILU ? acc / (1.0f + sycl::exp(-acc)) : acc;
++        if (row < nrows && sg.get_local_linear_id() == 0) {
++#pragma unroll
++            for (int c = 0; c < NT; c++) y[c * ys + row] = SILU ? acc[c] / (1.0f + sycl::exp(-acc[c])) : acc[c];
++        }
+     } else {
+-        // Every lane reaches the barrier, including those past the last row.
++        // Every lane reaches the barriers, including those past the last row.
+         const int sg_id = lid / WARP_SIZE;
+-        if (sg.get_local_linear_id() == 0) slm[sg_id] = acc;
+-        sycl::group_barrier(it.get_group());
+-        if (t == 0 && row < nrows) {
+-            float s = 0.0f;
+ #pragma unroll
+-            for (int i = 0; i < SG_PER_ROW; i++) s += slm[r_local * SG_PER_ROW + i];
+-            y[row] = SILU ? s / (1.0f + sycl::exp(-s)) : s;
++        for (int c = 0; c < NT; c++) {
++            if (c > 0) sycl::group_barrier(it.get_group());   // the previous column's reads are done
++            if (sg.get_local_linear_id() == 0) slm[sg_id] = acc[c];
++            sycl::group_barrier(it.get_group());
++            if (t == 0 && row < nrows) {
++                float s = 0.0f;
++#pragma unroll
++                for (int i = 0; i < SG_PER_ROW; i++) s += slm[r_local * SG_PER_ROW + i];
++                y[c * ys + row] = SILU ? s / (1.0f + sycl::exp(-s)) : s;
++            }
+         }
+     }
+ }
+ 
+-template <typename T, int TPR, bool SILU = false>
++template <typename T, int TPR, int NT, bool SILU = false>
+ void mmvw_launch(const void * W, const float * x, float * y, int64_t ncols, int64_t nrows, int64_t row_stride,
+-                 dpct::queue_ptr stream) {
++                 int64_t xs, int64_t ys, dpct::queue_ptr stream) {
+     constexpr int RPW = MMVW_WG / TPR;
+     const int64_t n_wg = (nrows + RPW - 1) / RPW;
+     stream->submit([&](sycl::handler & cgh) {
+@@ -73,22 +88,33 @@
+         const T * Wt = (const T *) W;
+         cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(n_wg * MMVW_WG), sycl::range<1>(MMVW_WG)),
+                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+-                             mmvw_kernel<T, TPR, SILU>(Wt, x, y, ncols, nrows, row_stride, it,
++                             mmvw_kernel<T, TPR, NT, SILU>(Wt, x, y, ncols, nrows, row_stride, xs, ys, it,
+                                                  slm.get_multi_ptr<sycl::access::decorated::no>().get());
+                          });
+     });
+ }
+ 
+-template <typename T, bool SILU = false>
+-void mmvw_dispatch(const void * W, const float * x, float * y, int64_t ncols, int64_t nrows, int64_t row_stride,
+-                   dpct::queue_ptr stream) {
++template <typename T, int NT, bool SILU>
++void mmvw_dispatch_nt(const void * W, const float * x, float * y, int64_t ncols, int64_t nrows, int64_t row_stride,
++                      int64_t xs, int64_t ys, dpct::queue_ptr stream) {
+     // More lanes per row when there are few rows, so the GPU has work for its width.
+     if (nrows <= 64 && ncols >= 256 * 8) {
+-        mmvw_launch<T, 256, SILU>(W, x, y, ncols, nrows, row_stride, stream);
++        mmvw_launch<T, 256, NT, SILU>(W, x, y, ncols, nrows, row_stride, xs, ys, stream);
+     } else if (nrows <= 1024 && ncols >= 64 * 8) {
+-        mmvw_launch<T, 64, SILU>(W, x, y, ncols, nrows, row_stride, stream);
++        mmvw_launch<T, 64, NT, SILU>(W, x, y, ncols, nrows, row_stride, xs, ys, stream);
+     } else {
+-        mmvw_launch<T, 16, SILU>(W, x, y, ncols, nrows, row_stride, stream);
++        mmvw_launch<T, 16, NT, SILU>(W, x, y, ncols, nrows, row_stride, xs, ys, stream);
++    }
++}
++
++template <typename T, bool SILU = false>
++void mmvw_dispatch(const void * W, const float * x, float * y, int64_t ncols, int64_t nrows, int64_t row_stride,
++                   int64_t nt, int64_t xs, int64_t ys, dpct::queue_ptr stream) {
++    switch (nt) {
++        case 1:  mmvw_dispatch_nt<T, 1, SILU>(W, x, y, ncols, nrows, row_stride, xs, ys, stream); break;
++        case 2:  mmvw_dispatch_nt<T, 2, SILU>(W, x, y, ncols, nrows, row_stride, xs, ys, stream); break;
++        case 3:  mmvw_dispatch_nt<T, 3, SILU>(W, x, y, ncols, nrows, row_stride, xs, ys, stream); break;
++        default: mmvw_dispatch_nt<T, 4, SILU>(W, x, y, ncols, nrows, row_stride, xs, ys, stream); break;
+     }
+ }
+ 
+@@ -102,8 +128,8 @@
+ bool ggml_sycl_mmvw_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+     if (src0->type != GGML_TYPE_BF16 && src0->type != GGML_TYPE_F16) return false;
+     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+-    // one token, no batch dimensions: the decode shape
+-    if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) return false;
++    // 1-4 tokens (decode, an MTP verify step), no batch dimensions
++    if (src1->ne[1] < 1 || src1->ne[1] > MMVW_MAX_NT || src1->ne[2] != 1 || src1->ne[3] != 1) return false;
+     if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
+     const int64_t ncols = src0->ne[0];
+     if (ncols % 8 != 0 || src1->ne[0] != ncols) return false;
+@@ -119,15 +145,18 @@
+                     bool silu, ggml_tensor * out) {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+     dpct::queue_ptr stream = ctx.stream();
+-    const int64_t ncols = src0->ne[0], nrows = src0->ne[1];
++    const int64_t ncols = src0->ne[0], nrows = src0->ne[1], nt = src1->ne[1];
+     const int64_t row_stride = src0->nb[1] / ggml_type_size(src0->type);
+-    float * y = (float *) (out ? out->data : dst->data);   // with the SiLU fused, into the UNARY's tensor
++    const ggml_tensor * yt = out ? out : dst;             // with the SiLU fused, into the UNARY's tensor
++    float * y = (float *) yt->data;
++    const int64_t xs = src1->nb[1] / sizeof(float), ys = yt->nb[1] / sizeof(float);   // column strides
++    const float * x = (const float *) src1->data;
+     if (src0->type == GGML_TYPE_BF16) {
+-        if (silu) mmvw_dispatch<sycl::ext::oneapi::bfloat16, true>(src0->data, (const float *) src1->data, y, ncols, nrows, row_stride, stream);
+-        else      mmvw_dispatch<sycl::ext::oneapi::bfloat16>(src0->data, (const float *) src1->data, y, ncols, nrows, row_stride, stream);
++        if (silu) mmvw_dispatch<sycl::ext::oneapi::bfloat16, true>(src0->data, x, y, ncols, nrows, row_stride, nt, xs, ys, stream);
++        else      mmvw_dispatch<sycl::ext::oneapi::bfloat16>(src0->data, x, y, ncols, nrows, row_stride, nt, xs, ys, stream);
+     } else {
+-        if (silu) mmvw_dispatch<sycl::half, true>(src0->data, (const float *) src1->data, y, ncols, nrows, row_stride, stream);
+-        else      mmvw_dispatch<sycl::half>(src0->data, (const float *) src1->data, y, ncols, nrows, row_stride, stream);
++        if (silu) mmvw_dispatch<sycl::half, true>(src0->data, x, y, ncols, nrows, row_stride, nt, xs, ys, stream);
++        else      mmvw_dispatch<sycl::half>(src0->data, x, y, ncols, nrows, row_stride, nt, xs, ys, stream);
+     }
+ }
+ 
+@@ -165,11 +194,14 @@
+     if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+     const int64_t K = src0->ne[0];
+     if (K < 1 || K > 32 || src1->ne[0] != K) return false;
+-    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) return false;
++    // smallk batch: src1 and dst over ne[2] batches, src0 per batch or broadcast; no 4th dimension
++    if (src0->ne[3] != 1 || src1->ne[3] != 1 || dst->ne[3] != 1) return false;
++    if (src0->ne[2] != 1 && src0->ne[2] != src1->ne[2]) return false;
++    if (dst->ne[2] != src1->ne[2]) return false;
+     // element-contiguous rows; any row strides
+     if (src0->nb[0] != sizeof(float) || src1->nb[0] != sizeof(float)) return false;
+     if (!ggml_is_contiguous(dst)) return false;
+-    return src0->ne[1] * src1->ne[1] <= (int64_t) 1 << 24;
++    return src0->ne[1] * src1->ne[1] * src1->ne[2] <= (int64_t) 1 << 24;
+ }
+ 
+ void ggml_sycl_smallk(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -178,18 +210,20 @@
+     const int     K   = (int) src0->ne[0];
+     const int64_t M   = src0->ne[1], N = src1->ne[1];
+     const int64_t s0  = src0->nb[1] / sizeof(float), s1 = src1->nb[1] / sizeof(float);
++    const int64_t B   = src1->ne[2];
++    const int64_t s0b = src0->ne[2] == 1 ? 0 : src0->nb[2] / sizeof(float), s1b = src1->nb[2] / sizeof(float);
+     const float * a   = (const float *) src0->data;
+     const float * b   = (const float *) src1->data;
+     float *       d   = (float *) dst->data;
+-    const int64_t n_out = M * N;
++    const int64_t n_out = M * N * B;
+     const int64_t wg = 256;
+     stream->parallel_for(sycl::nd_range<1>(sycl::range<1>(((n_out + wg - 1) / wg) * wg), sycl::range<1>(wg)),
+         [=](sycl::nd_item<1> it) {
+             const int64_t i = it.get_global_id(0);
+             if (i >= n_out) return;
+-            const int64_t m = i % M, n = i / M;          // dst is [M, N]: m fastest
+-            const float * ar = a + m * s0;
+-            const float * br = b + n * s1;
++            const int64_t m = i % M, n = (i / M) % N, bb = i / (M * N);   // dst is [M, N, B]: m fastest
++            const float * ar = a + bb * s0b + m * s0;
++            const float * br = b + bb * s1b + n * s1;
+             float acc = 0.0f;
+             for (int k = 0; k < K; k++) acc += ar[k] * br[k];
+             d[i] = acc;

@@ -1069,7 +1069,6 @@ int main(int argc, char ** argv) {
             prefix_cache_min = cfg.n_ctx / 2;
             fprintf(stderr, "note: --prefix-cache-min defaults to %ld at --ctx %u\n", prefix_cache_min, cfg.n_ctx);
         }
-        if (!cfg.mtp_path.empty()) { fprintf(stderr, "--prefix-cache: not supported with --mtp (the draft head's state is not checkpointed)\n"); return 1; }
         // The pool is ordinary host memory next to the pinned RAM tier; leave the
         // system some room rather than find out under the OOM killer.
         const double phys = (double) sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE);

@@ -279,15 +279,20 @@ public:
     // keys, the decode bias) are rebuilt after a restore, as after a prefill. Image
     // embedding overrides are not kept: one is read only while its position is
     // evaluated, so below n_past its effect is already in the caches; a restore
-    // drops them all, since another sequence's could land in the new tail. Not
-    // supported with the draft head, whose own state is not captured.
+    // drops them all, since another sequence's could land in the new tail. With the
+    // draft head: its own caches for the same positions, and the last position's wide
+    // residual (the head's input for the row the next eval completes), so drafting
+    // goes on after a restore instead of switching itself off for the sequence.
     struct checkpoint {
         int32_t              n_past = 0;
         uint32_t             n_ctx = 0;
         ggml_type            type_k = GGML_TYPE_COUNT, type_v = GGML_TYPE_COUNT;
         bool                 kv_host = false, idx_host = false;
         std::vector<uint8_t> st;
-        size_t bytes() const { return st.size(); }
+        std::vector<uint8_t> mtp_st;            // the head's state (empty without the head)
+        std::vector<float>   mtp_h;             // the last position's wide residual [n_embd * hc], or empty
+        bool                 mtp_kv_valid = false;
+        size_t bytes() const { return st.size() + mtp_st.size() + mtp_h.size() * sizeof(float); }
     };
     size_t  checkpoint_bytes() const;      // what checkpoint_save() would hold now
     bool    checkpoint_save(checkpoint & out, std::string & err);

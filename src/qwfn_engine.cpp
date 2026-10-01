@@ -757,11 +757,13 @@ void engine::reset() {
 }
 
 size_t engine::checkpoint_bytes() const {
-    return st_.checkpoint_bytes(n_past_);
+    size_t b = st_.checkpoint_bytes(n_past_);
+    if (mtp_on_) b += st_mtp_.checkpoint_bytes(n_past_) + (size_t) hp_.n_embd * hp_.hc_count * sizeof(float);
+    return b;
 }
 
 bool engine::checkpoint_save(checkpoint & out, std::string & err) {
-    if (mtp_on_) { err = "checkpoint: not supported with the draft head"; return false; }
+    (void) err;
     ggml_backend_synchronize(w_.backend());
     const state_config & sc = st_.config();
     out.n_past = n_past_;
@@ -774,11 +776,21 @@ bool engine::checkpoint_save(checkpoint & out, std::string & err) {
     if (out.st.capacity() < need) std::vector<uint8_t>().swap(out.st);
     out.st.resize(need);
     st_.save(n_past_, out.st.data());
+    out.mtp_st.clear(); out.mtp_h.clear(); out.mtp_kv_valid = false;
+    if (mtp_on_) {
+        out.mtp_st.resize(st_mtp_.checkpoint_bytes(n_past_));
+        st_mtp_.save(n_past_, out.mtp_st.data());
+        out.mtp_kv_valid = mtp_kv_valid_;
+        if (mtp_have_h_ && mtp_h_rows_ >= 1) {   // the last evaluated position's row of t_hlast_
+            const size_t row = (size_t) hp_.n_embd * hp_.hc_count;
+            out.mtp_h.resize(row);
+            ggml_backend_tensor_get(t_hlast_, out.mtp_h.data(), (size_t) (mtp_h_rows_ - 1) * t_hlast_->nb[2], row * sizeof(float));
+        }
+    }
     return true;
 }
 
 bool engine::checkpoint_restore(const checkpoint & in, std::string & err) {
-    if (mtp_on_) { err = "checkpoint: not supported with the draft head"; return false; }
     const state_config & sc = st_.config();
     if (in.n_ctx != sc.n_ctx || in.type_k != sc.type_k || in.type_v != sc.type_v ||
         in.kv_host != sc.kv_host || in.idx_host != sc.idx_host) {
@@ -794,6 +806,16 @@ bool engine::checkpoint_restore(const checkpoint & in, std::string & err) {
     st_.restore(in.n_past, in.st.data());
     clear_embeddings();
     n_past_ = in.n_past;
+    if (mtp_on_) {
+        const size_t row = (size_t) hp_.n_embd * hp_.hc_count;
+        if (in.mtp_st.size() == st_mtp_.checkpoint_bytes(in.n_past) && in.mtp_h.size() == row && in.mtp_kv_valid) {
+            st_mtp_.restore(in.n_past, in.mtp_st.data());
+            ggml_backend_tensor_set(t_hlast_, in.mtp_h.data(), 0, row * sizeof(float));   // row 0: the next eval's head row
+            mtp_have_h_ = true; mtp_h_rows_ = 1; mtp_kv_valid_ = true;
+        } else {
+            mtp_kv_valid_ = false;   // a checkpoint without the head's state: no drafts for this sequence
+        }
+    }
     return true;
 }
 
