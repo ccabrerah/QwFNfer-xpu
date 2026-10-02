@@ -499,6 +499,10 @@ int main(int argc, char ** argv) {
     printf("              tiers: %llu promotions, %llu RAM evictions, %llu cold-file reads, %llu upgrades\n",
            (unsigned long long) s.promotions, (unsigned long long) s.evictions,
            (unsigned long long) s.cold_tier_reads, (unsigned long long) s.upgrades);
+    if (s.swaps || s.swap_dropped)
+        printf("              exclusive: %llu swaps (%llu took a resident's slot), %llu victims dropped, %llu converted for the CPU\n",
+               (unsigned long long) s.swaps, (unsigned long long) s.swap_evictions, (unsigned long long) s.swap_dropped,
+               (unsigned long long) s.swap_converts);
     {
         const auto c = eng.ram_census();
         printf("              RAM tier at end: %llu slots = %llu hot + %llu cold (%llu of them hot-worthy) + %llu empty; %llu prefetched unused, %llu in flight; %llu experts marked hot-worthy\n",

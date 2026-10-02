@@ -7,6 +7,8 @@
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace qwfn {
 
@@ -155,6 +157,7 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
         lp.slot_cold.assign(lp.n_slots, 0);
         lp.slot_speculative.assign(lp.n_slots, 0);
         lp.slot_pinned.assign(lp.n_slots, 0);
+        lp.slot_soa.assign(lp.n_slots, 0);
         lp.slot_freq.assign(lp.n_slots, 0);
         lp.ef.assign(hot->hp().n_expert, 0);
         lp.slot_used.assign(lp.n_slots, 0);
@@ -323,6 +326,20 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
         }
     }
 
+    if (cfg.exclusive) {
+        // A swap reads the victim's device bytes straight into a free RAM slot, before the upload that overwrites
+        // them on the same in-order stream: it needs the VRAM tier and asynchronous promotions from a pinned arena,
+        // and one file (a cold block has other types). Device layouts go back by to_file_layout(): Q2_0_SOA and
+        // IQ4_NL_SOA are both 18-byte blocks (a 2-byte scale, 16 code bytes) in the file.
+        const char * why = nullptr;
+        if (!vram_buf_) why = "no VRAM tier";
+        else if (!cfg.vram_backend || !cfg.async_promote || !arena_pinned_) why = "promotions are not asynchronous from a pinned arena";
+        else if (cold_) why = "a cold tier is in use";
+        else if (ggml_type_size(GGML_TYPE_Q2_0) != 18 || ggml_type_size(GGML_TYPE_IQ4_NL) != 18) why = "unexpected block sizes";
+        if (why) fprintf(stderr, "[qwfn] exclusive expert tiers requested but off: %s\n", why);
+        else { exclusive_ = true; exclusive_split(hot->hp().n_expert); }
+    }
+
     arena_buf_ = ggml_backend_cpu_buffer_from_ptr(arena_, arena_bytes_);
     if (!arena_buf_) { err = "failed to wrap the expert arena in a ggml buffer"; return false; }
 
@@ -330,6 +347,142 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
             arena_bytes_ / 1e9, arena_pinned_ ? " (pinned)" : "", total_slots_, n_layer * hot->hp().n_expert,
             100.0 * (double) total_slots_ / (double) (n_layer * hot->hp().n_expert));
     return true;
+}
+
+void expert_cache::exclusive_split(uint32_t n_expert) {
+    // What each layer's VRAM tier does not hold, in that layer's block bytes; the arena's spare bytes, if any, go to
+    // the layers evenly (room for in-flight reads and swaps); a short arena shrinks every layer by the same ratio.
+    const uint32_t n_layer = (uint32_t) blk_.size();
+    size_t need = 0;
+    auto want = [&](const layer_pool & lp) { return swaps_in(lp) ? n_expert - std::min(n_expert, lp.g_slots) : n_expert; };
+    for (const layer_pool & lp : blk_) need += (size_t) want(lp) * lp.block_bytes;
+    const double ratio = need > arena_bytes_ ? (double) arena_bytes_ / (double) need : 1.0;
+    size_t used = 0;
+    for (layer_pool & lp : blk_) {
+        lp.n_slots = (uint32_t) std::max<size_t>(2, (size_t) (want(lp) * ratio));
+        used += (size_t) lp.n_slots * lp.block_bytes;
+    }
+    // The floor of 2 slots (and the rounding) can overshoot a tight arena: take slots back from the largest layers.
+    while (used > arena_bytes_) {
+        layer_pool * big = nullptr;
+        for (layer_pool & lp : blk_) if (lp.n_slots > 2 && (!big || lp.n_slots > big->n_slots)) big = &lp;
+        if (!big) break;   // cannot happen: the arena is >= 1 GB, 2 slots a layer are ~0.15 GB
+        big->n_slots--; used -= big->block_bytes;
+    }
+    if (ratio >= 1.0) {   // spare: a slot more per layer while it fits
+        for (bool grew = true; grew; ) {
+            grew = false;
+            for (layer_pool & lp : blk_)
+                if (lp.n_slots < n_expert && used + lp.block_bytes <= arena_bytes_) { lp.n_slots++; used += lp.block_bytes; grew = true; }
+        }
+    }
+    size_t cursor = 0, covered = 0;
+    total_slots_ = 0;
+    for (layer_pool & lp : blk_) {
+        lp.base = arena_ + cursor;
+        cursor += (size_t) lp.n_slots * lp.block_bytes;
+        lp.slot_expert.assign(lp.n_slots, SLOT_EMPTY);
+        lp.slot_valid.assign(lp.n_slots, 0);
+        lp.slot_cold.assign(lp.n_slots, 0);
+        lp.slot_speculative.assign(lp.n_slots, 0);
+        lp.slot_pinned.assign(lp.n_slots, 0);
+        lp.slot_freq.assign(lp.n_slots, 0);
+        lp.slot_used.assign(lp.n_slots, 0);
+        lp.slot_soa.assign(lp.n_slots, 0);
+        lp.free_slots.clear();
+        std::fill(lp.expert_slot.begin(), lp.expert_slot.end(), -1);
+        total_slots_ += lp.n_slots;
+        covered += std::min<size_t>(n_expert, (size_t) lp.n_slots + lp.g_slots);
+    }
+    fprintf(stderr, "[qwfn] exclusive expert tiers%s: RAM slots split by what VRAM does not hold -- %zu RAM + %zu VRAM "
+                    "slots cover %zu of %u experts (%.1f%%; %.2f GB of RAM needed for all)\n",
+            cfg_.exclusive_lent_inclusive ? " (prefill-lent layers inclusive)" : "",
+            total_slots_, total_gslots_, covered, n_layer * n_expert, 100.0 * covered / (n_layer * n_expert), need / 1e9);
+}
+
+void expert_cache::release_slot(layer_pool & lp, int32_t s) {
+    const uint16_t e = lp.slot_expert[s];
+    if (e != SLOT_EMPTY && e < lp.expert_slot.size() && lp.expert_slot[e] == s) lp.expert_slot[e] = -1;
+    lp.slot_expert[s] = SLOT_EMPTY;
+    lp.slot_valid[s]  = 0;
+    lp.slot_speculative[s] = 0;
+    lp.slot_freq[s]   = 0;
+    lp.slot_soa[s]    = 0;
+    lp.slot_pinned[s] = 0;   // the expert moved to VRAM; a pinned empty slot would never be reused
+    if (lp.free_slots.size() < lp.n_slots) lp.free_slots.push_back(s);   // stale entries are skipped when popped
+}
+
+void expert_cache::finish_swap(const pending_swap & sw) {
+    layer_pool & lp = blk_[sw.layer];
+    auto in_vram = [&](uint32_t e) {
+        const int32_t g = lp.g_expert_slot[e];
+        return g >= 0 && lp.g_valid[g] && lp.g_slot_expert[g] == (uint16_t) e;
+    };
+    // The promoted expert's RAM slot: freed while the expert is VRAM-resident (its bytes were only read). A later
+    // promotion in the same window may have displaced it again; then the RAM copy stays and that swap's
+    // read-back of it is dropped below (expert_slot already points here).
+    const uint32_t e = sw.promoted;
+    if (lp.slot_expert[sw.from] == (uint16_t) e && lp.expert_slot[e] == sw.from && in_vram(e)) release_slot(lp, sw.from);
+    if (sw.to < 0) return;
+    // The victim's bytes have landed in sw.to (marked in flight: slot_expert = victim, slot_valid = 0, not mapped).
+    const uint16_t v = sw.victim;
+    if (lp.slot_expert[sw.to] != v || lp.slot_valid[sw.to]) { st_.swap_dropped++; return; }   // cannot happen: protected
+    if (lp.expert_slot[v] >= 0 || in_vram(v)) { st_.swap_dropped++; release_slot(lp, sw.to); return; }
+    lp.expert_slot[v]       = sw.to;
+    lp.slot_valid[sw.to]    = 1;
+    lp.slot_cold[sw.to]     = 0;
+    lp.slot_speculative[sw.to] = 0;
+    lp.slot_soa[sw.to]      = 1;
+    lp.slot_freq[sw.to]     = std::max<uint32_t>(1, lp.ef[v]);
+    lp.slot_used[sw.to]     = ++tick_;
+    st_.swaps++;
+    // QWFN_SWAP_CHECK=1 (diagnostic): the read-back block, in the file's layout, against the file.
+    static const bool check = getenv("QWFN_SWAP_CHECK") != nullptr;
+    if (check) {
+        static std::vector<int> fds;
+        static uint64_t checked = 0, bad = 0;
+        const auto & paths = hot_->shard_paths();
+        if (fds.empty()) for (const auto & path : paths) fds.push_back(::open(path.c_str(), O_RDONLY));
+        std::vector<uint8_t> blk(lp.block_bytes), file;
+        memcpy(blk.data(), slot_ptr(lp, (uint32_t) sw.to), lp.block_bytes);
+        soa_to_file(lp, blk.data());
+        bool ok = true;
+        for (int q = 0; q < EXPERT_NPARTS && ok; q++) {
+            const byte_range br = hot_->expert_range(sw.layer, v, (expert_part) q);
+            file.resize(br.nbytes);
+            ok = br.valid() && pread(fds[br.shard], file.data(), br.nbytes, (off_t) br.offset) == (ssize_t) br.nbytes &&
+                 memcmp(file.data(), blk.data() + lp.part_off[q] + lp.part_pay[q], br.nbytes) == 0;
+        }
+        checked++;
+        if (!ok && bad++ < 8) fprintf(stderr, "[qwfn] swap check: layer %u expert %u read back WRONG\n", sw.layer, (unsigned) v);
+        if ((checked & 1023) == 0) fprintf(stderr, "[qwfn] swap check: %llu read-backs checked, %llu wrong\n",
+                                           (unsigned long long) checked, (unsigned long long) bad);
+    }
+}
+
+void expert_cache::to_file_layout(layer_pool & lp, uint32_t s) {
+    if (s >= lp.slot_soa.size() || !lp.slot_soa[s]) return;
+    soa_to_file(lp, slot_ptr(lp, s));
+    lp.slot_soa[s] = 0;
+    st_.swap_converts++;
+}
+
+void expert_cache::soa_to_file(const layer_pool & lp, uint8_t * slot) {
+    for (int q = 0; q < EXPERT_NPARTS; q++) {
+        if (!is_soa(gpu_type(lp.part_type[q]))) continue;
+        // Q2_0_SOA / IQ4_NL_SOA (ggml-sycl patches 09, 17), uploaded as one slice: [codes of every block][scales of
+        // every block] -> 18-byte blocks, a 2-byte scale then 16 code bytes (both types)
+        const size_t bytes = lp.g_part_bytes[q], nblk = bytes / 18;
+        uint8_t * p = slot + lp.part_off[q] + lp.part_pay[q];
+        if (soa_scratch_.size() < bytes) soa_scratch_.resize(bytes);
+        memcpy(soa_scratch_.data(), p, bytes);
+        const uint8_t * codes = soa_scratch_.data(), * scales = codes + nblk * 16;
+        for (size_t j = 0; j < nblk; j++) {
+            p[j * 18 + 0] = scales[j * 2 + 0];
+            p[j * 18 + 1] = scales[j * 2 + 1];
+            memcpy(p + j * 18 + 2, codes + j * 16, 16);
+        }
+    }
 }
 
 void expert_cache::shutdown() {
@@ -407,7 +560,7 @@ int32_t expert_cache::choose_victim(layer_pool & lp) {
     for (uint32_t k = 0; k < cfg_.evict_samples; k++) {
         const uint32_t s = (uint32_t) (xorshift(rng) % lp.n_slots);
         if (lp.slot_pinned[s] || in_flight(s)) continue;
-        if (lp.slot_expert[s] == SLOT_EMPTY) return (int32_t) s;
+        if (lp.slot_expert[s] == SLOT_EMPTY) { lp.slot_soa[s] = 0; return (int32_t) s; }
         // lru    : evict the slot untouched longest.
         // lfu    : evict the expert with the fewest lifetime uses (survives eviction).
         // hybrid : frequency, tie-broken by recency, with recency dominating
@@ -425,6 +578,7 @@ int32_t expert_cache::choose_victim(layer_pool & lp) {
         for (uint32_t s = 0; s < lp.n_slots; s++)
             if (!lp.slot_pinned[s] && !in_flight(s)) { best = (int32_t) s; break; }
     }
+    if (best >= 0) lp.slot_soa[best] = 0;   // about to be refilled
     return best;
 }
 
@@ -529,8 +683,9 @@ bool expert_cache::would_promote(layer_pool & lp, uint32_t expert_id) {
     return any && lp.ef[expert_id] > worst;
 }
 
-bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, const uint8_t * host_block) {
-    if (!vram_buf_ || lp.g_slots == 0 || lp.g_lent) return false;
+bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot) {
+    if (!vram_buf_ || lp.g_slots == 0 || lp.g_lent || ram_slot < 0) return false;
+    const uint8_t * host_block = slot_ptr(lp, (uint32_t) ram_slot);
     // A block from the cold checkpoint has other quant types and sizes; the
     // per-part device arrays hold one type per part, so it stays on the CPU.
     {
@@ -575,6 +730,7 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, const uint8_t * 
     const uint32_t incoming = lp.ef[expert_id];
     if (!vram_lru && stale < 0 && lp.g_slot_expert[victim] != SLOT_EMPTY && worst >= incoming) return false;
 
+    const uint16_t victim_expert = lp.g_slot_expert[victim];
     if (lp.g_slot_expert[victim] != SLOT_EMPTY) lp.g_expert_slot[lp.g_slot_expert[victim]] = -1;
 
     // Asynchronous when the arena is pinned. The earlier attempt at this
@@ -585,11 +741,54 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, const uint8_t * 
     // refilled by a disk read while the copy still read it -- is closed by
     // deferring the release to settle_promotions(), after a stream sync.
     last_promote_async_ = cfg_.async_promote && cfg_.vram_backend && arena_pinned_;
+    // Exclusive tiers: the victim's device bytes are read into a free RAM slot (else the coldest resident's) on
+    // the same in-order stream as the upload below, so the read lands before they are overwritten; the slot is
+    // marked in flight (protected, not mapped) until settle_promotions() maps it and frees this expert's.
+    if (swaps_in(lp) && last_promote_async_) {
+        const uint32_t layer = (uint32_t) (&lp - blk_.data());
+        int32_t to = -1;
+        if (victim_expert != SLOT_EMPTY && !(lp.g_cold.size() > (size_t) victim && lp.g_cold[victim])) {
+            while (!lp.free_slots.empty() && to < 0) {
+                const int32_t f = lp.free_slots.back(); lp.free_slots.pop_back();
+                if (lp.slot_expert[f] == SLOT_EMPTY && !lp.slot_pinned[f]) to = f;
+            }
+            if (to < 0) {
+                to = choose_victim(lp);
+                if (to == ram_slot) to = -1;   // never: in live_ / pending (the caller's own slot)
+                if (to >= 0 && lp.slot_expert[to] != SLOT_EMPTY) {
+                    if (lp.slot_speculative[to]) st_.pf_wasted++;
+                    lp.expert_slot[lp.slot_expert[to]] = -1;
+                    st_.evictions++;
+                    st_.swap_evictions++;
+                }
+            }
+            if (to < 0) {
+                st_.swap_dropped++;
+            } else {
+                lp.slot_expert[to] = victim_expert;   // in flight: choose_victim() skips it, lookups do not see it
+                lp.slot_valid[to]  = 0;
+                lp.slot_cold[to]   = 0;
+                lp.slot_speculative[to] = 0;
+                lp.slot_soa[to]    = 0;
+                uint8_t * dst = slot_ptr(lp, (uint32_t) to);
+                xfer_->buffer = lp.g_buf;
+                for (int q = 0; q < EXPERT_NPARTS; q++) {
+                    xfer_->data  = lp.g_part[q] + (size_t) victim * lp.g_part_bytes[q];
+                    xfer_->type  = GGML_TYPE_I8;   // raw device bytes; to_file_layout() before a CPU use
+                    xfer_->ne[0] = lp.g_part_bytes[q];
+                    xfer_->nb[0] = 1;
+                    xfer_->nb[1] = xfer_->nb[2] = xfer_->nb[3] = lp.g_part_bytes[q];
+                    ggml_backend_tensor_get_async(cfg_.vram_backend, xfer_, dst + lp.part_off[q] + lp.part_pay[q], 0, lp.g_part_bytes[q]);
+                }
+            }
+        }
+        pending_swaps_.push_back(pending_swap{ layer, expert_id, ram_slot, victim_expert, to });
+    }
     xfer_->buffer = lp.g_buf;
     for (int q = 0; q < EXPERT_NPARTS; q++) {
         xfer_->data  = lp.g_part[q] + (size_t) victim * lp.g_part_bytes[q];
         const ggml_type gt = gpu_type(lp.part_type[q]);
-        if (is_soa(gt)) {
+        if (is_soa(gt) && !lp.slot_soa[ram_slot]) {
             // One slice of all the part's blocks: the SOA layout depends only on the block count, so this is
             // the same byte arrangement the 2-D/3-D weight views read. The backend reorders on upload.
             xfer_->type  = gt;
@@ -746,7 +945,7 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
             ready[i] = true;
             if (promoted < cfg_.max_promotions_per_layer) {
                 const auto tp = std::chrono::steady_clock::now();
-                if (promote(lp, e, slot_ptr(lp, (uint32_t) s))) {
+                if (promote(lp, e, s)) {
                     promoted++;
                     // Hand back the VRAM copy and release the RAM slot. Keeping
                     // both meant the tiers overlapped instead of adding: a
@@ -770,6 +969,7 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
                 st_.t_promote += std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - tp).count();
             }
+            if (!out[i].on_gpu) to_file_layout(lp, (uint32_t) s);   // a block read back from VRAM, served here
             continue;
         }
         st_.misses++;
@@ -903,7 +1103,7 @@ bool expert_cache::fetch_batch(uint32_t layer, const uint32_t * expert_ids, uint
         }
         {
             const int32_t s = lp.expert_slot[e];
-            if (s >= 0 && lp.slot_expert[s] == (uint16_t) e && lp.slot_valid[s] && !lp.slot_cold[s]) { fill_handle(lp, (uint32_t) s, out[i]); continue; }
+            if (s >= 0 && lp.slot_expert[s] == (uint16_t) e && lp.slot_valid[s] && !lp.slot_cold[s]) { to_file_layout(lp, (uint32_t) s); fill_handle(lp, (uint32_t) s, out[i]); continue; }
         }
         // An empty RAM slot takes the block (a fresh session's tier fills with the
         // prompt's experts, as it should); a full tier is left alone and the block
@@ -929,7 +1129,7 @@ bool expert_cache::fetch_batch(uint32_t layer, const uint32_t * expert_ids, uint
         out[i].buffer = adopt >= 0 ? arena_buf_ : nullptr; out[i].on_gpu = false; out[i].from_cold = false; out[i].slot = adopt;
         if (adopt >= 0) {
             lp.slot_expert[adopt] = (uint16_t) e; lp.slot_valid[adopt] = 1; lp.slot_freq[adopt] = 1;
-            lp.slot_used[adopt] = ++tick_; lp.slot_cold[adopt] = 0; lp.slot_speculative[adopt] = 0;
+            lp.slot_used[adopt] = ++tick_; lp.slot_cold[adopt] = 0; lp.slot_speculative[adopt] = 0; lp.slot_soa[adopt] = 0;
             lp.expert_slot[e] = adopt;
         }
     }
@@ -1052,14 +1252,15 @@ void expert_cache::prefetch(uint32_t layer, const uint32_t * expert_ids, uint32_
     }
 }
 
-void expert_cache::ram_resident_slices(uint32_t layer, std::vector<ram_slice> & out) const {
+void expert_cache::ram_resident_slices(uint32_t layer, std::vector<ram_slice> & out) {
     out.clear();
     if (layer >= blk_.size()) return;
-    const layer_pool & lp = blk_[layer];
+    layer_pool & lp = blk_[layer];
     for (uint32_t s = 0; s < lp.n_slots; s++) {
         if (!lp.slot_valid[s] || lp.slot_cold[s] || lp.slot_expert[s] == SLOT_EMPTY) continue;
         const uint16_t e = lp.slot_expert[s];
         if (e >= lp.expert_slot.size() || lp.expert_slot[e] != (int32_t) s) continue;   // an orphan
+        to_file_layout(lp, s);
         ram_slice r; r.expert = e;
         const uint8_t * base = lp.base + (size_t) s * lp.block_bytes;
         for (int q = 0; q < EXPERT_NPARTS; q++) r.part[q] = base + lp.part_off[q] + lp.part_pay[q];
@@ -1068,8 +1269,11 @@ void expert_cache::ram_resident_slices(uint32_t layer, std::vector<ram_slice> & 
 }
 
 void expert_cache::settle_promotions() {
-    if (pending_release_.empty()) return;
+    if (pending_release_.empty() && pending_swaps_.empty()) return;
     if (cfg_.vram_backend) ggml_backend_synchronize(cfg_.vram_backend);
+    // Exclusive tiers: the victims' bytes have landed in their RAM slots, the uploads are done.
+    for (const pending_swap & sw : pending_swaps_) finish_swap(sw);
+    pending_swaps_.clear();
     // The RAM copy stays. With recency-based VRAM eviction a promoted expert
     // can leave VRAM again soon; if its RAM copy is gone that is a disk read
     // (measured: hit rate 96.1% -> 94.4%, 40% more reads). Lookups check VRAM
@@ -1140,7 +1344,7 @@ void expert_cache::lend_end() {
             const uint32_t e = c.second;
             const int32_t  s = lp.expert_slot[e];
             if (s < 0 || !lp.slot_valid[s] || lp.slot_expert[s] != (uint16_t) e) continue;
-            if (!promote(lp, e, slot_ptr(lp, (uint32_t) s))) continue;
+            if (!promote(lp, e, s)) continue;
             n++;
             st_.warm_promoted++;
             if (last_promote_async_) pending_release_.push_back(pending_rel{ il, e, s });
@@ -1226,7 +1430,7 @@ void expert_cache::warm(uint32_t layer, const warm_item * items, uint32_t n, uin
     for (uint32_t e : to_promote) {
         const int32_t s = lp.expert_slot[e];
         if (s < 0 || !lp.slot_valid[s] || lp.slot_expert[s] != (uint16_t) e) continue;
-        if (!promote(lp, e, slot_ptr(lp, (uint32_t) s))) continue;
+        if (!promote(lp, e, s)) continue;
         st_.warm_promoted++;
         if (last_promote_async_) pending_release_.push_back(pending_rel{ layer, e, s });
     }

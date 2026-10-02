@@ -76,6 +76,11 @@ struct expert_cache_stats {
     uint64_t pf_used    = 0;    // of those, later actually requested
     uint64_t pf_wasted  = 0;    // evicted or replaced before use
     uint64_t ram_released = 0;  // RAM slots freed once the block reached VRAM
+    // Exclusive tiers (config::exclusive): a promotion's VRAM victim read back into a free RAM slot.
+    uint64_t swaps = 0;          // victims written back into RAM
+    uint64_t swap_evictions = 0; // of those, the RAM slot taken from a resident (no free slot)
+    uint64_t swap_dropped = 0;   // victims not kept: no RAM slot to take, or resident again by the settle
+    uint64_t swap_converts = 0;  // RAM blocks turned from the device layout back to the file's for a CPU use
     uint64_t upgrades   = 0;    // cold blocks refetched at full precision on reuse
     uint64_t batch_lookups = 0, batch_misses = 0;   // prompt-batch experts served without admission, and the ones read for it
     uint64_t warm_admitted = 0; // blocks copied into the RAM tier from a prefill's staging
@@ -136,6 +141,14 @@ public:
         // slack also absorbs the per-call input arena, which grows with n_kv.
         size_t vram_reserve = 768ull << 20;
         bool   use_cold_tier  = true;         // serve misses from the IQ1_S checkpoint
+        // Exclusive tiers: RAM holds what VRAM does not. A promotion swaps: the VRAM victim is read back into a free
+        // RAM slot (an asynchronous device->host copy into the pinned arena, queued before the upload that
+        // overwrites it), and the RAM slot the promoted expert leaves is freed at the next settle -- the next
+        // swap's destination. The arena is split per layer by what that layer's VRAM tier does not hold.
+        bool   exclusive = false;
+        // With exclusive: the layers whose VRAM tier a prefill borrows keep inclusive RAM (sized as if they had no
+        // VRAM tier, no swaps), so a prefill does not drop their VRAM experts to disk.
+        bool   exclusive_lent_inclusive = false;
         unsigned queue_depth  = 256;
         io_engine::backend io_backend = io_engine::backend::uring;
         // Bound the H2D traffic spent warming T0: one block is ~2.18 MB, so
@@ -237,7 +250,7 @@ public:
     bool arena_pinned() const { return arena_pinned_; }
     // Every valid, hot block of `layer` in the RAM tier, with its payload pointers.
     // Main thread only; the pointers hold while nothing admits into that layer.
-    void ram_resident_slices(uint32_t layer, std::vector<ram_slice> & out) const;
+    void ram_resident_slices(uint32_t layer, std::vector<ram_slice> & out);
 
     // The VRAM tier is two buffers: a permanent one and a dynamic one of
     // lend_bytes that holds expert slots during decode and is FREED for the
@@ -315,6 +328,10 @@ private:
         std::vector<uint8_t>  slot_cold;      // provenance: filled from the cold checkpoint
         std::vector<uint8_t>  slot_speculative; // admitted by a prediction, not yet used
         std::vector<uint8_t>  slot_pinned;
+        // Exclusive tiers: the block is in the device layout (Q2_0_SOA / IQ4_NL_SOA parts as [codes][scales]), as
+        // a swap read it back; to_file_layout() converts it before a CPU use, a promotion uploads it raw.
+        std::vector<uint8_t>  slot_soa;
+        std::vector<int32_t>  free_slots;          // released by swaps: the next swap's destinations
         std::vector<uint32_t> slot_freq;
         // Frequency belongs to the EXPERT, not the slot. Keeping it per-slot
         // destroyed the count on eviction and started every admission at 1, so
@@ -354,8 +371,8 @@ private:
         uint64_t              g_ver = 1;          // bumped on every residency change
     };
 
-    // Copy one host block into a device slot, evicting the coldest if needed.
-    bool promote(layer_pool & lp, uint32_t expert_id, const uint8_t * host_block);
+    // Copy one RAM slot's block into a device slot, evicting the coldest if needed (exclusive tiers: swapping).
+    bool promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot);
     void fill_gpu_handle(const layer_pool & lp, uint32_t gslot, expert_handle & h) const;
     // The type the VRAM tier presents a part as: Q2_0_SOA for q2_0 when q2_soa is on, IQ4_NL_SOA for iq4_nl when
     // iq4_soa is on.
@@ -427,6 +444,18 @@ private:
     bool                   last_promote_async_ = false;
     struct pending_rel { uint32_t layer, expert; int32_t slot; };
     std::vector<pending_rel> pending_release_;
+    // Exclusive tiers: swaps waiting for the stream sync in settle_promotions(). from: the promoted expert's RAM
+    // slot (freed); to: the slot the victim's bytes are landing in, or -1 (victim empty or dropped).
+    struct pending_swap { uint32_t layer; uint32_t promoted; int32_t from; uint16_t victim; int32_t to; };
+    std::vector<pending_swap> pending_swaps_;
+    bool                      exclusive_ = false;
+    bool swaps_in(const layer_pool & lp) const { return exclusive_ && !(cfg_.exclusive_lent_inclusive && lp.g_in_lent); }
+    void exclusive_split(uint32_t n_expert);        // re-split the arena by what each layer's VRAM tier does not hold
+    void finish_swap(const pending_swap & sw);      // after the sync: the RAM tier's map follows the bytes
+    void release_slot(layer_pool & lp, int32_t s);
+    void to_file_layout(layer_pool & lp, uint32_t s);   // a block read back from VRAM, before a CPU use
+    void soa_to_file(const layer_pool & lp, uint8_t * block);   // the device layout's parts -> the file's, in place
+    std::vector<uint8_t> soa_scratch_;
     std::vector<layer_pool> blk_;
     size_t                 total_slots_ = 0;
     size_t                 total_gslots_ = 0;

@@ -2070,7 +2070,9 @@ int main(int argc, char ** argv) {
                               {"bytes_from_disk", c.bytes_from_disk},
                               // the raw counters, so a harness can difference two samples
                               {"lookups", c.lookups}, {"hits", c.hits}, {"gpu_hits", c.gpu_hits},
-                              {"promotions", c.promotions}, {"pf_issued", c.pf_issued}, {"pf_used", c.pf_used}}},
+                              {"promotions", c.promotions}, {"pf_issued", c.pf_issued}, {"pf_used", c.pf_used},
+                              {"evictions", c.evictions}, {"swaps", c.swaps}, {"swap_evictions", c.swap_evictions},
+                              {"swap_dropped", c.swap_dropped}, {"swap_converts", c.swap_converts}}},
             // cumulative decode split, seconds: difference two samples for a per-token budget
             {"decode", {{"t_decode", S.eng.t_decode}, {"t_graph_a", S.eng.t_layerA}, {"t_moe_gpu", S.eng.t_moe_gpu},
                         {"t_moe_cpu", S.eng.t_moe_cpu}, {"t_io", S.eng.t_io}, {"t_inputs", S.eng.t_inputs},

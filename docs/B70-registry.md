@@ -79,6 +79,8 @@ measured on overlay v2 (stock GSQ-RCO Q2_0 + Unsloth tensors), vision loaded, on
 | Verify-step attention: cache-free work, then indexer/scoring/top-k/masks batched over the positions | 167 -> 126 kernels per attention graph at T=2, layer graphs 28.4 -> 27.4 ms per step, identical answers | adopted |
 | Promotion budget kept at the one-token value for verify steps | no change | rejected |
 | Prefix cache with the head (checkpoints carry its state) | restores in ~110 ms, drafting continues | adopted |
+| Exclusive expert tiers (`QWFN_RAM_EXCLUSIVE=1`), `--ram 8`, A/B in one window | expert I/O per step 14.4 / 12.3 / 11.6 -> 2.4 / 0.7 / 2.5 ms; essay / code / t=0.7 32.5 / 37.6 / 37.6 -> 44.9 / 46.8 / 44.1 tok/s; decode after a 20K prompt 19.1 -> 17.1 (64 tokens, one sample: the prefill-lent layers' VRAM experts go to disk); 40K prefill, prefix-cache restores, vision unchanged; every read-back byte-exact | adopted (opt-in switch) |
+| Exclusive at `--ram 11`; and with the prefill-lent layers inclusive (`QWFN_RAM_LENT_INCLUSIVE=1`) | 47.7 / 47.9 / 46.2 tok/s, after 20K 20.8, but the VMs swap (+1.5 GiB, ~260K pages in); lent-inclusive: 40.8 / 45.9 / 38.8, after 20K 22.1 (less coverage for short prompts) | 8 for now; zone split not worth it |
 | **The configuration** (`--vram 24` + head vs `--vram 25` without) | ~+13% short-prompt decode; at the limit (image + 126K document) ~0.45 GB free, nothing evicted | adopted |
 
 ## Ideas -- not yet tried
