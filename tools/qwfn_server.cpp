@@ -743,8 +743,14 @@ struct timeshare {
         const tp now = std::chrono::steady_clock::now();
         if (running != &t || secs(now - slice_start) < quantum) return false;
         charge(t, now);
+        // The rule pick() applies once this request has parked (least usage, then earliest arrival):
+        // it yields only to a waiter that rule puts before it, or it would park just to be picked again
+        // (a waiter of its own session that arrived later, say).
         const double mine = decayed(t.session, now);
-        for (const ticket * w : waiting) if (decayed(w->session, now) <= mine) return true;
+        for (const ticket * w : waiting) {
+            const double u = decayed(w->session, now);
+            if (u < mine || (u == mine && w->arrived < t.arrived)) return true;
+        }
         slice_start = now;   // nobody (more deserving) waiting: a fresh quantum
         return false;
     }
