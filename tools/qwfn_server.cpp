@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cctype>
 #include <cerrno>
 #include <climits>
@@ -632,6 +633,162 @@ struct live_stats {
     }
 };
 
+// ---- time sharing (--timeshare N) -------------------------------------------
+// Up to N requests are open at once; one holds the engine at a time, for a quantum. At a
+// decode step's start a request whose quantum is up parks (its sequence checkpointed, the
+// engine released) when another open request should run instead, and resumes later where it
+// stopped. Who runs next: the waiting request whose session has used the least engine time
+// lately (decayed, half-life `half_life`), earliest arrival first on a tie. After a request
+// completes the engine lingers for its session's next turn before anyone else gets it.
+struct timeshare {
+    using tp = std::chrono::steady_clock::time_point;
+    static double secs(std::chrono::steady_clock::duration d) { return std::chrono::duration<double>(d).count(); }
+    int    max_open  = 0;       // 0: off (one request at a time, the others queue on the engine lock)
+    double quantum   = 30.0;    // seconds a request holds the engine before it may have to yield
+    double linger    = 1.0;     // seconds the engine waits for a finished request's session
+    double half_life = 300.0;   // decay of the per-session usage the choice is based on
+    struct ticket {
+        uint64_t    id = 0;
+        std::string session;
+        tp          arrived;
+        bool        parked = false;   // it ran and yielded; its sequence is checkpointed
+        double      used = 0;         // engine seconds, this request
+        int         n_parks = 0;
+    };
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<ticket *> waiting;    // open, not running: new arrivals and parked requests
+    ticket * running = nullptr;
+    int      n_open = 0;
+    uint64_t next_id = 1;
+    tp       slice_start{};    // the running request's quantum began here
+    tp       charged_at{};     // its engine time is accounted up to here
+    tp       linger_until{}, linger_slice{};   // a lingering session's next turn continues its quantum (linger_slice)
+    std::string linger_session;
+    struct usage_t { double s = 0; tp t{}; };
+    std::unordered_map<std::string, usage_t> usage;
+    long long n_admitted = 0, n_rejected = 0, n_parks = 0, n_park_refused = 0, n_lingered = 0;
+    double    t_park = 0, t_resume = 0;   // seconds spent checkpointing and restoring
+
+    double decayed(const std::string & s, tp now) const {   // m held
+        const auto it = usage.find(s);
+        if (it == usage.end()) return 0.0;
+        return it->second.s * std::exp2(-secs(now - it->second.t) / half_life);
+    }
+    void charge(ticket & t, tp now) {   // m held: the running request's engine time since its slice began
+        const double dt = std::max(0.0, secs(now - charged_at));
+        t.used += dt;
+        usage_t & u = usage[t.session];
+        u.s = decayed(t.session, now) + dt; u.t = now;
+        charged_at = now;
+        if (usage.size() > 256)   // forget sessions whose usage has decayed away
+            for (auto it = usage.begin(); it != usage.end(); )
+                { if (decayed(it->first, now) < 0.01 && it->first != t.session) it = usage.erase(it); else ++it; }
+    }
+    ticket * pick(tp now) const {   // m held: who may take the engine now (null: nobody yet)
+        if (running || waiting.empty()) return nullptr;
+        ticket * best = nullptr;
+        if (now < linger_until) {   // only the finished request's session, earliest first
+            for (ticket * t : waiting) if (t->session == linger_session && (!best || t->arrived < best->arrived)) best = t;
+            return best;
+        }
+        double bu = 0;
+        for (ticket * t : waiting) {
+            const double u = decayed(t->session, now);
+            if (!best || u < bu || (u == bu && t->arrived < best->arrived)) { best = t; bu = u; }
+        }
+        return best;
+    }
+    bool admit(ticket & t, const std::string & session) {
+        std::lock_guard<std::mutex> l(m);
+        if (n_open >= max_open) { n_rejected++; return false; }
+        n_open++; n_admitted++;
+        t.id = next_id++; t.session = session; t.arrived = std::chrono::steady_clock::now();
+        return true;
+    }
+    // Wait for the engine. `idle` runs every ~10 s while waiting, outside the lock (a parked
+    // stream's keepalive).
+    void wait_turn(std::unique_lock<std::mutex> & l, ticket & t, const std::function<void()> & idle) {
+        waiting.push_back(&t);
+        auto next_idle = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        for (;;) {
+            const tp now = std::chrono::steady_clock::now();
+            if (pick(now) == &t) break;
+            tp until = next_idle;
+            if (now < linger_until && linger_until < until) until = linger_until;
+            cv.wait_until(l, until);
+            if (idle && std::chrono::steady_clock::now() >= next_idle) {
+                l.unlock(); idle(); l.lock();
+                next_idle = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            }
+        }
+        waiting.erase(std::find(waiting.begin(), waiting.end(), &t));
+        running = &t; t.parked = false;
+        const tp now = std::chrono::steady_clock::now();
+        charged_at = now;
+        // A turn taken in its session's linger continues that session's quantum: an agent loop whose
+        // turns each end inside a quantum must still yield once it has had the engine for one.
+        if (now < linger_until && t.session == linger_session) { slice_start = linger_slice; n_lingered++; }
+        else slice_start = now;
+        linger_until = tp{};
+    }
+    void acquire(ticket & t) {
+        std::unique_lock<std::mutex> l(m);
+        wait_turn(l, t, nullptr);
+    }
+    // At a yield point, with the quantum up: should the running request give the engine away?
+    // A waiter whose session has used no more than this one's (after charging this slice) wins.
+    bool should_yield(ticket & t) {
+        std::lock_guard<std::mutex> l(m);
+        const tp now = std::chrono::steady_clock::now();
+        if (running != &t || secs(now - slice_start) < quantum) return false;
+        charge(t, now);
+        const double mine = decayed(t.session, now);
+        for (const ticket * w : waiting) if (decayed(w->session, now) <= mine) return true;
+        slice_start = now;   // nobody (more deserving) waiting: a fresh quantum
+        return false;
+    }
+    void refused(ticket & t) {   // it should have parked but could not (no room): a fresh quantum
+        std::lock_guard<std::mutex> l(m);
+        if (running == &t) slice_start = std::chrono::steady_clock::now();
+        n_park_refused++;
+    }
+    // The engine is checkpointed and released by the caller: wait for the next turn.
+    void park(ticket & t, const std::function<void()> & idle) {
+        std::unique_lock<std::mutex> l(m);
+        charge(t, std::chrono::steady_clock::now());
+        t.parked = true; t.n_parks++; n_parks++;
+        running = nullptr;
+        cv.notify_all();
+        wait_turn(l, t, idle);
+    }
+    void release(ticket & t) {
+        std::lock_guard<std::mutex> l(m);
+        const tp now = std::chrono::steady_clock::now();
+        if (running == &t) {
+            charge(t, now); running = nullptr;
+            linger_until = now + std::chrono::microseconds((long long) (linger * 1e6));
+            linger_session = t.session; linger_slice = slice_start;
+        } else { auto it = std::find(waiting.begin(), waiting.end(), &t); if (it != waiting.end()) waiting.erase(it); }
+        n_open--;
+        cv.notify_all();
+    }
+    json to_json() {
+        std::lock_guard<std::mutex> l(m);
+        const tp now = std::chrono::steady_clock::now();
+        json open = json::array();
+        auto row = [&](const ticket * t, const char * state) {
+            open.push_back({{"id", t->id}, {"session", t->session}, {"state", state}, {"engine_s", t->used},
+                            {"age_s", secs(now - t->arrived)}, {"parks", t->n_parks}, {"session_usage_s", decayed(t->session, now)}});
+        };
+        if (running) row(running, "running");
+        for (const ticket * t : waiting) row(t, t->parked ? "parked" : "waiting");
+        return {{"max_open", max_open}, {"quantum_s", quantum}, {"linger_s", linger}, {"open", open},
+                {"admitted", n_admitted}, {"rejected", n_rejected}, {"parks", n_parks}, {"park_refused", n_park_refused},
+                {"lingered", n_lingered}, {"park_s", t_park}, {"resume_s", t_resume}};
+    }
+};
+
 // ---- server state -----------------------------------------------------------
 // content parts -> text, with images encoded to embeddings on the way past
 struct pending_img { std::vector<float> emb; int n_tok = 0; };
@@ -696,6 +853,12 @@ struct server {
     int32_t  pool_min = 1024;   // --prefix-cache-min: shorter sequences are not saved
     int32_t  pool_boundary = 4096;   // --prefix-cache-boundary: checkpoint histories at least this long (0: off)
     uint64_t pool_clock = 0, pool_next_id = 1;
+    // Time sharing: the scheduler, the host bytes of parked requests' checkpoints (counted
+    // against the prefix cache's budget), and a counter bumped whenever a request starts
+    // using the engine (a parked request that finds it unchanged skips its restore).
+    timeshare ts;
+    size_t   parked_bytes = 0;
+    uint64_t eng_epoch = 0;
     std::string          model_id = "qwen3.8-flash-next";
     std::string          model_file;   // the shard the server was started with, for /props
     uint32_t             n_ctx = 0, n_batch = 0;
@@ -724,6 +887,74 @@ struct server {
     };
 
 };
+
+// A request's hold on the engine: the engine lock, plus its time-sharing ticket when
+// --timeshare is on (then taking the lock waits for the scheduler's turn first). unlock()
+// may come early (a stream releases when its last byte is out); the destructor covers
+// every other exit. Taken and released on one thread: a streamed reply's provider runs on
+// the handler's thread, after the handler returns.
+struct engine_hold;
+static thread_local engine_hold * g_hold = nullptr;   // the hold this thread's generation runs under
+struct engine_hold {
+    server & S;
+    timeshare::ticket t;
+    std::unique_lock<std::mutex> lk;
+    bool ts = false;
+    explicit engine_hold(server & s) : S(s), lk(s.mu, std::defer_lock) {}
+    void lock() {
+        if (ts) S.ts.acquire(t);
+        lk.lock();
+        g_hold = this;
+    }
+    void unlock() {
+        if (!lk.owns_lock()) return;
+        lk.unlock();
+        if (g_hold == this) g_hold = nullptr;
+        if (ts) {
+            S.ts.release(t);
+            int open; { std::lock_guard<std::mutex> l(S.ts.m); open = S.ts.n_open; }
+            std::lock_guard<std::mutex> l(S.live.mu); S.live.busy = open > 0;
+        }
+    }
+    ~engine_hold() { unlock(); }
+};
+// The engine for one request: null when time sharing is on and --timeshare requests are open.
+static std::shared_ptr<engine_hold> hold_engine(server & S, const std::string & session) {
+    auto h = std::make_shared<engine_hold>(S);
+    if (S.ts.max_open > 0) {
+        if (!S.ts.admit(h->t, session)) return nullptr;
+        h->ts = true;
+        { std::lock_guard<std::mutex> l(S.live.mu); S.live.busy = true; }   // open counts as in flight (gpu windows check it)
+    }
+    h->lock();
+    return h;
+}
+// Whose request this is, for the time accounting: an explicit id (an X-Session-Id header,
+// OpenAI's `user`, Anthropic's metadata.user_id), else the conversation's opening (the first
+// system and user messages' text), which every turn of one conversation repeats.
+static std::string session_key(const httplib::Request & req, const json & body, const json & msgs) {
+    if (req.has_header("X-Session-Id")) return "h:" + req.get_header_value("X-Session-Id");
+    if (body.contains("user") && body["user"].is_string()) return "u:" + body["user"].get<std::string>();
+    if (body.contains("metadata") && body["metadata"].is_object() && body["metadata"].contains("user_id") && body["metadata"]["user_id"].is_string())
+        return "u:" + body["metadata"]["user_id"].get<std::string>();
+    std::string k;
+    auto text_of = [](const json & c) {
+        std::string t;
+        if (c.is_string()) t = c.get<std::string>();
+        else if (c.is_array()) for (const auto & p : c) if (p.is_object() && p.value("type", "") == "text") t += p.value("text", "");
+        return t.substr(0, 4096);
+    };
+    bool have_system = false;
+    if (msgs.is_array())
+        for (const auto & m : msgs) {
+            if (!m.is_object()) continue;
+            const std::string role = m.value("role", "");
+            if ((role == "system" || role == "developer") && !have_system && m.contains("content")) { k += text_of(m["content"]); k += '\x1f'; have_system = true; }
+            if (role == "user" && m.contains("content")) { k += text_of(m["content"]); break; }
+        }
+    char b[24]; snprintf(b, sizeof b, "c:%016llx", (unsigned long long) hash_bytes(k.data(), k.size()));
+    return b;
+}
 
 static bool render_content(server & S, const json & content, std::string & text,
                            std::vector<std::pair<size_t, pending_img>> & imgs,
@@ -958,6 +1189,12 @@ int main(int argc, char ** argv) {
           "      --prefix-cache-boundary N  also checkpoint a chat prompt at the end of its history, before the assistant\n"
           "                      opener, when that is at least N tokens (default 4096; 0 = off): a next request whose\n"
           "                      re-rendered reply differs then restores it instead of re-prefilling everything\n"
+          "      --timeshare N   time-share the engine between up to N open requests (default 0 = off: one at a time, the\n"
+          "                      rest queue; with N, request N+1 gets 503). One runs at a time; after a quantum, at a\n"
+          "                      decode step, it parks (checkpointed in the --prefix-cache budget, which it needs) when\n"
+          "                      another open request's session has used the engine less lately. Prefill is not interrupted\n"
+          "      --quantum S     seconds a request holds the engine before it may yield (default 30)\n"
+          "      --linger S      after a request completes, seconds its session's next request goes first (default 1)\n"
           "      --mtp PATH      the draft head (nextn layer gguf): each step carries its draft, verified by the trunk (exact)\n"
           "      --mtp-drafts N  most head drafts per step (1-3, default 1)\n"
           "      --lookup-drafts N  with --mtp: when the reply copies its context, steps of 1+N positions drafted from the\n"
@@ -979,6 +1216,8 @@ int main(int argc, char ** argv) {
 
     std::string host = "127.0.0.1", mmproj_path, alias, def_effort = "xhigh";
     double prefix_cache_gb = 0;
+    int    timeshare_n = 0;
+    double quantum_s = 30.0, linger_s = 1.0;
     long   prefix_cache_min = 1024; bool prefix_cache_min_set = false;
     long   prefix_cache_boundary = 4096;
     int vision_threads = 0;
@@ -1012,6 +1251,9 @@ int main(int argc, char ** argv) {
         if (a == "--threads"&& i + 1 < argc) { cfg.n_threads = atoi(next()); continue; }
         if (a == "--ram-frac" && i + 1 < argc) { cfg.ram_frac = atof(next()); continue; }
         if (a == "--prefix-cache" && i + 1 < argc) { prefix_cache_gb = atof(next()); continue; }
+        if (a == "--timeshare" && i + 1 < argc) { timeshare_n = std::max(0, atoi(next())); continue; }
+        if (a == "--quantum" && i + 1 < argc) { quantum_s = std::max(1.0, atof(next())); continue; }
+        if (a == "--linger" && i + 1 < argc) { linger_s = std::max(0.0, atof(next())); continue; }
         if (a == "--prefix-cache-min" && i + 1 < argc) {   // strict: atoi would turn garbage into 0, "save everything"
             const char * v = next(); char * end = nullptr;
             errno = 0;
@@ -1117,6 +1359,11 @@ int main(int argc, char ** argv) {
     S.pool_budget = (size_t) (prefix_cache_gb * 1e9);
     S.pool_min = (int32_t) prefix_cache_min;
     S.pool_boundary = (int32_t) prefix_cache_boundary;
+    if (timeshare_n > 0 && S.pool_budget == 0)
+        fprintf(stderr, "warning: --timeshare needs --prefix-cache (a parked request is checkpointed there); requests will not yield\n");
+    S.ts.max_open = timeshare_n; S.ts.quantum = quantum_s; S.ts.linger = linger_s;
+    if (timeshare_n > 0)
+        fprintf(stderr, "time sharing: up to %d open requests, quantum %.0f s, linger %.1f s\n", timeshare_n, quantum_s, linger_s);
     std::string err;
 
     fprintf(stderr, "loading tokenizer...\n");
@@ -1431,7 +1678,7 @@ int main(int argc, char ** argv) {
     };
     // Room for `need` bytes, least recently used out, never the entry `keep`.
     auto pool_evict_to = [&](size_t need, uint64_t keep) -> bool {
-        while (S.pool_bytes + need > S.pool_budget) {
+        while (S.pool_bytes + S.parked_bytes + need > S.pool_budget) {
             size_t lru = S.pool.size();
             for (size_t i = 0; i < S.pool.size(); i++)
                 if (S.pool[i].id != keep && (lru == S.pool.size() || S.pool[i].used < S.pool[lru].used)) lru = i;
@@ -1481,7 +1728,7 @@ int main(int argc, char ** argv) {
         }
         // Next to a boundary checkpoint of this same sequence the full one only saves re-prefilling
         // the reply, so it may not push anything out.
-        if (covered_by_boundary && S.pool_bytes + need > S.pool_budget) {
+        if (covered_by_boundary && S.pool_bytes + S.parked_bytes + need > S.pool_budget) {
             fprintf(stderr, "[prefix-cache] not saved: %zu tokens, a boundary checkpoint covers them and there is no free room\n", S.consumed.size());
             return;
         }
@@ -1615,6 +1862,7 @@ int main(int argc, char ** argv) {
         // The head's logits come back to the host only when this request samples its drafts (temperature); a
         // greedy request takes the head's argmax and its probability, read on the device.
         S.eng.set_mtp_logits(smp.cfg.temp > 0.0f && getenv("QWFN_MTP_ARGMAX_DRAFT") == nullptr);
+        S.eng_epoch++;   // this request now changes the engine's sequence: a parked one must restore its own
         // Prefix continuation: only valid when the new prompt strictly extends
         // what the engine already holds.
         if (prefix_reuse(P) == 0) {
@@ -1681,7 +1929,7 @@ int main(int argc, char ** argv) {
           S.live.t_prompt = 0; S.live.t_gen = 0; S.live.prompt_done = 0; S.live.prompt_base = 0; S.live.prefilling = R.n_prompt > 0; S.live.t_prompt0 = clk::now(); S.live.n_requests++; }
         // Whatever way this returns (an eval error, a client that went away), the
         // counters must not say "busy" forever.
-        struct busy_guard { live_stats & L; ~busy_guard() { std::lock_guard<std::mutex> lk(L.mu); L.busy = false; L.prefilling = false; } } guard{S.live};
+        struct busy_guard { server & S; ~busy_guard() { std::lock_guard<std::mutex> lk(S.live.mu); if (S.ts.max_open == 0) S.live.busy = false; S.live.prefilling = false; } } guard{S};
         g_gen_thread = pthread_self(); g_gen_thread_set = true;
         smp.gen.clear();
 
@@ -1713,7 +1961,7 @@ int main(int argc, char ** argv) {
         // compare strings, so the answer must not start with it.
         bool content_started = false;
         std::string acc;                 // everything emitted, for stop matching
-        const auto td = clk::now();
+        auto td = clk::now();   // moved forward by the time spent parked: t_gen is engine time
         int n = 0;
         // With the draft head loaded (--mtp), a sampled token goes in as a pair
         // with the head's draft for the one after it; the trunk's logits at the
@@ -1763,6 +2011,80 @@ int main(int argc, char ** argv) {
         };
         if (lookup_on) { lookup_rebuild(); S.lookup_pol->new_sequence(); }
         std::vector<int32_t> lk_prop(engine::MTP_MAX_DRAFTS);
+        // Time sharing (--timeshare): the yield point, at a decode step's start. The engine then holds
+        // exactly `hist` minus `tok` (sampled and its draft made, not evaluated), so a checkpoint of the
+        // sequence, `tok` and this thread's own state (the sampler, the reply so far) are all it takes
+        // to go on later. Parking: checkpoint, release the engine, wait for the scheduler; resuming:
+        // restore it (unless nobody used the engine meanwhile) and redo `tok`'s draft. False: the
+        // resume failed (the dirty guard then resets the engine).
+        auto ts_yield = [&]() -> bool {
+            engine_hold * h = g_hold;
+            if (!h || !h->ts || !S.ts.should_yield(h->t)) return true;
+            const int32_t np = S.eng.n_past();
+            if (np != (int32_t) hist.size() - 1 || S.pool_budget == 0) { S.ts.refused(h->t); return true; }
+            const auto t0 = clk::now();
+            const size_t need = S.eng.checkpoint_bytes();
+            if (!pool_evict_to(need, 0)) {
+                fprintf(stderr, "[timeshare] request %llu stays: a %.2f GB checkpoint does not fit the prefix cache (%.2f GB, %.2f GB parked)\n",
+                        (unsigned long long) h->t.id, need / 1e9, S.pool_budget / 1e9, S.parked_bytes / 1e9);
+                S.ts.refused(h->t); return true;
+            }
+            auto ck = std::make_unique<engine::checkpoint>();
+            std::string se;
+            try {
+                if (!S.eng.checkpoint_save(*ck, se)) { fprintf(stderr, "[timeshare] checkpoint failed: %s\n", se.c_str()); S.ts.refused(h->t); return true; }
+            } catch (const std::bad_alloc &) {
+                fprintf(stderr, "[timeshare] request %llu stays: out of host memory for its %.2f GB checkpoint\n", (unsigned long long) h->t.id, need / 1e9);
+                S.ts.refused(h->t); return true;
+            }
+            const size_t ck_bytes = ck->bytes();
+            server::reply_state last = S.last;   // the live sequence's reply, as this request found it
+            std::unordered_map<int32_t, uint64_t> img;
+            for (const auto & kv : S.consumed_img) if (kv.first < np) img.insert(kv);
+            // The engine's sequence is nobody's while this request is parked: a switch must not save it.
+            S.consumed.clear(); S.consumed_img.clear();
+            S.parked_bytes += ck_bytes;
+            const uint64_t epoch = ++S.eng_epoch;
+            const double t_save = since(t0);
+            fprintf(stderr, "[timeshare] request %llu (%s) parks after %d generated tokens: %d in context, %.2f GB checkpoint in %.0f ms\n",
+                    (unsigned long long) h->t.id, h->t.session.c_str(), n, np, ck_bytes / 1e9, t_save * 1e3);
+            const auto tp0 = clk::now();
+            {
+                // Whatever happens while parked, the engine lock is held again when this scope ends:
+                // the callers' cleanup (the dirty guard, the stream's exception handler) touches the engine.
+                struct relock { std::unique_lock<std::mutex> & l; ~relock() { if (!l.owns_lock()) l.lock(); } } rl{h->lk};
+                h->lk.unlock();
+                S.ts.park(h->t, on_tick ? std::function<void()>(on_tick) : std::function<void()>());   // a stream keeps its keepalives
+            }
+            const auto t1 = clk::now();
+            S.parked_bytes -= ck_bytes;
+            const bool moved = S.eng_epoch != epoch;
+            if (moved) {
+                pool_save(0);   // the sequence that ran meanwhile, if it completed: its next turn restores it
+                if (!S.eng.checkpoint_restore(*ck, se)) { e = "timeshare: resume failed: " + se; return false; }
+                // The restore drops the draft made for `tok`: make it again (the head's state for the
+                // positions before `tok` came back with the checkpoint).
+                if (!S.eng.mtp_step(&tok, 1, e)) return false;
+            }
+            ck.reset();
+            S.consumed.assign(hist.begin(), hist.begin() + np);
+            S.consumed_img = std::move(img);
+            S.last = std::move(last);
+            S.eng_epoch++;
+            S.eng.set_mtp_logits(smp.cfg.temp > 0.0f && getenv("QWFN_MTP_ARGMAX_DRAFT") == nullptr);
+            if (lookup_on && moved) lookup_rebuild();
+            td += t1 - tp0;
+            g_gen_thread = pthread_self(); g_gen_thread_set = true;
+            const double t_restore = since(t1);
+            { std::lock_guard<std::mutex> l(S.ts.m); S.ts.t_park += t_save; S.ts.t_resume += t_restore; }
+            { std::lock_guard<std::mutex> lk(S.live.mu);
+              S.live.busy = true; S.live.prefilling = false;
+              S.live.n_input = R.n_input; S.live.n_cached = R.n_cached; S.live.n_prompt = R.n_prompt; S.live.t_prompt = R.t_prompt;
+              S.live.prompt_done = R.n_prompt; S.live.n_gen = n + 1; S.live.t_gen = since(td); S.live.n_past = S.eng.n_past(); }
+            fprintf(stderr, "[timeshare] request %llu resumes after %.1f s parked: %s in %.0f ms\n", (unsigned long long) h->t.id,
+                    std::chrono::duration<double>(t1 - tp0).count(), moved ? "restored" : "engine untouched, no restore", t_restore * 1e3);
+            return true;
+        };
         for (; n < budget; n++) {
             { std::lock_guard<std::mutex> lk(S.live.mu); S.live.n_gen = n + 1; S.live.t_gen = since(td); S.live.n_past = S.eng.n_past(); }
             if (!tok_in) hist.push_back(tok);
@@ -1821,6 +2143,7 @@ int main(int argc, char ** argv) {
                 if (!evald.empty()) { tok = evald.front(); evald.erase(evald.begin()); continue; }
                 tok = tok_next; tok_in = false; continue;
             }
+            if (!ts_yield()) return false;
             // The draft: the head's argmax when sampling is greedy; at temperature,
             // a sample from the head's own distribution under the request's
             // sampler (speculative sampling: accept with probability
@@ -1948,7 +2271,7 @@ int main(int argc, char ** argv) {
         if (n >= budget && budget > 0) R.finish = "length";
         R.t_gen = since(td);
         R.n_gen = n;
-        { std::lock_guard<std::mutex> lk(S.live.mu); S.live.busy = false; S.live.n_gen = n; S.live.t_gen = R.t_gen;
+        { std::lock_guard<std::mutex> lk(S.live.mu); if (S.ts.max_open == 0) S.live.busy = false; S.live.n_gen = n; S.live.t_gen = R.t_gen;
           S.live.n_prompt_total += R.n_prompt; S.live.t_prompt_total += R.t_prompt; S.live.n_gen_total += n; S.live.t_gen_total += R.t_gen; S.live.n_past = S.eng.n_past();
           S.live.n_input_total += R.n_input; S.live.n_cached_total += R.n_cached;
           S.live.n_pairs_total += R.n_pairs; S.live.n_accepted_total += R.n_accepted; S.live.n_drafted_total += R.n_drafted;
@@ -2122,8 +2445,11 @@ int main(int argc, char ** argv) {
                     {"boundary_saves", S.live.pc_boundary_saves}, {"boundary_hits", S.live.pc_boundary_hits}, {"t_boundary_save", S.live.pc_t_boundary_save},
                     {"hits", S.live.pc_hits}, {"misses", S.live.pc_misses}, {"saves", S.live.pc_saves}, {"evictions", S.live.pc_evictions},
                     {"tokens_restored", S.live.pc_tokens_restored}, {"t_save", S.live.pc_t_save}, {"t_restore", S.live.pc_t_restore}}; }
+        json tsj = S.ts.to_json();
+        tsj["parked_bytes"] = S.parked_bytes;   // racy read of a plain counter, as above
         return json{
             {"busy", busy},
+            {"timeshare", tsj},
             // prompt: the current request's prompt while busy, the last one's when idle.
             // input = cached (reused from the engine's prefix) + n (prefilled); done counts
             // the prefilled tokens so far, fractional inside a batch.
@@ -2510,7 +2836,7 @@ int main(int argc, char ** argv) {
             // desynchronised state.
             fprintf(stderr, "[qwfn-server] %s: stream aborted by an exception after %d generated tokens: %s\n", Q.id.c_str(), R.n_gen, out.aborted.c_str());
             S.last.msgs = json(); S.consumed.clear(); S.eng.reset(); S.eng.clear_embeddings();
-            { std::lock_guard<std::mutex> lg(S.live.mu); S.live.busy = false; }
+            { std::lock_guard<std::mutex> lg(S.live.mu); if (S.ts.max_open == 0) S.live.busy = false; }
             return out;
         }
         if (out.ok) finish_request(Q, out.C); else S.last.msgs = json();
@@ -2538,7 +2864,12 @@ int main(int argc, char ** argv) {
         // a second request arriving mid-stream (a harness generating a title,
         // the next turn) must wait, not enter the engine. So the lock is shared
         // with the provider and released when the stream is done.
-        auto lk = std::make_shared<std::unique_lock<std::mutex>>(S.mu);
+        auto lk = hold_engine(S, session_key(req, body, Q->msgs));
+        if (!lk) {
+            res.status = 503; res.set_header("Retry-After", "5");
+            res.set_content(json{{"error", {{"message", "all " + std::to_string(S.ts.max_open) + " request slots are open; retry shortly"}, {"type", "server_busy"}}}}.dump(), "application/json");
+            return;
+        }
         auto P = std::make_shared<server::prompt>();
         if (!build_prompt(Q->msgs, Q->effort, Q->thinking, Q->tools_block, Q->forced, Q->tools, *P, e)) { fail(res, 400, e); return; }
 
@@ -2667,7 +2998,12 @@ int main(int argc, char ** argv) {
         const std::string model = body.value("model", S.model_id);
         log_request(req, *Q, body, " (anthropic)");
 
-        auto lk = std::make_shared<std::unique_lock<std::mutex>>(S.mu);
+        auto lk = hold_engine(S, session_key(req, body, Q->msgs));
+        if (!lk) {
+            res.status = 503; res.set_header("Retry-After", "5");
+            res.set_content(json{{"error", {{"message", "all " + std::to_string(S.ts.max_open) + " request slots are open; retry shortly"}, {"type", "server_busy"}}}}.dump(), "application/json");
+            return;
+        }
         auto P = std::make_shared<server::prompt>();
         std::string e;
         if (!build_prompt(Q->msgs, Q->effort, Q->thinking, Q->tools_block, Q->forced, Q->tools, *P, e)) { fail_anthropic(res, 400, e); return; }
@@ -2800,7 +3136,12 @@ int main(int argc, char ** argv) {
             else for (const auto & s : body["stop"]) stops.push_back(s.get<std::string>());
         }
 
-        std::lock_guard<std::mutex> lk(S.mu);
+        auto lk = hold_engine(S, session_key(req, body, json::array({json{{"role", "user"}, {"content", p.substr(0, 4096)}}})));
+        if (!lk) {
+            res.status = 503; res.set_header("Retry-After", "5");
+            res.set_content(json{{"error", {{"message", "all " + std::to_string(S.ts.max_open) + " request slots are open; retry shortly"}, {"type", "server_busy"}}}}.dump(), "application/json");
+            return;
+        }
         server::prompt P;
         P.tok = S.vb.encode(p, false, true);
         gen_result R;
