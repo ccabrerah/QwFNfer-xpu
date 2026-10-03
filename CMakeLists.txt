@@ -80,6 +80,7 @@ add_library(qwfn_core STATIC
   src/qwfn_engine.cpp
   src/qwfn_prefill.cpp
   src/qwfn_vision.cpp
+  src/qwfn_lookup.cpp
 )
 target_include_directories(qwfn_core PUBLIC
   "${LLAMA_CPP_ROOT}/vendor/stb"
@@ -157,6 +158,11 @@ target_compile_options(qwfn-tok PRIVATE -O2 ${QWFN_ARCH_FLAGS})
 add_executable(qwfn-gen tools/qwfn_gen.cpp)
 target_link_libraries(qwfn-gen PRIVATE qwfn_core)
 target_compile_options(qwfn-gen PRIVATE -O3 ${QWFN_ARCH_FLAGS})
+
+# Prompt-lookup drafter and policy: unit tests and an offline simulation (no model, no device).
+add_executable(qwfn-lookup-test tools/qwfn_lookup_test.cpp src/qwfn_lookup.cpp)
+target_include_directories(qwfn-lookup-test PRIVATE src)
+target_compile_options(qwfn-lookup-test PRIVATE -O2 -Wall -Wextra)
 
 add_executable(qwfn-train-predictor tools/qwfn_train_predictor.cpp)
 target_link_libraries(qwfn-train-predictor PRIVATE qwfn_core)

@@ -747,7 +747,9 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
     if (swaps_in(lp) && last_promote_async_) {
         const uint32_t layer = (uint32_t) (&lp - blk_.data());
         int32_t to = -1;
-        if (victim_expert != SLOT_EMPTY && !(lp.g_cold.size() > (size_t) victim && lp.g_cold[victim])) {
+        const bool cold_victim = victim_expert != SLOT_EMPTY && cfg_.swap_min_ef > 0 && lp.ef[victim_expert] < cfg_.swap_min_ef;
+        if (cold_victim) st_.swap_cold++;
+        if (victim_expert != SLOT_EMPTY && !cold_victim && !(lp.g_cold.size() > (size_t) victim && lp.g_cold[victim])) {
             while (!lp.free_slots.empty() && to < 0) {
                 const int32_t f = lp.free_slots.back(); lp.free_slots.pop_back();
                 if (lp.slot_expert[f] == SLOT_EMPTY && !lp.slot_pinned[f]) to = f;
@@ -779,6 +781,7 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
                     xfer_->nb[0] = 1;
                     xfer_->nb[1] = xfer_->nb[2] = xfer_->nb[3] = lp.g_part_bytes[q];
                     ggml_backend_tensor_get_async(cfg_.vram_backend, xfer_, dst + lp.part_off[q] + lp.part_pay[q], 0, lp.g_part_bytes[q]);
+                    st_.bytes_d2h += lp.g_part_bytes[q];
                 }
             }
         }
@@ -803,6 +806,7 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
         const uint8_t * src = host_block + lp.part_off[q] + lp.part_pay[q];
         if (last_promote_async_) ggml_backend_tensor_set_async(cfg_.vram_backend, xfer_, src, 0, lp.g_part_bytes[q]);
         else                     ggml_backend_tensor_set(xfer_, src, 0, lp.g_part_bytes[q]);
+        st_.bytes_h2d += lp.g_part_bytes[q];
     }
 
     lp.g_slot_expert[victim]  = (uint16_t) expert_id;
@@ -1270,10 +1274,14 @@ void expert_cache::ram_resident_slices(uint32_t layer, std::vector<ram_slice> & 
 
 void expert_cache::settle_promotions() {
     if (pending_release_.empty() && pending_swaps_.empty()) return;
+    const auto t0 = std::chrono::steady_clock::now();
     if (cfg_.vram_backend) ggml_backend_synchronize(cfg_.vram_backend);
+    const auto t1 = std::chrono::steady_clock::now();
     // Exclusive tiers: the victims' bytes have landed in their RAM slots, the uploads are done.
     for (const pending_swap & sw : pending_swaps_) finish_swap(sw);
     pending_swaps_.clear();
+    st_.t_settle_sync   += std::chrono::duration<double>(t1 - t0).count();
+    st_.t_settle_finish += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     // The RAM copy stays. With recency-based VRAM eviction a promoted expert
     // can leave VRAM again soon; if its RAM copy is gone that is a disk read
     // (measured: hit rate 96.1% -> 94.4%, 40% more reads). Lookups check VRAM

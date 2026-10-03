@@ -132,6 +132,9 @@ struct engine_config {
     // Drafts the head proposes per step (1..QWFN_MTP_MAX_DRAFTS): the trunk verifies
     // them as one step of 1+k positions and rolls back to the last accepted one.
     uint32_t  mtp_drafts = 1;
+    // Positions a verify step may roll back, when more than mtp_drafts (the server's prompt-lookup steps carry
+    // --lookup-drafts): one GDN/conv snapshot each, ~76 MB of device memory per position on this model.
+    uint32_t  rollback_positions = 0;
     // Decode only: drop a routed expert whose normalised gate is below this and
     // renormalise the rest in the router graph (0 = off). An approximation,
     // priced with the replay NLL; the dropped experts are neither fetched nor computed.
@@ -318,6 +321,7 @@ public:
     ggml_backend_t             backend() const { return w_.backend(); }
     ggml_backend_buffer_type_t buft()    const { return w_.buft(); }
     bool is_attn_layer(uint32_t il) const { return hp_.is_attn_layer(il); }
+    uint32_t n_layer() const { return hp_.n_layer; }
     // Device bytes held by the cached per-layer decode graphs' allocators (QWFN_VRAM_AUDIT).
     void graph_buffer_bytes(size_t & a_bytes, int & a_graphs, size_t & m_bytes, int & m_graphs) const;
 

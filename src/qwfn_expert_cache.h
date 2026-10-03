@@ -81,6 +81,11 @@ struct expert_cache_stats {
     uint64_t swap_evictions = 0; // of those, the RAM slot taken from a resident (no free slot)
     uint64_t swap_dropped = 0;   // victims not kept: no RAM slot to take, or resident again by the settle
     uint64_t swap_converts = 0;  // RAM blocks turned from the device layout back to the file's for a CPU use
+    uint64_t swap_cold = 0;      // victims not read back: below config::swap_min_ef
+    // settle_promotions(): the stream sync (the promotion copies landing) and the host work after it, seconds;
+    // and the bytes the promotions moved each way.
+    double   t_settle_sync = 0, t_settle_finish = 0;
+    uint64_t bytes_h2d = 0, bytes_d2h = 0;
     uint64_t upgrades   = 0;    // cold blocks refetched at full precision on reuse
     uint64_t batch_lookups = 0, batch_misses = 0;   // prompt-batch experts served without admission, and the ones read for it
     uint64_t warm_admitted = 0; // blocks copied into the RAM tier from a prefill's staging
@@ -149,6 +154,9 @@ public:
         // With exclusive: the layers whose VRAM tier a prefill borrows keep inclusive RAM (sized as if they had no
         // VRAM tier, no swaps), so a prefill does not drop their VRAM experts to disk.
         bool   exclusive_lent_inclusive = false;
+        // With exclusive: a VRAM victim used fewer than this many times (the decayed per-expert count) is not read
+        // back into RAM (dropped, as in the inclusive tiers); 0 reads every victim back.
+        uint32_t swap_min_ef = 0;
         unsigned queue_depth  = 256;
         io_engine::backend io_backend = io_engine::backend::uring;
         // Bound the H2D traffic spent warming T0: one block is ~2.18 MB, so

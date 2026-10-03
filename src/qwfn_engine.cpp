@@ -191,7 +191,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
         const int64_t hv = hp_.ssm_d_state, nvh = hp_.ssm_dt_rank;
         const int64_t conv_dim = 2 * (int64_t) hp_.ssm_n_group * hp_.ssm_d_state + (int64_t) hp_.ssm_dt_rank * hp_.ssm_d_state;
         // One snapshot per draft the step may carry: slot s-1 is the state s tokens back.
-        rb_nsnap_ = (int) std::max<uint32_t>(1, std::min<uint32_t>(cfg.mtp_drafts, (uint32_t) MTP_MAX_DRAFTS));
+        rb_nsnap_ = (int) std::max<uint32_t>(1, std::min<uint32_t>(std::max(cfg.mtp_drafts, cfg.rollback_positions), (uint32_t) MTP_MAX_DRAFTS));
         for (uint32_t il = 0; il < hp_.n_layer; il++) {
             if (hp_.is_attn_layer(il)) continue;
             rb_rs_[il]   = ggml_new_tensor_4d(rbctx_, GGML_TYPE_F32, hv, hv, nvh, rb_nsnap_);
@@ -516,6 +516,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
     // prefill-lent layers inclusive.
     ec_cfg.exclusive = getenv("QWFN_RAM_EXCLUSIVE") != nullptr;
     ec_cfg.exclusive_lent_inclusive = getenv("QWFN_RAM_LENT_INCLUSIVE") != nullptr;
+    if (const char * v = getenv("QWFN_SWAP_MIN_EF")) ec_cfg.swap_min_ef = (uint32_t) std::max(0, atoi(v));
     ec_cfg.use_cold_tier = cfg.use_cold_tier;
     ec_cfg.max_promotions_per_layer = cfg.promote_per_layer;
     ec_cfg.ram_frac      = cfg.ram_frac;

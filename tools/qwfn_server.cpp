@@ -16,6 +16,7 @@
 // you cannot simply forget the tail of a scan.
 
 #include "qwfn_engine.h"
+#include "qwfn_lookup.h"
 #include "qwfn_model.h"
 #include "qwfn_vocab.h"
 #include "qwfn_vision.h"
@@ -600,6 +601,7 @@ struct live_stats {
     struct snapshot {
         int n_input = 0, n_cached = 0, n_prompt = 0, n_gen = 0, n_pairs = 0, n_accepted = 0, n_drafted = 0;
         double t_prompt = 0, t_gen = 0; std::string finish; long long when = 0; bool ok = true;
+        int n_lookup_steps = 0, n_lookup_drafted = 0, n_lookup_accepted = 0;
     } last;
     bool have_last = false;
     double prompt_seconds_locked() const {   // mu held
@@ -625,7 +627,8 @@ struct live_stats {
                 {"prompt_ms", last.t_prompt * 1e3}, {"prompt_tokens_per_second", last.t_prompt > 0 ? last.n_prompt / last.t_prompt : 0.0},
                 {"generation_ms", last.t_gen * 1e3}, {"tokens_per_second", last.t_gen > 0 ? last.n_gen / last.t_gen : 0.0},
                 {"finish_reason", last.finish}, {"ok", last.ok}, {"completed_at", last.when},
-                {"speculative", {{"pairs", last.n_pairs}, {"accepted", last.n_accepted}, {"drafted", last.n_drafted}}}};
+                {"speculative", {{"pairs", last.n_pairs}, {"accepted", last.n_accepted}, {"drafted", last.n_drafted},
+                                 {"lookup_steps", last.n_lookup_steps}, {"lookup_drafted", last.n_lookup_drafted}, {"lookup_accepted", last.n_lookup_accepted}}}};
     }
 };
 
@@ -636,6 +639,9 @@ struct pending_img { std::vector<float> emb; int n_tok = 0; };
 struct server {
     model_index    mi;
     uint32_t       mtp_drafts = 1;   // --mtp-drafts: the most drafts a verify step carries
+    int            lookup_drafts = 0;   // --lookup-drafts: prompt-lookup drafts per lookup step (0 = off)
+    qwfn::lookup_drafter lookup;        // the current request's history, indexed (reset per request)
+    std::unique_ptr<qwfn::lookup_policy> lookup_pol;   // learned across requests: costs and acceptance
     engine         eng;
     qwfn::vocab    vb;
     vision_encoder vis;
@@ -946,12 +952,18 @@ int main(int argc, char ** argv) {
           "      --ram-frac F    MemAvailable share the RAM tier may take (default 0.75)\n"
           "      --prefix-cache GB  host memory for checkpoints of conversations switched away from (default 0 = off), so\n"
           "                      alternating clients do not re-prefill; least recently used first out. ~16 KB per token at\n"
-          "                      --kv q8_0 plus ~118 MB per entry: a 21K-token conversation is ~460 MB. Not with --mtp\n"
+          "                      --kv q8_0 plus ~118 MB per entry: a 21K-token conversation is ~460 MB\n"
           "      --prefix-cache-min N  sequences shorter than N tokens are not saved (default 1024; 0 saves all): one-off\n"
           "                      requests would otherwise take ~118 MB each. Lower it for clients that alternate below it\n"
           "      --prefix-cache-boundary N  also checkpoint a chat prompt at the end of its history, before the assistant\n"
           "                      opener, when that is at least N tokens (default 4096; 0 = off): a next request whose\n"
           "                      re-rendered reply differs then restores it instead of re-prefilling everything\n"
+          "      --mtp PATH      the draft head (nextn layer gguf): each step carries its draft, verified by the trunk (exact)\n"
+          "      --mtp-drafts N  most head drafts per step (1-3, default 1)\n"
+          "      --lookup-drafts N  with --mtp: when the reply copies its context, steps of 1+N positions drafted from the\n"
+          "                      earlier occurrence (prompt lookup, 0-3, default 0 = off); switched in on a long match and\n"
+          "                      kept while the copy lasts (QWFN_LOOKUP_ENTER / _PATIENCE / _MARGIN tune it). Each draft\n"
+          "                      beyond --mtp-drafts adds a rollback snapshot: ~76 MB of device memory on this model\n"
           "      --spec-ahead N  predict 1 or 2 layers ahead (default 2)\n"
           "      --no-prefill-overlap   single prefill staging buffer, saves ~1.8 GB RAM\n"
           "\n"
@@ -971,6 +983,7 @@ int main(int argc, char ** argv) {
     long   prefix_cache_boundary = 4096;
     int vision_threads = 0;
     int def_reasoning_budget = 0;
+    int lookup_drafts = 0;
     int port = 8080;
     engine_config cfg;
     // vram defaults high on purpose: the tier self-tunes down to whatever the
@@ -1038,6 +1051,7 @@ int main(int argc, char ** argv) {
         if (a == "--prefill-decode-max" && i + 1 < argc) { cfg.prefill_decode_max = (uint32_t) atoi(argv[++i]); continue; }
         if (a == "--gate-drop" && i + 1 < argc) { cfg.gate_drop = (float) atof(argv[++i]); continue; }
         if (a == "--mtp-drafts" && i + 1 < argc) { cfg.mtp_drafts = (uint32_t) std::max(1, std::min(3, atoi(argv[++i]))); continue; }
+        if (a == "--lookup-drafts" && i + 1 < argc) { lookup_drafts = std::max(0, std::min((int) engine::MTP_MAX_DRAFTS, atoi(argv[++i]))); continue; }
         if (a == "--spec-block-layers" && i + 1 < argc) { cfg.spec_block = true; cfg.spec_block_layers = next(); continue; }
         if (a == "--state-host" && i + 1 < argc) {   // none | idx | kv | kv,idx
             std::string v = next();
@@ -1081,7 +1095,24 @@ int main(int argc, char ** argv) {
     }
 
     server S;
-    S.n_ctx = cfg.n_ctx; S.n_batch = cfg.n_batch; S.mtp_drafts = cfg.mtp_drafts; S.def_effort = def_effort; S.def_reasoning_budget = def_reasoning_budget;
+    S.n_ctx = cfg.n_ctx; S.n_batch = cfg.n_batch; S.mtp_drafts = cfg.mtp_drafts;
+    if (lookup_drafts > 0 && cfg.mtp_path.empty()) { fprintf(stderr, "[qwfn-server] --lookup-drafts needs --mtp (rollback snapshots); off\n"); lookup_drafts = 0; }
+    S.lookup_drafts = lookup_drafts;
+    cfg.rollback_positions = (uint32_t) lookup_drafts;   // a rejected lookup step rolls back up to all its drafts
+    if (lookup_drafts > 0) {
+        qwfn::lookup_policy::params lp; lp.k_max = lookup_drafts;
+        if (const char * v = getenv("QWFN_LOOKUP_ENTER"))    lp.enter_match = atoi(v);
+        if (const char * v = getenv("QWFN_LOOKUP_PATIENCE")) lp.patience = atoi(v);
+        if (const char * v = getenv("QWFN_LOOKUP_MARGIN"))   lp.margin = (float) atof(v);
+        lp.force = getenv("QWFN_LOOKUP_FORCE") != nullptr;
+        lp.head_t = 1 + (int) std::min<uint32_t>(cfg.mtp_drafts, (uint32_t) engine::MTP_MAX_DRAFTS);
+        S.lookup_pol = std::make_unique<qwfn::lookup_policy>(lp);
+        fprintf(stderr, "[qwfn-server] prompt lookup: %d drafts per lookup step, %s\n", lookup_drafts,
+                lp.head_t == 1 + lookup_drafts ? "the head's window size: per step, the source expected to commit more"
+                : ("enter on a " + std::to_string(lp.enter_match) + "-token match, patience " + std::to_string(lp.patience)
+                   + ", margin " + std::to_string(lp.margin).substr(0, 4)).c_str());
+    }
+    S.def_effort = def_effort; S.def_reasoning_budget = def_reasoning_budget;
     S.model_file = argv[1];
     S.pool_budget = (size_t) (prefix_cache_gb * 1e9);
     S.pool_min = (int32_t) prefix_cache_min;
@@ -1360,6 +1391,7 @@ int main(int argc, char ** argv) {
         std::string stop_seq;                                       // the stop sequence that ended the reply, when one did
         int n_input = 0, n_cached = 0, n_prompt = 0, n_gen = 0;   // whole prompt, reused prefix, prefilled, generated
         int n_pairs = 0, n_accepted = 0, n_drafted = 0;     // verify steps, drafts accepted, drafts proposed
+        int n_lookup_steps = 0, n_lookup_drafted = 0, n_lookup_accepted = 0;   // of those, prompt-lookup steps
         double t_prompt = 0, t_gen = 0;
         bool reasoning_budget_hit = false;
     };
@@ -1723,6 +1755,14 @@ int main(int argc, char ** argv) {
             std::string se; S.eng.spec_layer0(hist.data(), (int32_t) hist.size(), T, se);
             for (int k = 0; k < n; k++) hist.pop_back();
         };
+        // Prompt lookup (--lookup-drafts): the history indexed once per request, then every committed token.
+        const bool lookup_on = S.lookup_drafts > 0 && S.lookup_pol != nullptr;
+        auto lookup_rebuild = [&]() {
+            S.lookup.reset(std::min<size_t>((size_t) S.n_ctx, hist.size() + (size_t) std::max(budget, 0) + 64));
+            S.lookup.append(hist.data(), hist.size());
+        };
+        if (lookup_on) { lookup_rebuild(); S.lookup_pol->new_sequence(); }
+        std::vector<int32_t> lk_prop(engine::MTP_MAX_DRAFTS);
         for (; n < budget; n++) {
             { std::lock_guard<std::mutex> lk(S.live.mu); S.live.n_gen = n + 1; S.live.t_gen = since(td); S.live.n_past = S.eng.n_past(); }
             if (!tok_in) hist.push_back(tok);
@@ -1795,9 +1835,29 @@ int main(int argc, char ** argv) {
             // below sees the distribution the draft was drawn from.
             const bool sampled = smp.cfg.temp > 0.0f && !argmax_draft && S.eng.mtp_logits() != nullptr;
             std::vector<int32_t> drafts; std::vector<std::vector<std::pair<int32_t, float>>> qs;
+            // A lookup step: the drafts are the tokens that followed the earlier occurrence of the history's suffix
+            // (exact either way: greedy compares, and at temperature a fixed draft is accepted when the trunk's own
+            // sample equals it, the qs-free path below). Padded to the lookup window so its size, and the layer
+            // graphs, stay put while the copy lasts; padding is verified like any draft.
+            bool lk_step = false; int lk_real = 0, lk_match = 0;
+            if (lookup_on && S.eng.mtp_draft_id() >= 0) {
+                if (S.lookup.size() > hist.size()) lookup_rebuild();   // cannot happen: hist only grows between steps
+                else if (S.lookup.size() < hist.size()) S.lookup.append(hist.data() + S.lookup.size(), hist.size() - S.lookup.size());
+                const int k = S.lookup.propose(S.lookup_drafts, lk_prop.data());
+                lk_match = S.lookup.last_match();
+                lk_step = S.lookup_pol->choose(k, lk_match);
+                if (lk_step) {
+                    lk_real = k;
+                    drafts.assign(lk_prop.begin(), lk_prop.begin() + k);
+                    if (k == 0) drafts.push_back(S.eng.mtp_draft_id());   // nothing to copy this step: the head's draft leads
+                    while ((int) drafts.size() < S.lookup_drafts) drafts.push_back(drafts.back());
+                }
+            }
             if (S.eng.mtp_draft_id() >= 0) {
                 const int want = drafts_wanted();
-                if (!sampled) {
+                if (lk_step) {
+                    // drafted above
+                } else if (!sampled) {
                     if (!S.eng.mtp_draft_more(want, e, min_p)) return false;
                     for (int k = 0; k < S.eng.mtp_draft_count(); k++) {
                         if (S.eng.mtp_draft_p_k(k) < min_p) break;
@@ -1821,6 +1881,8 @@ int main(int argc, char ** argv) {
             }
             const int K = (int) drafts.size();
             if (K > 0) {
+                const auto t_step0 = clk::now();
+                const uint64_t replays0 = S.eng.n_replay;
                 {
                     std::vector<int32_t> step(drafts);
                     spec_l0(step.data(), K, K + 1);
@@ -1850,7 +1912,7 @@ int main(int argc, char ** argv) {
                             else { for (auto & [t, r] : res) r = (float) (r / sum); y = smp.sample(res); }
                         }
                     }
-                    acc_at[j] += 0.05f * ((accept ? 1.0f : 0.0f) - acc_at[j]);
+                    if (!lk_step) acc_at[j] += 0.05f * ((accept ? 1.0f : 0.0f) - acc_at[j]);
                     if (!accept) break;
                     R.n_accepted++;
                     smp.gen.push_back(drafts[j]);
@@ -1865,6 +1927,14 @@ int main(int argc, char ** argv) {
                 fed.push_back(y);
                 spec_l0(&y, 1, 1);
                 if (!S.eng.mtp_step(fed.data(), (int) fed.size(), e)) return false;
+                if (lookup_on) {
+                    // A step whose layer graphs were rebuilt (a window change) is not a window's cost.
+                    const bool rebuilt = S.eng.n_replay - replays0 < (uint64_t) S.eng.n_layer();
+                    const int real = std::min(lk_real, K);
+                    S.lookup_pol->observe(lk_step, K + 1, lk_step ? real : K, lk_step ? std::min(j, real) : j, lk_match,
+                                          1000.0 * std::chrono::duration<double>(clk::now() - t_step0).count(), rebuilt);
+                    if (lk_step) { R.n_lookup_steps++; R.n_lookup_drafted += real; R.n_lookup_accepted += std::min(j, real); }
+                }
                 if (j > 0) { tok = drafts[0]; evald.assign(drafts.begin() + 1, drafts.begin() + j); tok_next = y; tok_in = true; }
                 else       { tok = y; }
             } else {
@@ -1882,7 +1952,8 @@ int main(int argc, char ** argv) {
           S.live.n_prompt_total += R.n_prompt; S.live.t_prompt_total += R.t_prompt; S.live.n_gen_total += n; S.live.t_gen_total += R.t_gen; S.live.n_past = S.eng.n_past();
           S.live.n_input_total += R.n_input; S.live.n_cached_total += R.n_cached;
           S.live.n_pairs_total += R.n_pairs; S.live.n_accepted_total += R.n_accepted; S.live.n_drafted_total += R.n_drafted;
-          S.live.last = live_stats::snapshot{R.n_input, R.n_cached, R.n_prompt, R.n_gen, R.n_pairs, R.n_accepted, R.n_drafted, R.t_prompt, R.t_gen, R.finish, now_unix(), true};
+          S.live.last = live_stats::snapshot{R.n_input, R.n_cached, R.n_prompt, R.n_gen, R.n_pairs, R.n_accepted, R.n_drafted, R.t_prompt, R.t_gen, R.finish, now_unix(), true,
+                                             R.n_lookup_steps, R.n_lookup_drafted, R.n_lookup_accepted};
           S.live.have_last = true; }
 
         // Close the turn so the next request can continue from here. The sampled
@@ -2072,7 +2143,7 @@ int main(int argc, char ** argv) {
                               {"lookups", c.lookups}, {"hits", c.hits}, {"gpu_hits", c.gpu_hits},
                               {"promotions", c.promotions}, {"pf_issued", c.pf_issued}, {"pf_used", c.pf_used},
                               {"evictions", c.evictions}, {"swaps", c.swaps}, {"swap_evictions", c.swap_evictions},
-                              {"swap_dropped", c.swap_dropped}, {"swap_converts", c.swap_converts}}},
+                              {"swap_dropped", c.swap_dropped}, {"swap_converts", c.swap_converts}, {"swap_cold", c.swap_cold}}},
             // cumulative decode split, seconds: difference two samples for a per-token budget
             {"decode", {{"t_decode", S.eng.t_decode}, {"t_graph_a", S.eng.t_layerA}, {"t_moe_gpu", S.eng.t_moe_gpu},
                         {"t_moe_cpu", S.eng.t_moe_cpu}, {"t_io", S.eng.t_io}, {"t_inputs", S.eng.t_inputs},
@@ -2084,6 +2155,8 @@ int main(int argc, char ** argv) {
                         {"cache_misses", c.misses}, {"cache_reads", c.n_reads}, {"cache_bytes_read", c.bytes_read},
                         {"cache_t_submit", c.t_submit}, {"cache_t_wait", c.t_wait}, {"cache_t_promote", c.t_promote},
                         {"cache_bursts", c.n_bursts}, {"cache_pf_wasted", c.pf_wasted},
+                        {"t_settle_sync", c.t_settle_sync}, {"t_settle_finish", c.t_settle_finish},
+                        {"cache_bytes_h2d", c.bytes_h2d}, {"cache_bytes_d2h", c.bytes_d2h}, {"cache_promotions", c.promotions},
                         {"cache_t_wait_spec", c.t_wait_spec}, {"cache_t_wait_demand", c.t_wait_demand},
                         // the draft head (--mtp): whole head, its three parts, and the rollbacks of rejected drafts
                         {"t_mtp", S.eng.t_mtp}, {"t_mtp_pre", S.eng.t_mtp_pre}, {"t_mtp_moe", S.eng.t_mtp_moe},
@@ -2282,7 +2355,11 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "[qwfn-server] %s: prompt %d tok (%d cached) %.1f tok/s | generated %d tok (%zu reasoning chars%s) in %.1f s, %.1f tok/s, finish %s%s\n",
                 Q.id.c_str(), R.n_prompt, R.n_cached, R.t_prompt > 0 ? R.n_prompt / R.t_prompt : 0.0, R.n_gen, R.reasoning.size(),
                 R.reasoning_budget_hit ? ", budget hit" : "", R.t_gen, R.t_gen > 0 ? R.n_gen / R.t_gen : 0.0, R.finish.c_str(),
-                R.n_pairs ? (" | drafts: " + std::to_string(R.n_accepted) + " of " + std::to_string(R.n_drafted) + " accepted over " + std::to_string(R.n_pairs) + " steps").c_str() : "");
+                R.n_pairs ? (" | drafts: " + std::to_string(R.n_accepted) + " of " + std::to_string(R.n_drafted) + " accepted over " + std::to_string(R.n_pairs) + " steps"
+                             + (R.n_lookup_steps ? " (lookup: " + std::to_string(R.n_lookup_accepted) + " of " + std::to_string(R.n_lookup_drafted)
+                                                   + " over " + std::to_string(R.n_lookup_steps) + " steps)" : std::string())).c_str() : "");
+        static const bool lookup_debug = getenv("QWFN_LOOKUP_DEBUG") != nullptr;
+        if (lookup_debug && S.lookup_pol) fprintf(stderr, "[qwfn-server] %s: lookup policy: %s\n", Q.id.c_str(), S.lookup_pol->describe().c_str());
     };
     auto run_batch = [&](chat_request & Q, const server::prompt & P, chat_result & C, std::string & err) -> bool {
         if (!generate(P, Q.smp, Q.max_tok, Q.thinking, Q.stops,
