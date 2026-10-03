@@ -1192,7 +1192,8 @@ int main(int argc, char ** argv) {
           "      --timeshare N   time-share the engine between up to N open requests (default 0 = off: one at a time, the\n"
           "                      rest queue; with N, request N+1 gets 503). One runs at a time; after a quantum, at a\n"
           "                      decode step, it parks (checkpointed in the --prefix-cache budget, which it needs) when\n"
-          "                      another open request's session has used the engine less lately. Prefill is not interrupted\n"
+          "                      another open request's session has used the engine less lately; a prefill parks between\n"
+          "                      its passes (--batch tokens each)\n"
           "      --quantum S     seconds a request holds the engine before it may yield (default 30)\n"
           "      --linger S      after a request completes, seconds its session's next request goes first (default 1)\n"
           "      --mtp PATH      the draft head (nextn layer gguf): each step carries its draft, verified by the trunk (exact)\n"
@@ -1933,12 +1934,86 @@ int main(int argc, char ** argv) {
         g_gen_thread = pthread_self(); g_gen_thread_set = true;
         smp.gen.clear();
 
-        const auto tp = clk::now();
+        auto tp = clk::now();   // moved forward by the time spent parked (time sharing)
         const float * lg = nullptr;
         // A prompt-boundary checkpoint: stop the prefill at the end of the history, save, go on.
         const bool at_boundary = S.pool_budget > 0 && S.pool_boundary > 0 &&
                                  P.boundary >= std::max(S.pool_boundary, S.pool_min) &&
                                  fed < P.boundary && P.boundary < (int32_t) hist.size();
+        // Time sharing (--timeshare): parking at a yield point. With the quantum up and another open
+        // request due, the sequence the engine holds (exactly `np` tokens of `hist`) is checkpointed, the
+        // engine released, and this thread waits for its next turn; this thread's own state (the sampler,
+        // the reply so far, the prompt left to feed) never leaves it. On resume the checkpoint is restored
+        // unless nobody used the engine meanwhile, and then `redo` puts back what a restore drops (a decode
+        // step's draft, a prefill's pending image embeddings). Returns -1 when the resume failed (the dirty
+        // guard then resets the engine), else the seconds spent parked (0: did not park).
+        auto ts_park = [&](int32_t np, int n_gen, const char * where, const std::function<bool()> & redo) -> double {
+            engine_hold * h = g_hold;
+            if (!h || !h->ts || !S.ts.should_yield(h->t)) return 0;
+            if (S.eng.n_past() != np || S.pool_budget == 0) { S.ts.refused(h->t); return 0; }
+            const auto t0 = clk::now();
+            const size_t need = S.eng.checkpoint_bytes();
+            if (!pool_evict_to(need, 0)) {
+                fprintf(stderr, "[timeshare] request %llu stays: a %.2f GB checkpoint does not fit the prefix cache (%.2f GB, %.2f GB parked)\n",
+                        (unsigned long long) h->t.id, need / 1e9, S.pool_budget / 1e9, S.parked_bytes / 1e9);
+                S.ts.refused(h->t); return 0;
+            }
+            auto ck = std::make_unique<engine::checkpoint>();
+            std::string se;
+            try {
+                if (!S.eng.checkpoint_save(*ck, se)) { fprintf(stderr, "[timeshare] checkpoint failed: %s\n", se.c_str()); S.ts.refused(h->t); return 0; }
+            } catch (const std::bad_alloc &) {
+                fprintf(stderr, "[timeshare] request %llu stays: out of host memory for its %.2f GB checkpoint\n", (unsigned long long) h->t.id, need / 1e9);
+                S.ts.refused(h->t); return 0;
+            }
+            const size_t ck_bytes = ck->bytes();
+            server::reply_state last = S.last;                      // the live sequence's reply, as this request found it
+            std::unordered_map<int32_t, uint64_t> img = S.consumed_img;   // this prompt's images (some maybe not fed yet)
+            // The engine's sequence is nobody's while this request is parked: a switch must not save it.
+            S.consumed.clear(); S.consumed_img.clear();
+            S.parked_bytes += ck_bytes;
+            const uint64_t epoch = ++S.eng_epoch;
+            const double t_save = since(t0);
+            fprintf(stderr, "[timeshare] request %llu (%s) parks %s: %d of %zu tokens in context, %d generated, %.2f GB checkpoint in %.0f ms\n",
+                    (unsigned long long) h->t.id, h->t.session.c_str(), where, np, hist.size(), n_gen, ck_bytes / 1e9, t_save * 1e3);
+            const auto tp0 = clk::now();
+            {
+                // Whatever happens while parked, the engine lock is held again when this scope ends:
+                // the callers' cleanup (the dirty guard, the stream's exception handler) touches the engine.
+                struct relock { std::unique_lock<std::mutex> & l; ~relock() { if (!l.owns_lock()) l.lock(); } } rl{h->lk};
+                h->lk.unlock();
+                S.ts.park(h->t, on_tick ? std::function<void()>(on_tick) : std::function<void()>());   // a stream keeps its keepalives
+            }
+            const auto t1 = clk::now();
+            S.parked_bytes -= ck_bytes;
+            const bool moved = S.eng_epoch != epoch;
+            if (moved) {
+                pool_save(0);   // the sequence that ran meanwhile, if it completed: its next turn restores it
+                if (!S.eng.checkpoint_restore(*ck, se)) { e = "timeshare: resume failed: " + se; return -1; }
+                if (redo && !redo()) return -1;
+            }
+            ck.reset();
+            S.consumed.assign(hist.begin(), hist.begin() + np);
+            S.consumed_img = std::move(img);
+            S.last = std::move(last);
+            S.eng_epoch++;
+            S.eng.set_mtp_logits(smp.cfg.temp > 0.0f && getenv("QWFN_MTP_ARGMAX_DRAFT") == nullptr);
+            g_gen_thread = pthread_self(); g_gen_thread_set = true;
+            const double t_restore = since(t1), parked = std::chrono::duration<double>(t1 - tp0).count();
+            { std::lock_guard<std::mutex> l(S.ts.m); S.ts.t_park += t_save; S.ts.t_resume += t_restore; }
+            { std::lock_guard<std::mutex> lk(S.live.mu);
+              S.live.busy = true; S.live.n_input = R.n_input; S.live.n_cached = R.n_cached; S.live.n_prompt = R.n_prompt; S.live.n_past = S.eng.n_past(); }
+            fprintf(stderr, "[timeshare] request %llu resumes after %.1f s parked: %s in %.0f ms\n", (unsigned long long) h->t.id,
+                    parked, moved ? "restored" : "engine untouched, no restore", t_restore * 1e3);
+            return std::max(parked, 1e-9);
+        };
+        // A restore drops the image embeddings not fed yet: set this prompt's images again (the engine
+        // matches them by position, so the ones already fed are never read).
+        auto ts_redo_prefill = [&]() {
+            for (const auto & sp : P.splices) S.eng.set_embeddings(sp.first, sp.second.data(), (int32_t) (sp.second.size() / 2560));
+            return true;
+        };
+
         while (fed < (int32_t) hist.size()) {
             const int32_t stop = (at_boundary && fed < P.boundary) ? P.boundary : (int32_t) hist.size();
             const int32_t take = std::min<int32_t>(S.n_batch, stop - fed);
@@ -1949,6 +2024,18 @@ int main(int argc, char ** argv) {
             { std::lock_guard<std::mutex> lk(S.live.mu); S.live.prompt_base = fed - fed0; S.live.prompt_done = fed - fed0; S.live.n_past = S.eng.n_past(); }
             if (at_boundary && fed == P.boundary) pool_boundary_save(hist, fed);
             if (on_tick) on_tick();
+            if (fed < (int32_t) hist.size()) {   // phase 2: a prefill yields between passes
+                const double parked = ts_park(fed, 0, "mid-prefill", ts_redo_prefill);
+                if (parked < 0) return false;
+                if (parked > 0) {
+                    const auto shift = std::chrono::duration_cast<clk::duration>(std::chrono::duration<double>(parked));
+                    tp += shift;   // t_prompt is engine time
+                    std::lock_guard<std::mutex> lk(S.live.mu);
+                    // the request that ran meanwhile set the live counters to its own: put this one's back
+                    S.live.prefilling = true; S.live.t_prompt0 = tp; S.live.prompt_base = fed - fed0; S.live.prompt_done = fed - fed0;
+                    S.live.n_gen = 0; S.live.t_gen = 0;
+                }
+            }
         }
         R.t_prompt = since(tp);
         { std::lock_guard<std::mutex> lk(S.live.mu); S.live.t_prompt = R.t_prompt; S.live.prefilling = false; S.live.prompt_done = R.n_prompt; S.live.n_past = S.eng.n_past(); }
@@ -2011,80 +2098,6 @@ int main(int argc, char ** argv) {
         };
         if (lookup_on) { lookup_rebuild(); S.lookup_pol->new_sequence(); }
         std::vector<int32_t> lk_prop(engine::MTP_MAX_DRAFTS);
-        // Time sharing (--timeshare): the yield point, at a decode step's start. The engine then holds
-        // exactly `hist` minus `tok` (sampled and its draft made, not evaluated), so a checkpoint of the
-        // sequence, `tok` and this thread's own state (the sampler, the reply so far) are all it takes
-        // to go on later. Parking: checkpoint, release the engine, wait for the scheduler; resuming:
-        // restore it (unless nobody used the engine meanwhile) and redo `tok`'s draft. False: the
-        // resume failed (the dirty guard then resets the engine).
-        auto ts_yield = [&]() -> bool {
-            engine_hold * h = g_hold;
-            if (!h || !h->ts || !S.ts.should_yield(h->t)) return true;
-            const int32_t np = S.eng.n_past();
-            if (np != (int32_t) hist.size() - 1 || S.pool_budget == 0) { S.ts.refused(h->t); return true; }
-            const auto t0 = clk::now();
-            const size_t need = S.eng.checkpoint_bytes();
-            if (!pool_evict_to(need, 0)) {
-                fprintf(stderr, "[timeshare] request %llu stays: a %.2f GB checkpoint does not fit the prefix cache (%.2f GB, %.2f GB parked)\n",
-                        (unsigned long long) h->t.id, need / 1e9, S.pool_budget / 1e9, S.parked_bytes / 1e9);
-                S.ts.refused(h->t); return true;
-            }
-            auto ck = std::make_unique<engine::checkpoint>();
-            std::string se;
-            try {
-                if (!S.eng.checkpoint_save(*ck, se)) { fprintf(stderr, "[timeshare] checkpoint failed: %s\n", se.c_str()); S.ts.refused(h->t); return true; }
-            } catch (const std::bad_alloc &) {
-                fprintf(stderr, "[timeshare] request %llu stays: out of host memory for its %.2f GB checkpoint\n", (unsigned long long) h->t.id, need / 1e9);
-                S.ts.refused(h->t); return true;
-            }
-            const size_t ck_bytes = ck->bytes();
-            server::reply_state last = S.last;   // the live sequence's reply, as this request found it
-            std::unordered_map<int32_t, uint64_t> img;
-            for (const auto & kv : S.consumed_img) if (kv.first < np) img.insert(kv);
-            // The engine's sequence is nobody's while this request is parked: a switch must not save it.
-            S.consumed.clear(); S.consumed_img.clear();
-            S.parked_bytes += ck_bytes;
-            const uint64_t epoch = ++S.eng_epoch;
-            const double t_save = since(t0);
-            fprintf(stderr, "[timeshare] request %llu (%s) parks after %d generated tokens: %d in context, %.2f GB checkpoint in %.0f ms\n",
-                    (unsigned long long) h->t.id, h->t.session.c_str(), n, np, ck_bytes / 1e9, t_save * 1e3);
-            const auto tp0 = clk::now();
-            {
-                // Whatever happens while parked, the engine lock is held again when this scope ends:
-                // the callers' cleanup (the dirty guard, the stream's exception handler) touches the engine.
-                struct relock { std::unique_lock<std::mutex> & l; ~relock() { if (!l.owns_lock()) l.lock(); } } rl{h->lk};
-                h->lk.unlock();
-                S.ts.park(h->t, on_tick ? std::function<void()>(on_tick) : std::function<void()>());   // a stream keeps its keepalives
-            }
-            const auto t1 = clk::now();
-            S.parked_bytes -= ck_bytes;
-            const bool moved = S.eng_epoch != epoch;
-            if (moved) {
-                pool_save(0);   // the sequence that ran meanwhile, if it completed: its next turn restores it
-                if (!S.eng.checkpoint_restore(*ck, se)) { e = "timeshare: resume failed: " + se; return false; }
-                // The restore drops the draft made for `tok`: make it again (the head's state for the
-                // positions before `tok` came back with the checkpoint).
-                if (!S.eng.mtp_step(&tok, 1, e)) return false;
-            }
-            ck.reset();
-            S.consumed.assign(hist.begin(), hist.begin() + np);
-            S.consumed_img = std::move(img);
-            S.last = std::move(last);
-            S.eng_epoch++;
-            S.eng.set_mtp_logits(smp.cfg.temp > 0.0f && getenv("QWFN_MTP_ARGMAX_DRAFT") == nullptr);
-            if (lookup_on && moved) lookup_rebuild();
-            td += t1 - tp0;
-            g_gen_thread = pthread_self(); g_gen_thread_set = true;
-            const double t_restore = since(t1);
-            { std::lock_guard<std::mutex> l(S.ts.m); S.ts.t_park += t_save; S.ts.t_resume += t_restore; }
-            { std::lock_guard<std::mutex> lk(S.live.mu);
-              S.live.busy = true; S.live.prefilling = false;
-              S.live.n_input = R.n_input; S.live.n_cached = R.n_cached; S.live.n_prompt = R.n_prompt; S.live.t_prompt = R.t_prompt;
-              S.live.prompt_done = R.n_prompt; S.live.n_gen = n + 1; S.live.t_gen = since(td); S.live.n_past = S.eng.n_past(); }
-            fprintf(stderr, "[timeshare] request %llu resumes after %.1f s parked: %s in %.0f ms\n", (unsigned long long) h->t.id,
-                    std::chrono::duration<double>(t1 - tp0).count(), moved ? "restored" : "engine untouched, no restore", t_restore * 1e3);
-            return true;
-        };
         for (; n < budget; n++) {
             { std::lock_guard<std::mutex> lk(S.live.mu); S.live.n_gen = n + 1; S.live.t_gen = since(td); S.live.n_past = S.eng.n_past(); }
             if (!tok_in) hist.push_back(tok);
@@ -2143,7 +2156,18 @@ int main(int argc, char ** argv) {
                 if (!evald.empty()) { tok = evald.front(); evald.erase(evald.begin()); continue; }
                 tok = tok_next; tok_in = false; continue;
             }
-            if (!ts_yield()) return false;
+            {   // a decode step's start: the engine holds `hist` minus `tok` (sampled, its draft made, not evaluated)
+                const double parked = ts_park((int32_t) hist.size() - 1, n, "mid-decode", [&]() {
+                    return S.eng.mtp_step(&tok, 1, e);   // the restore dropped `tok`'s draft: make it again
+                });
+                if (parked < 0) return false;
+                if (parked > 0) {
+                    td += std::chrono::duration_cast<clk::duration>(std::chrono::duration<double>(parked));   // t_gen is engine time
+                    if (lookup_on) lookup_rebuild();
+                    std::lock_guard<std::mutex> lk(S.live.mu);
+                    S.live.prefilling = false; S.live.t_prompt = R.t_prompt; S.live.prompt_done = R.n_prompt; S.live.n_gen = n + 1; S.live.t_gen = since(td);
+                }
+            }
             // The draft: the head's argmax when sampling is greedy; at temperature,
             // a sample from the head's own distribution under the request's
             // sampler (speculative sampling: accept with probability
