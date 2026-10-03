@@ -58,7 +58,7 @@ prefix cache and vision unchanged. Configuration: [`docs/B70-config.md`](docs/B7
 
 Every change is off by default in the patched ggml tree and checked with `test-backend-ops`; the details and the
 rejected alternatives are in [`docs/B70-SYCL.md`](docs/B70-SYCL.md) and [`docs/B70-config.md`](docs/B70-config.md), and
-everything tried so far (adopted, rejected, and ideas not yet tried) in [`docs/B70-registry.md`](docs/B70-registry.md).
+everything tried so far (adopted, rejected, and ideas not yet tried) in [`docs/B70-registry.md`](docs/B70-registry.md). Every command-line flag and environment variable: [`docs/PARAMETERS.md`](docs/PARAMETERS.md).
 
 ## Preferred config
 
