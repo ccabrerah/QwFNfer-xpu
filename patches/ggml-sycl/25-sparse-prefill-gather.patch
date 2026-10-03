@@ -1,0 +1,448 @@
+From: Carlos Cabrera H. <6750732+ccabrerah@users.noreply.github.com>
+Subject: [PATCH 25] ggml-sycl: gathered sparse prefill attention for QSA (each query's chosen cells on DPAS)
+
+GGML_SYCL_FUSE_SPARSE_PREFILL=1 (with the engine's graph order). A prompt chunk's QSA attention is a [n_kv, T] F16
+selection mask (FILL -inf, SET_ROWS 0 at the indexer's cells, + causal) over a dense FLASH_ATTN_EXT, whose cost grows
+with n_kv * T. Matched from the mask's FILL to the FA, it becomes one kernel per (query, kv head) over that query's
+cells straight from the q8_0 cache, after vLLM's QSA kernel: the GQA group's heads are the matrix rows, so S = Q K^T and
+O += P V run as joint_matrix DPAS tiles (8x16x16 half, F32 accumulate, online softmax in F32). The cell list is
+compacted in a stream (a cell listed twice counts once, as in the mask). GGML_SYCL_SPF_MIN_KV: below this n_kv the
+dense path runs (it is cheaper per call there); GGML_SYCL_SPF_MIN_T (default 256): chunks of fewer queries (decode and
+verify steps, short turns over a long cache) leave it too. GGML_SYCL_SPF_CHECK=1 runs both and compares per layer;
+GGML_SYCL_SPF_DEBUG=1 reports where the matcher stops.
+
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -6550,6 +6550,11 @@
+             }
+         }
+         // K/V gathers from the q8_0 cache + F16 casts + one-token FLASH_ATTN_EXT (GGML_SYCL_FUSE_SPARSE_DECODE=1)
++        // QSA selection mask + dense FLASH_ATTN_EXT of a prompt chunk -> one gathered kernel (GGML_SYCL_FUSE_SPARSE_PREFILL=1)
++        if (node->op == GGML_OP_FILL) {
++            const int skip = ggml_sycl_sparse_prefill_attn_fused(*sycl_ctx, cgraph, i);
++            if (skip > 0) { i += skip; continue; }
++        }
+         if (node->op == GGML_OP_GET_ROWS && ggml_sycl_sparse_decode_attn_fused(*sycl_ctx, cgraph, i)) {
+             i += 8;
+             continue;
+@@ -6749,6 +6754,7 @@
+         }
+ 
+         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
++        if (node->op == GGML_OP_FLASH_ATTN_EXT) ggml_sycl_spf_check_after(*sycl_ctx, node);
+         if (!ok) {
+             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+         }
+--- a/ggml/src/ggml-sycl/sdattn.cpp
++++ b/ggml/src/ggml-sycl/sdattn.cpp
+@@ -13,6 +13,9 @@
+ // A lane owns LD = hd / SG consecutive dimensions (16 at hd = 256), so each head's partial output stays in registers.
+ #include "sdattn.hpp"
+ #include "ggml-impl.h"
++#include <sycl/ext/oneapi/matrix/matrix.hpp>
++#include <vector>
++#include <cmath>
+ 
+ namespace {
+ 
+@@ -188,3 +191,386 @@
+         [=](sycl::nd_item<2> it) { sdattn_merge(pod, pmd, n_chunks, dst, it); });
+     return true;
+ }
++
++// ---- Sparse prefill attention, gathered (GGML_SYCL_FUSE_SPARSE_PREFILL=1) ------------------------------------------
++// The engine's prompt attention selects ~2K cells per query (QSA blocks) and expresses the selection as a [n_kv, T]
++// F16 mask over a dense FLASH_ATTN_EXT: FILL(-inf) -> SET_ROWS(0 at the chosen cells) -> + causal -> FA over every
++// cell. The dense FA's cost grows with n_kv * T; the selection's with T only. Here: per (query, kv head, pair of
++// query heads) one subgroup walks that query's chosen cells straight from the q8_0 cache (rounded through F16 as the
++// dense path's K/V are), skips the causally masked ones, and keeps an online softmax in registers -- no mask built,
++// no dense pass. Scores and sums in F32 (the graph asks for GGML_PREC_F32).
++namespace {
++
++struct spf_pending { const ggml_tensor * fa = nullptr; float * buf = nullptr; size_t n = 0, cap = 0; };
++spf_pending spf_check_pending;   // GGML_SYCL_SPF_CHECK
++
++// One work-group per (query, kv head), as vLLM's QSA kernel (qwen4_exp/nvidia/ops/qsa.py) does it: the kv head's query
++// heads are the matrix rows, so the per-query gather still runs on the matrix units (DPAS through joint_matrix).
++// Q is [16 x 256] half in local memory (the GQA group's 12 rows, 4 zero rows); per tile of TCELL chosen cells the K and V
++// rows are gathered from the q8_0 cache into local memory as half (the dense path's cast); S = Q K^T [16 x 16] with each
++// of the NSG subgroups taking 64 of the 256 dims (partials summed in local memory); the online softmax per row in F32
++// (P to half for the second product, as the reference does); O += P V with each subgroup owning 64 output dims
++// (2 x 4 accumulator tiles, rescaled per row). Rows past the group are never stored (they would be the other kv head's).
++namespace jm = sycl::ext::oneapi::experimental::matrix;
++constexpr int NSG   = 4;          // subgroups per work-group
++constexpr int TCELL = 16;         // cells per tile (the B tiles' N for S, the K for O)
++constexpr int MROWS = 16;         // padded query rows: two 8-row A tiles
++constexpr int DSLC  = HD / NSG;   // 64 dims per subgroup
++
++template <typename T> static inline auto lptr(T * p) {
++    return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
++}
++
++constexpr int CBUF = NSG * SG + TCELL;   // the streaming compaction buffer: one batch of candidates + a tile's carry
++
++// v6: occupancy. Q lives in registers as the subgroup's A tiles (staged once through the K/V tile memory), and the cell
++// list is compacted in a stream -- one batch of NSG * SG candidates at a time into a small buffer, refilled when it holds
++// less than a tile -- instead of whole: ~21 KB of local memory per work-group instead of ~45 KB.
++void sdpattn(const char * Q, size_t q_nb0, size_t q_nb1, size_t q_nb2,
++             const uint8_t * kc, const uint8_t * vc, size_t row_bytes, size_t k_hstride, size_t v_hstride,
++             const char * cells, size_t c_nb1, const char * causal, size_t m_nb1,
++             int NC, int n_kv, int nh, int nh_kv, float scale, float * dst,
++             sycl::half * sKV, float * sPart, sycl::half * sP, float * sCorr, int * sBuf, float * sBufMk,
++             const sycl::nd_item<2> & it) {
++    const int t = it.get_group(0), kvh = it.get_group(1);
++    const int lid = it.get_local_id(1), sgid = lid / SG, lane = lid % SG;
++    const int gqa = nh / nh_kv;
++    const int h0 = kvh * gqa;
++    auto sg = it.get_sub_group();
++    const auto grp = it.get_group();
++    sycl::half * sK = sKV, * sV = sKV + TCELL * HD;
++    float * sOut = (float *) sKV;   // the output staging reuses the K/V tiles once the loop is done (16 KB)
++
++    // Q -> half, staged in the K/V tile memory, into this subgroup's A tiles (its 64 dims, both 8-row halves)
++    for (int i = lid; i < MROWS * HD; i += NSG * SG) {
++        const int r = i / HD, d = i % HD;
++        float v = 0.f;
++        if (r < gqa) v = *(const float *) (Q + (size_t) t * q_nb1 + (size_t) (h0 + r) * q_nb2 + (size_t) d * q_nb0);
++        sKV[i] = (sycl::half) v;
++    }
++    it.barrier(sycl::access::fence_space::local_space);
++    jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> qa[2][DSLC / 16];
++#pragma unroll
++    for (int m = 0; m < 2; m++)
++#pragma unroll
++        for (int kk = 0; kk < DSLC / 16; kk++)
++            jm::joint_matrix_load(sg, qa[m][kk], lptr(sKV + m * 8 * HD + sgid * DSLC + kk * 16), HD);
++    it.barrier(sycl::access::fence_space::local_space);   // the staging is free for the tiles
++
++    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> acc_o[2][DSLC / 16];
++#pragma unroll
++    for (int m = 0; m < 2; m++)
++#pragma unroll
++        for (int nt = 0; nt < DSLC / 16; nt++) jm::joint_matrix_fill(sg, acc_o[m][nt], 0.0f);
++    float row_m = -INFINITY, row_l = 0.f;   // the online softmax state of row `lane`, kept by subgroup 0
++
++    const int32_t * ct = (const int32_t *) (cells + (size_t) t * c_nb1);
++    const sycl::half * mt = (const sycl::half *) (causal + (size_t) t * m_nb1);
++    // The dense path writes 0 into a mask at the chosen cells, so a cell listed twice counts once there. The cell table
++    // lists some twice: a partial tail block repeats its last cell (consecutively), and the padding blocks past the
++    // real ones are all cell 0 (an early query of a chunk has fewer real blocks than the top-k takes). Kept: the visible
++    // cells, dropping a cell equal to the one listed before it and every cell 0 after the first.
++    int c0 = 0, buffered = 0, zeros_before = 0;
++    while (true) {
++        // refill: compact batches of candidates until a tile is buffered or the list is done
++        while (buffered < TCELL && c0 < NC) {
++            const int c = c0 + lid;
++            int32_t cell = -1;
++            bool is0 = false, keep = false;
++            float mk = 0.f;
++            if (c < NC) {
++                cell = ct[c];
++                is0 = cell == 0;
++                keep = !(c > 0 && ct[c - 1] == cell) && cell >= 0 && cell < n_kv;
++                if (keep) { mk = (float) mt[cell]; keep = mk != -INFINITY; }
++            }
++            const int z_ex = sycl::exclusive_scan_over_group(grp, is0 ? 1 : 0, sycl::plus<int>());
++            if (is0 && zeros_before + z_ex > 0) keep = false;
++            zeros_before += sycl::reduce_over_group(grp, is0 ? 1 : 0, sycl::plus<int>());
++            const int pos = buffered + sycl::exclusive_scan_over_group(grp, keep ? 1 : 0, sycl::plus<int>());
++            if (keep) { sBuf[pos] = cell; sBufMk[pos] = mk; }
++            buffered += sycl::reduce_over_group(grp, keep ? 1 : 0, sycl::plus<int>());
++            c0 += NSG * SG;
++            it.barrier(sycl::access::fence_space::local_space);
++        }
++        const int n = sycl::min(TCELL, buffered);
++        if (n == 0) break;
++        // gather the tile from the buffer's front: subgroup g fills cells g, g + NSG, ...; empty cells are zeros
++        for (int r = sgid; r < TCELL; r += NSG) {
++            const int dim0 = lane * LD;
++            if (r < n) {
++                const int32_t cell = sBuf[r];
++                // q8_0 blocks are 34 bytes: the lane's 16 codes start 2-byte aligned, so they are read as 8 halfwords
++                // (16 byte loads before); the values are the same: (half) (d * code)
++                {
++                    const uint8_t * blk = kc + (size_t) cell * row_bytes + (size_t) kvh * k_hstride + (size_t) (dim0 / QK8_0) * sizeof(block_q8_0);
++                    const float d = (float) *(const sycl::half *) blk;
++                    const uint16_t * q16 = (const uint16_t *) (blk + sizeof(sycl::half) + dim0 % QK8_0);
++#pragma unroll
++                    for (int j = 0; j < LD / 2; j++) {
++                        const uint16_t w = q16[j];
++                        sK[r * HD + dim0 + 2 * j]     = (sycl::half) (d * (float) (int8_t) (w & 0xFF));
++                        sK[r * HD + dim0 + 2 * j + 1] = (sycl::half) (d * (float) (int8_t) (w >> 8));
++                    }
++                }
++                {
++                    const uint8_t * blk = vc + (size_t) cell * row_bytes + (size_t) kvh * v_hstride + (size_t) (dim0 / QK8_0) * sizeof(block_q8_0);
++                    const float d = (float) *(const sycl::half *) blk;
++                    const uint16_t * q16 = (const uint16_t *) (blk + sizeof(sycl::half) + dim0 % QK8_0);
++#pragma unroll
++                    for (int j = 0; j < LD / 2; j++) {
++                        const uint16_t w = q16[j];
++                        sV[r * HD + dim0 + 2 * j]     = (sycl::half) (d * (float) (int8_t) (w & 0xFF));
++                        sV[r * HD + dim0 + 2 * j + 1] = (sycl::half) (d * (float) (int8_t) (w >> 8));
++                    }
++                }
++            } else {
++#pragma unroll
++                for (int j = 0; j < LD; j++) { sK[r * HD + dim0 + j] = (sycl::half) 0.f; sV[r * HD + dim0 + j] = (sycl::half) 0.f; }
++            }
++        }
++        // the softmax below needs the tile's masks after the buffer shifts: subgroup 0 keeps them in its lanes
++        const float tile_mk = (sgid == 0 && lane < n) ? sBufMk[lane] : 0.f;
++        it.barrier(sycl::access::fence_space::local_space);
++        // shift the buffer's remainder to the front (the tile's indices are no longer needed)
++        const int rest = buffered - n;
++        int carry = -1; float carry_mk = 0.f;
++        if (lid < rest) { carry = sBuf[n + lid]; carry_mk = sBufMk[n + lid]; }
++        it.barrier(sycl::access::fence_space::local_space);
++        if (lid < rest) { sBuf[lid] = carry; sBufMk[lid] = carry_mk; }
++        buffered = rest;
++        // S partial over this subgroup's 64 dims: [16 rows x 16 cells] = Q[:, slice] . K[cells, slice]^T
++#pragma unroll
++        for (int m = 0; m < 2; m++) {
++            jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> acc_s;
++            jm::joint_matrix_fill(sg, acc_s, 0.0f);
++#pragma unroll
++            for (int kk = 0; kk < DSLC / 16; kk++) {
++                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::col_major> b;
++                jm::joint_matrix_load(sg, b, lptr(sK + sgid * DSLC + kk * 16), HD);   // B[k][n] = K[cell n][dim]
++                jm::joint_matrix_mad(sg, acc_s, qa[m][kk], b, acc_s);
++            }
++            jm::joint_matrix_store(sg, acc_s, lptr(sPart + (sgid * MROWS + m * 8) * TCELL), TCELL, jm::layout::row_major);
++        }
++        it.barrier(sycl::access::fence_space::local_space);
++        // online softmax: lane r of subgroup 0 owns row r; the tile's masks are broadcast from the lanes holding them
++        if (sgid == 0) {
++            const int r = lane;
++            float corr = 1.f;
++            float s[TCELL];
++            float tmax = -INFINITY;
++#pragma unroll
++            for (int cc = 0; cc < TCELL; cc++) {
++                const float mkc = sycl::select_from_group(sg, tile_mk, cc);
++                float v = -INFINITY;
++                if (cc < n) {
++                    v = 0.f;
++#pragma unroll
++                    for (int g = 0; g < NSG; g++) v += sPart[(g * MROWS + r) * TCELL + cc];
++                    v = v * scale + mkc;
++                }
++                s[cc] = v; tmax = sycl::fmax(tmax, v);
++            }
++            if (r < gqa) {
++                const float mn = sycl::fmax(row_m, tmax);
++                corr = sycl::exp(row_m - mn);
++                float sum = 0.f;
++#pragma unroll
++                for (int cc = 0; cc < TCELL; cc++) {
++                    const float p = cc < n ? sycl::exp(s[cc] - mn) : 0.f;
++                    sP[r * TCELL + cc] = (sycl::half) p;
++                    sum += p;
++                }
++                row_l = row_l * corr + sum;
++                row_m = mn;
++            } else {
++#pragma unroll
++                for (int cc = 0; cc < TCELL; cc++) sP[r * TCELL + cc] = (sycl::half) 0.f;
++            }
++            sCorr[r] = corr;
++        }
++        it.barrier(sycl::access::fence_space::local_space);
++        // O = O * corr + P V over this subgroup's 64 output dims
++#pragma unroll
++        for (int m = 0; m < 2; m++) {
++            jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> a;
++            jm::joint_matrix_load(sg, a, lptr(sP + m * 8 * TCELL), TCELL);
++#pragma unroll
++            for (int nt = 0; nt < DSLC / 16; nt++) {
++                sycl::ext::intel::experimental::matrix::joint_matrix_apply(sg, acc_o[m][nt],
++                    [=](float & x, size_t row, size_t) { x *= sCorr[m * 8 + row]; });
++                jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::row_major> b;
++                jm::joint_matrix_load(sg, b, lptr(sV + sgid * DSLC + nt * 16), HD);   // B[cell][dim]
++                jm::joint_matrix_mad(sg, acc_o[m][nt], a, b, acc_o[m][nt]);
++            }
++        }
++        it.barrier(sycl::access::fence_space::local_space);   // the tile is consumed before it is refilled
++    }
++    // normalise and write the group's rows (the loop's last barrier has retired every read of sKV and sCorr)
++    if (sgid == 0) sCorr[lane] = row_l > 0.f ? 1.f / row_l : 0.f;   // an all-masked row gives 0
++    it.barrier(sycl::access::fence_space::local_space);
++#pragma unroll
++    for (int m = 0; m < 2; m++)
++#pragma unroll
++        for (int nt = 0; nt < DSLC / 16; nt++)
++            jm::joint_matrix_store(sg, acc_o[m][nt], lptr(sOut + m * 8 * HD + sgid * DSLC + nt * 16), HD, jm::layout::row_major);
++    it.barrier(sycl::access::fence_space::local_space);
++    for (int i = lid; i < gqa * HD; i += NSG * SG) {
++        const int r = i / HD, d = i % HD;
++        dst[((size_t) t * nh + h0 + r) * HD + d] = sOut[i] * sCorr[r];
++    }
++}
++
++}  // namespace
++
++bool ggml_sycl_fuse_sparse_prefill_enabled() {
++    static const bool v = [] { const char * e = getenv("GGML_SYCL_FUSE_SPARSE_PREFILL"); return e && atoi(e) == 1; }();   // 2: the engine's order only
++    return v;
++}
++
++// From the FILL that starts the engine's selection mask to the FLASH_ATTN_EXT that consumes it. The engine expands
++// Q, K/V views, the cell table and the causal mask first, so the nodes in between are exactly the mask's: base FILL
++// (-inf), its 4-D view, the zeros FILL, the cell table's view, SET_ROWS, the 2-D view of it, the causal view, and the
++// in-place ADD. Every link is checked by pointer; anything else in between and the nodes run as they are.
++int ggml_sycl_sparse_prefill_attn_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
++    if (!ggml_sycl_fuse_sparse_prefill_enabled()) return 0;
++    ggml_tensor * base = cgraph->nodes[i];
++    if (base->op != GGML_OP_FILL || base->type != GGML_TYPE_F16 || base->ne[2] != 1 || base->ne[3] != 1) return 0;
++    static int dumped = 0;
++    const bool dbg = getenv("GGML_SYCL_SPF_DEBUG") && dumped < 2;
++    if (dbg) {
++        dumped++;
++        fprintf(stderr, "spf: FILL f16 [%lld, %lld] at node %d; next nodes:", (long long) base->ne[0], (long long) base->ne[1], i);
++        for (int k = i + 1; k < cgraph->n_nodes && k <= i + 14; k++) fprintf(stderr, " %s", ggml_op_name(cgraph->nodes[k]->op));
++        fprintf(stderr, "\n");
++    }
++#define SPF_FAIL(why) do { if (dbg) fprintf(stderr, "spf: no match: %s\n", why); return 0; } while (0)
++    int ifa = -1;
++    for (int k = i + 1; k < cgraph->n_nodes && k <= i + 12; k++)
++        if (cgraph->nodes[k]->op == GGML_OP_FLASH_ATTN_EXT) { ifa = k; break; }
++    if (ifa < 0) SPF_FAIL("no FA within 12 nodes");
++    ggml_tensor * fa = cgraph->nodes[ifa];
++    ggml_tensor * add = fa->src[3];
++    if (!add || add->op != GGML_OP_ADD || fa->src[4]) SPF_FAIL("FA mask is not an ADD");
++    ggml_tensor * selv = add->src[0], * cv = add->src[1];
++    if (!selv || selv->op != GGML_OP_VIEW || !cv || cv->op != GGML_OP_VIEW) SPF_FAIL("ADD srcs are not views");
++    ggml_tensor * setr = selv->src[0];
++    if (!setr || setr->op != GGML_OP_SET_ROWS) SPF_FAIL("no SET_ROWS");
++    // ggml_set_rows(a, b, c) keeps src[0] = b (the rows), src[1] = c (the indices), src[2] = a (the destination)
++    ggml_tensor * zeros = setr->src[0], * idxv = setr->src[1], * a4 = setr->src[2];
++    if (!a4 || a4->op != GGML_OP_VIEW || a4->src[0] != base || !zeros || zeros->op != GGML_OP_FILL || !idxv) SPF_FAIL("SET_ROWS srcs");
++    // the nodes between the base FILL and the FA: exactly the mask's (any order), nothing else
++    const ggml_tensor * mask_nodes[8] = { base, a4, zeros, idxv, setr, selv, cv, add };
++    for (int k = i; k < ifa; k++) {
++        bool ok = false;
++        for (const ggml_tensor * mn : mask_nodes) ok |= cgraph->nodes[k] == mn;
++        if (!ok) { if (dbg) fprintf(stderr, "spf: foreign node %s at %d\n", ggml_op_name(cgraph->nodes[k]->op), k); return 0; }
++        if (cgraph->nodes[k]->flags & GGML_TENSOR_FLAG_OUTPUT) SPF_FAIL("an output flag");
++    }
++    // the mask's intermediates are used only inside the pattern (each node's uses counted from the graph)
++    for (int k = i; k < ifa; k++) {
++        int inside = 0;
++        for (int j = k; j <= ifa; j++)
++            for (int s = 0; s < GGML_MAX_SRC; s++) if (cgraph->nodes[j]->src[s] == cgraph->nodes[k]) inside++;
++        if (inside != ggml_node_get_use_count(cgraph, k)) { if (dbg) fprintf(stderr, "spf: node %d (%s) used outside: %d inside, %d total\n", k, ggml_op_name(cgraph->nodes[k]->op), inside, ggml_node_get_use_count(cgraph, k)); return 0; }
++    }
++    // the cell table: I32 [NC, T] rows (a view of the indexer's top-k cells), NC = cells per query
++    const ggml_tensor * cells = idxv;
++    if (cells->type != GGML_TYPE_I32 || cells->nb[0] != sizeof(int32_t)) SPF_FAIL("type/shape check 1");
++    const ggml_tensor * Q = fa->src[0], * K = fa->src[1], * V = fa->src[2];
++    const ggml_tensor * causal = cv;
++    // Q [hd, T, nh] F32; K/V views [hd, n_kv, nh_kv] of q8_0 caches with packed rows of kv_dim; mask [n_kv, T] F16
++    if (Q->type != GGML_TYPE_F32 || Q->ne[0] != HD || Q->nb[0] != sizeof(float) || Q->ne[3] != 1) SPF_FAIL("type/shape check 2");
++    const int64_t T = Q->ne[1], nh = Q->ne[2];
++    if (K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q8_0 || K->ne[0] != HD || V->ne[0] != HD) SPF_FAIL("type/shape check 3");
++    const int64_t n_kv = K->ne[1], nh_kv = K->ne[2];
++    if (V->ne[1] != n_kv || V->ne[2] != nh_kv || nh % nh_kv != 0 || nh / nh_kv > MROWS) SPF_FAIL("GQA group over 16 rows");
++    if (K->nb[1] != V->nb[1] || K->nb[1] != (size_t) (HD * nh_kv / QK8_0) * sizeof(block_q8_0)) SPF_FAIL("type/shape check 5");
++    if (K->nb[2] != (size_t) (HD / QK8_0) * sizeof(block_q8_0) || V->nb[2] != K->nb[2]) SPF_FAIL("type/shape check 6");
++    if (cells->ne[1] != T || cells->ne[2] != 1 || cells->ne[3] != 1) SPF_FAIL("type/shape check 7");
++    if (causal->type != GGML_TYPE_F16 || causal->ne[0] != n_kv || causal->ne[1] != T || causal->nb[0] != sizeof(sycl::half)) SPF_FAIL("type/shape check 8");
++    if (base->ne[0] != n_kv || base->ne[1] != T) SPF_FAIL("type/shape check 9");
++    float scale, max_bias, softcap;
++    memcpy(&scale,    (const float *) fa->op_params + 0, sizeof(float));
++    memcpy(&max_bias, (const float *) fa->op_params + 1, sizeof(float));
++    memcpy(&softcap,  (const float *) fa->op_params + 2, sizeof(float));
++    if (max_bias != 0.0f || softcap != 0.0f) SPF_FAIL("type/shape check 10");
++    if (fa->type != GGML_TYPE_F32 || !ggml_is_contiguous(fa) || fa->ne[0] != HD || fa->ne[1] != nh || fa->ne[2] != T) SPF_FAIL("type/shape check 11");
++
++    // Short contexts: the dense SDPA is cheap there; GGML_SYCL_SPF_MIN_KV sets where the gather takes over (default 0).
++    static const long min_kv = [] { const char * e = getenv("GGML_SYCL_SPF_MIN_KV"); return e ? atol(e) : 0L; }();
++    if (n_kv < min_kv) return 0;
++    // Few queries (decode / verify steps, short follow-up turns over a long cache): one work-group per (query, kv head)
++    // leaves the device idle; the decode path / dense FA serve them. GGML_SYCL_SPF_MIN_T (default 256).
++    static const long min_t = [] { const char * e = getenv("GGML_SYCL_SPF_MIN_T"); return e ? atol(e) : 256L; }();
++    if (T < min_t) return 0;
++    const int NC = (int) cells->ne[0];
++    // The kernel reads the cell table and the causal mask while writing the FA's output: they must not share memory
++    // (the engine keeps them alive past the FA; this refuses a graph that does not).
++    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
++        const char * a0 = (const char *) a->data, * a1 = a0 + ggml_nbytes(a);
++        const char * b0 = (const char *) b->data, * b1 = b0 + ggml_nbytes(b);
++        return a0 < b1 && b0 < a1;
++    };
++    static int refused = 0;
++    if (overlaps(fa, cells) || overlaps(fa, causal) || overlaps(fa, Q)) {
++        if (refused++ < 3) fprintf(stderr, "ggml-sycl: sparse prefill attention not gathered: the FA output shares memory with an input\n");
++        return 0;
++    }
++    static bool logged = false;
++    if (!logged) { logged = true; fprintf(stderr, "ggml-sycl: sparse prefill attention gathered: %d cells per query, T %lld, n_kv %lld\n", NC, (long long) T, (long long) n_kv); }
++    const char * Qd = (const char *) Q->data;
++    const size_t q_nb0 = Q->nb[0], q_nb1 = Q->nb[1], q_nb2 = Q->nb[2];
++    const uint8_t * kcd = (const uint8_t *) K->data, * vcd = (const uint8_t *) V->data;
++    const size_t row_bytes = K->nb[1], k_hs = K->nb[2], v_hs = V->nb[2];
++    const char * cd = (const char *) cells->data; const size_t c_nb1 = cells->nb[1];
++    const char * md = (const char *) causal->data; const size_t m_nb1 = causal->nb[1];
++    const int in_kv = (int) n_kv, inh = (int) nh, inh_kv = (int) nh_kv;
++    float * dst = (float *) fa->data;
++    dpct::queue_ptr stream = ctx.stream();
++    static const bool check = getenv("GGML_SYCL_SPF_CHECK") != nullptr;
++    if (check) {   // diagnostic: the gathered result into a scratch buffer; the dense nodes still run and are compared after
++        spf_check_pending.fa = fa;
++        spf_check_pending.n = (size_t) ggml_nelements(fa);
++        if (spf_check_pending.cap < spf_check_pending.n) {
++            if (spf_check_pending.buf) sycl::free(spf_check_pending.buf, *stream);
++            spf_check_pending.buf = sycl::malloc_device<float>(spf_check_pending.n, *stream);
++            spf_check_pending.cap = spf_check_pending.n;
++        }
++        dst = spf_check_pending.buf;
++    }
++    stream->submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<sycl::half, 1> sKV(sycl::range<1>(2 * TCELL * HD), cgh), sP(sycl::range<1>(MROWS * TCELL), cgh);
++        sycl::local_accessor<float, 1> sPart(sycl::range<1>(NSG * MROWS * TCELL), cgh), sCorr(sycl::range<1>(MROWS), cgh),
++                                       sBufMk(sycl::range<1>(CBUF), cgh);
++        sycl::local_accessor<int, 1> sBuf(sycl::range<1>(CBUF), cgh);
++        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) T, (size_t) nh_kv * NSG * SG), sycl::range<2>(1, NSG * SG)),
++            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG)]] {
++                auto lp = [](auto & acc) { return acc.template get_multi_ptr<sycl::access::decorated::no>().get(); };
++                sdpattn(Qd, q_nb0, q_nb1, q_nb2, kcd, vcd, row_bytes, k_hs, v_hs, cd, c_nb1, md, m_nb1,
++                        NC, in_kv, inh, inh_kv, scale, dst, lp(sKV), lp(sPart), lp(sP), lp(sCorr), lp(sBuf), lp(sBufMk), it);
++            });
++    });
++    if (check) return 0;
++    return ifa - i;   // nodes to skip after i (the FA included)
++}
++
++void ggml_sycl_spf_check_after(ggml_backend_sycl_context & ctx, const ggml_tensor * node) {
++    if (spf_check_pending.fa != node || !spf_check_pending.buf) return;
++    static int reported = 0;
++    dpct::queue_ptr stream = ctx.stream();
++    stream->wait();
++    std::vector<float> a(spf_check_pending.n), b(spf_check_pending.n);
++    stream->memcpy(a.data(), node->data, a.size() * sizeof(float)).wait();
++    stream->memcpy(b.data(), spf_check_pending.buf, b.size() * sizeof(float)).wait();
++    double maxd = 0, maxa = 0, sumd = 0; size_t nbad = 0;
++    for (size_t k = 0; k < a.size(); k++) {
++        const double d = std::fabs((double) a[k] - (double) b[k]);
++        if (!(d <= 1e30)) { nbad++; continue; }
++        maxd = std::max(maxd, d); maxa = std::max(maxa, (double) std::fabs(a[k])); sumd += d;
++    }
++    if (reported++ < 24)
++        fprintf(stderr, "spf check: T %lld: max |dense - gathered| %.3g (max |dense| %.3g), mean %.3g, non-finite %zu\n",
++                (long long) node->ne[2], maxd, maxa, sumd / a.size(), nbad);
++    spf_check_pending.fa = nullptr;
++}
+--- a/ggml/src/ggml-sycl/sdattn.hpp
++++ b/ggml/src/ggml-sycl/sdattn.hpp
+@@ -6,3 +6,11 @@
+ // not match exactly; the caller then runs them as usual. On true the caller skips the 8 nodes after i.
+ bool ggml_sycl_fuse_sparse_decode_enabled();
+ bool ggml_sycl_sparse_decode_attn_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i);
++
++// Gathered sparse prefill attention (GGML_SYCL_FUSE_SPARSE_PREFILL=1): from the FILL that starts the engine's QSA
++// selection mask to the FLASH_ATTN_EXT that consumes it, one kernel over each query's chosen cells. Returns the
++// number of nodes after i to skip (the FA included), 0 when the nodes do not match.
++bool ggml_sycl_fuse_sparse_prefill_enabled();
++int  ggml_sycl_sparse_prefill_attn_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i);
++// GGML_SYCL_SPF_CHECK=1: after a FLASH_ATTN_EXT the matcher saw, compare the dense result with the gathered one.
++void ggml_sycl_spf_check_after(ggml_backend_sycl_context & ctx, const ggml_tensor * node);

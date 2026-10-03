@@ -416,6 +416,20 @@ ggml_tensor * graph_builder::sparse_attn(ggml_tensor * cur, ggml_tensor * inp_po
     ggml_tensor * v_all = ggml_view_3d(ctx0, vc, hd, n_kv, nh_kv,
             ggml_row_size(vc->type, kv_dim), ggml_row_size(vc->type, hd), 0);
 
+    ggml_tensor * q = ggml_permute(ctx0, Q, 0, 2, 1, 3);                 // [hd, T, nh]
+
+    // GGML_SYCL_FUSE_SPARSE_PREFILL (ggml-sycl patch 25): the backend replaces the selection mask below and the
+    // dense FLASH_ATTN_EXT with one kernel over each query's chosen cells. It matches the mask's nodes as a
+    // contiguous run ending at the FA, so everything else the FA reads goes into the graph first.
+    static const bool gather = getenv("GGML_SYCL_FUSE_SPARSE_PREFILL") && atoi(getenv("GGML_SYCL_FUSE_SPARSE_PREFILL")) != 0;
+    if (gather && top_k) {
+        ggml_build_forward_expand(gf_, q);
+        ggml_build_forward_expand(gf_, k_all);
+        ggml_build_forward_expand(gf_, v_all);
+        ggml_build_forward_expand(gf_, top_k);
+        ggml_build_forward_expand(gf_, kq_mask);
+    }
+
     // Restrict the mask to the cells the indexer chose: start from all -inf,
     // write 0 at the selected indices, then add the causal mask back.
     ggml_tensor * mask = kq_mask;
@@ -446,10 +460,17 @@ ggml_tensor * graph_builder::sparse_attn(ggml_tensor * cur, ggml_tensor * inp_po
         mask = ggml_add_inplace(ctx0, sel, causal);
     }
 
-    ggml_tensor * q = ggml_permute(ctx0, Q, 0, 2, 1, 3);                 // [hd, T, nh]
     ggml_tensor * out = ggml_flash_attn_ext(ctx0, q, k_all, v_all, mask,
                                             1.0f / sqrtf((float) hd), 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    if (gather && top_k) {
+        // The fused kernel reads the cell table and the causal mask while it writes the FA's output, but in the
+        // graph their last reader is the mask build before the FA, so the allocator may hand their memory to the
+        // FA's output. A view of each after the FA keeps them alive through it (views compute nothing).
+        ggml_build_forward_expand(gf_, out);
+        ggml_build_forward_expand(gf_, ggml_view_1d(ctx0, top_k, 1, 0));
+        ggml_build_forward_expand(gf_, ggml_view_1d(ctx0, kq_mask, 1, 0));
+    }
     out = ggml_reshape_2d(ctx0, out, hd * nh, T);
 
     out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, gate));
