@@ -1,0 +1,254 @@
+From: Carlos Cabrera H. <6750732+ccabrerah@users.noreply.github.com>
+Subject: [PATCH 24] ggml-sycl: 2-4-column Q5_K / Q6_K matvecs through the reordered ESIMD kernels
+
+GGML_SYCL_DMMV_NCOLS=1. A 2..4-column MUL_MAT of a reordered Q5_K or Q6_K weight (the MTP verify step's positions) left
+the one-column ESIMD kernel for the generic reordered MMVQ (q8_1 activations), ~1.4x a one-column call at two columns.
+Here the row pair's blocks are dequantized once into 256 floats each -- the same values in the same chunk order as the
+one-column kernel's mac_pair -- and MACed against every column's f32 activation, so each column is accumulated as the
+one-column kernel accumulates it. Routed only on the reordered ESIMD path, single-device buffers, contiguous src1/dst.
+
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp	2026-10-03 01:15:08.234194796 -0300
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp	2026-10-03 01:15:08.255326702 -0300
+@@ -5054,8 +5054,15 @@
+     // need ne[0] % DMMV_X == 0.
+     const int64_t dmmv_x_required = (src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) ?
+                                     2*GGML_SYCL_DMMV_X : GGML_SYCL_DMMV_X;
++    // patch 25 (GGML_SYCL_DMMV_NCOLS=1): 2..4 columns of a reordered Q5_K / Q6_K weight go through the ESIMD
++    // multi-column kernel; the caller keeps that to the reordered ESIMD path.
++    static const bool ncols_on = [] { const char * e = getenv("GGML_SYCL_DMMV_NCOLS"); return e && atoi(e) != 0; }();
++    const bool ncols_ok = ncols_on && (src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) &&
++                          src1->ne[1] >= 2 && src1->ne[1] <= 4 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
++                          ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
++                          !ggml_backend_buffer_is_sycl_split(src0->buffer);   // a split dst is written at stride row_diff, not ne0
+     return ggml_sycl_supports_dmmv(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+-           src0->ne[0] % dmmv_x_required == 0 && src1->ne[1] == 1;
++           src0->ne[0] % dmmv_x_required == 0 && (src1->ne[1] == 1 || ncols_ok);
+ }
+ 
+ static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -5209,7 +5216,10 @@
+                 src0->type == GGML_TYPE_Q4_0)) {
+             use = use || !use_mul_mat_vec_q;
+         }
++        if (src1->ne[1] > 1) use = g_ggml_sycl_enable_esimd && ggml_sycl_supports_reorder_esimd(src0->type);   // patch 25
+         use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && use;
++    } else if (src1->ne[1] > 1) {
++        use_dequantize_mul_mat_vec = false;   // patch 25: the multi-column DMMV exists only on the reordered ESIMD path
+     }
+ 
+     if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
+--- a/ggml/src/ggml-sycl/dmmv.cpp	2026-10-03 01:15:08.232410170 -0300
++++ b/ggml/src/ggml-sycl/dmmv.cpp	2026-10-03 01:15:08.253791346 -0300
+@@ -2006,6 +2006,188 @@
+     });
+ }
+ 
++
++// ---- patch 25: 2..4 columns (a verify step's positions) through the reordered ESIMD kernels -------------------------
++// The one-column ESIMD kernels dequantize a block pair and MAC it against one f32 activation; a 2..4-column call
++// otherwise leaves for the generic reordered MMVQ (q8_1 activations), ~1.4x a one-column call for two columns. Here
++// the pair is dequantized once into 256 floats per row -- the same values in the same chunk order as mac_pair -- and
++// MACed against every column, so a column's sum is accumulated exactly as the one-column kernel accumulates it.
++template <ggml_type T> struct esimd_dequant_pair;
++
++template <> struct esimd_dequant_pair<GGML_TYPE_Q5_K> {
++    using traits = ggml_sycl_esimd::esimd_reorder_q_traits<GGML_TYPE_Q5_K>;
++    static ESIMD_INLINE void run(const traits::ptrs & p, size_t bia, size_t bib, bool has_b,
++                                 sycl::ext::intel::esimd::simd<float, 256> & da,
++                                 sycl::ext::intel::esimd::simd<float, 256> & db) {
++        using namespace sycl::ext::intel::esimd;
++        simd<uint8_t, 128> qs_a = block_load<uint8_t, 128>(p.qs + bia * (QK_K / 2));
++        simd<uint8_t, 32>  qh_a = block_load<uint8_t, 32>(p.qh + bia * (QK_K / 8));
++        simd<uint8_t, 12>  sc_a = block_load<uint8_t, 12>(p.scales + bia * K_SCALE_SIZE);
++        simd<uint8_t, 128> qs_b = 0; simd<uint8_t, 32> qh_b = 0; simd<uint8_t, 12> sc_b = 0;
++        const float dall_a = (float) p.dm[bia * 2 + 0], dmin_a = (float) p.dm[bia * 2 + 1];
++        float dall_b = 0.0f, dmin_b = 0.0f;
++        if (has_b) {
++            qs_b = block_load<uint8_t, 128>(p.qs + bib * (QK_K / 2));
++            qh_b = block_load<uint8_t, 32>(p.qh + bib * (QK_K / 8));
++            sc_b = block_load<uint8_t, 12>(p.scales + bib * K_SCALE_SIZE);
++            dall_b = (float) p.dm[bib * 2 + 0]; dmin_b = (float) p.dm[bib * 2 + 1];
++        }
++        simd<float, 8> sfa, mfa, sfb, mfb;
++        ggml_sycl_esimd::unpack_scale_min_k4(sc_a, dall_a, dmin_a, sfa, mfa);
++        ggml_sycl_esimd::unpack_scale_min_k4(sc_b, dall_b, dmin_b, sfb, mfb);
++        simd<uint8_t, 128> lo_a = qs_a & simd<uint8_t, 128>(0x0F), hi_a = qs_a >> simd<uint8_t, 128>(4);
++        simd<uint8_t, 128> lo_b = qs_b & simd<uint8_t, 128>(0x0F), hi_b = qs_b >> simd<uint8_t, 128>(4);
++#pragma unroll
++        for (int sb = 0; sb < 8; sb += 2) {
++            const int q_offset = sb * 16;
++            simd<uint16_t, 32> qa_lo = convert<uint16_t>(simd<uint8_t, 32>(lo_a.select<32, 1>(q_offset)));
++            simd<uint16_t, 32> qa_hi = convert<uint16_t>(simd<uint8_t, 32>(hi_a.select<32, 1>(q_offset)));
++            simd<uint16_t, 32> qb_lo = convert<uint16_t>(simd<uint8_t, 32>(lo_b.select<32, 1>(q_offset)));
++            simd<uint16_t, 32> qb_hi = convert<uint16_t>(simd<uint8_t, 32>(hi_b.select<32, 1>(q_offset)));
++            qa_lo += traits::extract_bit_to_pos4(qh_a, sb);
++            qa_hi += traits::extract_bit_to_pos4(qh_a, sb + 1);
++            qb_lo += traits::extract_bit_to_pos4(qh_b, sb);
++            qb_hi += traits::extract_bit_to_pos4(qh_b, sb + 1);
++            const float sa_lo = sfa[sb], sa_hi = sfa[sb + 1], ma_lo = mfa[sb], ma_hi = mfa[sb + 1];
++            const float sb_lo = sfb[sb], sb_hi = sfb[sb + 1], mb_lo = mfb[sb], mb_hi = mfb[sb + 1];
++            da.select<32, 1>(sb * 32)       = convert<float>(qa_lo) * sa_lo + ma_lo;
++            da.select<32, 1>((sb + 1) * 32) = convert<float>(qa_hi) * sa_hi + ma_hi;
++            db.select<32, 1>(sb * 32)       = convert<float>(qb_lo) * sb_lo + mb_lo;
++            db.select<32, 1>((sb + 1) * 32) = convert<float>(qb_hi) * sb_hi + mb_hi;
++        }
++    }
++};
++
++template <> struct esimd_dequant_pair<GGML_TYPE_Q6_K> {
++    using traits = ggml_sycl_esimd::esimd_reorder_q_traits<GGML_TYPE_Q6_K>;
++    static ESIMD_INLINE void run(const traits::ptrs & p, size_t bia, size_t bib, bool has_b,
++                                 sycl::ext::intel::esimd::simd<float, 256> & da,
++                                 sycl::ext::intel::esimd::simd<float, 256> & db) {
++        using namespace sycl::ext::intel::esimd;
++        simd<uint8_t, 128> ql_a = block_load<uint8_t, 128>(p.ql + bia * (QK_K / 2));
++        simd<uint8_t, 64>  qh_a = block_load<uint8_t, 64>(p.qh + bia * (QK_K / 4));
++        simd<int8_t, 16>   sc_a = block_load<int8_t, 16>(p.scales + bia * (QK_K / 16));
++        simd<uint8_t, 128> ql_b = 0; simd<uint8_t, 64> qh_b = 0; simd<int8_t, 16> sc_b = 0;
++        const float d_a = (float) p.d[bia];
++        float d_b = 0.0f;
++        if (has_b) {
++            ql_b = block_load<uint8_t, 128>(p.ql + bib * (QK_K / 2));
++            qh_b = block_load<uint8_t, 64>(p.qh + bib * (QK_K / 4));
++            sc_b = block_load<int8_t, 16>(p.scales + bib * (QK_K / 16));
++            d_b = (float) p.d[bib];
++        }
++        simd<float, 16> sfa = convert<float>(sc_a), sfb = convert<float>(sc_b);
++#pragma unroll
++        for (int im = 0; im < 2; ++im) {
++            simd<uint8_t, 32> lla = ql_a.select<32, 1>(64 * im), lha = ql_a.select<32, 1>(64 * im + 32), qha = qh_a.select<32, 1>(32 * im);
++            simd<uint8_t, 32> llb = ql_b.select<32, 1>(64 * im), lhb = ql_b.select<32, 1>(64 * im + 32), qhb = qh_b.select<32, 1>(32 * im);
++#pragma unroll
++            for (int g = 0; g < 4; ++g) {
++                const float sa_lo = sfa[8 * im + 2 * g + 0], sa_hi = sfa[8 * im + 2 * g + 1];
++                const float sb_lo = sfb[8 * im + 2 * g + 0], sb_hi = sfb[8 * im + 2 * g + 1];
++                simd<float, 32> sva = ggml_sycl_esimd::splat_lo_hi(sa_lo * d_a, sa_hi * d_a);
++                simd<float, 32> svb = ggml_sycl_esimd::splat_lo_hi(sb_lo * d_b, sb_hi * d_b);
++                simd<uint8_t, 32> qa, qb;
++                switch (g) {
++                    case 0:
++                        qa = (lla & simd<uint8_t, 32>(0x0F)) | ((qha & simd<uint8_t, 32>(0x03)) << simd<uint8_t, 32>(4));
++                        qb = (llb & simd<uint8_t, 32>(0x0F)) | ((qhb & simd<uint8_t, 32>(0x03)) << simd<uint8_t, 32>(4));
++                        break;
++                    case 1:
++                        qa = (lha & simd<uint8_t, 32>(0x0F)) | ((qha & simd<uint8_t, 32>(0x0C)) << simd<uint8_t, 32>(2));
++                        qb = (lhb & simd<uint8_t, 32>(0x0F)) | ((qhb & simd<uint8_t, 32>(0x0C)) << simd<uint8_t, 32>(2));
++                        break;
++                    case 2:
++                        qa = (lla >> simd<uint8_t, 32>(4)) | (qha & simd<uint8_t, 32>(0x30));
++                        qb = (llb >> simd<uint8_t, 32>(4)) | (qhb & simd<uint8_t, 32>(0x30));
++                        break;
++                    default:
++                        qa = (lha >> simd<uint8_t, 32>(4)) | ((qha & simd<uint8_t, 32>(0xC0)) >> simd<uint8_t, 32>(2));
++                        qb = (lhb >> simd<uint8_t, 32>(4)) | ((qhb & simd<uint8_t, 32>(0xC0)) >> simd<uint8_t, 32>(2));
++                        break;
++                }
++                da.select<32, 1>(32 * (4 * im + g)) = (convert<float>(qa) - 32.0f) * sva;
++                db.select<32, 1>(32 * (4 * im + g)) = (convert<float>(qb) - 32.0f) * svb;
++            }
++        }
++    }
++};
++
++template <ggml_type T, int NCOL>
++static void dequantize_mul_mat_vec_reorder_esimd_ncols(const void * vx, const float * y, float * dst, const int ncols,
++                                                       const int nrows, const int y_stride, const int dst_stride,
++                                                       sycl::local_accessor<float, 1> lmem, const sycl::nd_item<1> & it) {
++    using namespace sycl::ext::intel::esimd;
++    using traits = ggml_sycl_esimd::esimd_reorder_q_traits<T>;
++    const int    num_blocks_per_row = ncols / QK_K;
++    const size_t nb = (size_t) nrows * num_blocks_per_row;
++    const auto   ps = traits::make_ptrs(vx, nb);
++    const int  tid  = it.get_local_id(0);
++    const int  row0 = it.get_group(0) * 2;
++    const bool has_row1 = row0 + 1 < nrows;
++    simd<float, 32> acc0[NCOL], acc1[NCOL];
++#pragma unroll
++    for (int c = 0; c < NCOL; c++) { acc0[c] = 0.0f; acc1[c] = 0.0f; }
++    for (int ib = tid; ib < num_blocks_per_row; ib += ggml_sycl_esimd::GGML_SYCL_DMMV_ESIMD_WG_SIZE) {
++        simd<float, 256> d0, d1;
++        esimd_dequant_pair<T>::run(ps, (size_t) row0 * num_blocks_per_row + ib, (size_t) (row0 + 1) * num_blocks_per_row + ib,
++                                   has_row1, d0, d1);
++#pragma unroll
++        for (int c = 0; c < NCOL; c++) {
++            simd<float, 256> yv = block_load<float, 256>(y + (size_t) c * y_stride + (size_t) ib * QK_K);
++#pragma unroll
++            for (int k = 0; k < 8; k++) {
++                acc0[c] += yv.select<32, 1>(32 * k) * d0.select<32, 1>(32 * k);
++                acc1[c] += yv.select<32, 1>(32 * k) * d1.select<32, 1>(32 * k);
++            }
++        }
++    }
++#pragma unroll
++    for (int c = 0; c < NCOL; c++) {
++        lmem[(tid * NCOL + c) * 2 + 0] = reduce<float>(acc0[c], std::plus<>{});
++        lmem[(tid * NCOL + c) * 2 + 1] = reduce<float>(acc1[c], std::plus<>{});
++    }
++    it.barrier(sycl::access::fence_space::local_space);
++    if (tid == 0) {
++#pragma unroll
++        for (int c = 0; c < NCOL; c++) {
++            float s0 = 0.0f, s1 = 0.0f;
++            for (int p = 0; p < ggml_sycl_esimd::GGML_SYCL_DMMV_ESIMD_WG_SIZE; ++p) {
++                s0 += lmem[(p * NCOL + c) * 2 + 0];
++                s1 += lmem[(p * NCOL + c) * 2 + 1];
++            }
++            dst[(size_t) c * dst_stride + row0] = s0;
++            if (has_row1) dst[(size_t) c * dst_stride + row0 + 1] = s1;
++        }
++    }
++}
++
++template <ggml_type T, int NCOL>
++static void dmmv_reorder_esimd_ncols_launch(const void * vx, const float * y, float * dst, const int ncols, const int nrows,
++                                            const int y_stride, const int dst_stride, dpct::queue_ptr stream) {
++    GGML_ASSERT(ncols % QK_K == 0);
++    const int workgroups = (nrows + 1) / 2;
++    stream->submit([&](sycl::handler & h) {
++        sycl::local_accessor<float, 1> lmem(sycl::range<1>(ggml_sycl_esimd::GGML_SYCL_DMMV_ESIMD_WG_SIZE * 2 * NCOL), h);
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * ggml_sycl_esimd::GGML_SYCL_DMMV_ESIMD_WG_SIZE),
++                                         sycl::range<1>(ggml_sycl_esimd::GGML_SYCL_DMMV_ESIMD_WG_SIZE)),
++            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
++                dequantize_mul_mat_vec_reorder_esimd_ncols<T, NCOL>(vx, y, dst, ncols, nrows, y_stride, dst_stride, lmem, it);
++            });
++    });
++}
++
++template <ggml_type T>
++static void dmmv_reorder_esimd_ncols(const void * vx, const float * y, float * dst, const int ncols, const int nrows,
++                                     const int ny, const int y_stride, const int dst_stride, dpct::queue_ptr stream) {
++    switch (ny) {
++        case 2: dmmv_reorder_esimd_ncols_launch<T, 2>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
++        case 3: dmmv_reorder_esimd_ncols_launch<T, 3>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
++        case 4: dmmv_reorder_esimd_ncols_launch<T, 4>(vx, y, dst, ncols, nrows, y_stride, dst_stride, stream); break;
++        default: GGML_ABORT("dmmv esimd ncols: 2..4 columns");
++    }
++}
++
+ #endif // GGML_SYCL_DMMV_HAS_ESIMD
+ 
+ static void dequantize_mul_mat_vec_q4_K_sycl_reorder(const void *vx, const float *y,
+@@ -2177,7 +2359,10 @@
+             if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
+                 ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+ #ifdef GGML_SYCL_DMMV_HAS_ESIMD
+-                if (g_ggml_sycl_enable_esimd) {
++                if (g_ggml_sycl_enable_esimd && src1_ncols > 1) {   // patch 25: a verify step's 2..4 columns
++                    dmmv_reorder_esimd_ncols<GGML_TYPE_Q5_K>(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, (int) src1_ncols,
++                                                         (int) src1->ne[0], (int) dst->ne[0], stream);
++                } else if (g_ggml_sycl_enable_esimd) {
+                     dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
+                 }
+                 else
+@@ -2193,7 +2378,10 @@
+             if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
+                 ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+ #ifdef GGML_SYCL_DMMV_HAS_ESIMD
+-                if (g_ggml_sycl_enable_esimd) {
++                if (g_ggml_sycl_enable_esimd && src1_ncols > 1) {   // patch 25: a verify step's 2..4 columns
++                    dmmv_reorder_esimd_ncols<GGML_TYPE_Q6_K>(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, (int) src1_ncols,
++                                                         (int) src1->ne[0], (int) dst->ne[0], stream);
++                } else if (g_ggml_sycl_enable_esimd) {
+                     dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
+                 }
+                 else
