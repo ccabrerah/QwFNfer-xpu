@@ -1974,7 +1974,28 @@ int main(int argc, char ** argv) {
         // step's draft, a prefill's pending image embeddings). Returns -1 when the resume failed (the dirty
         // guard then resets the engine), -2 when the client left while parked (the engine, now holding another
         // request's sequence, is left alone), else the seconds spent parked (0: did not park).
+        // QWFN_TS_ROUNDTRIP=S (a test switch, any --timeshare): every S seconds, at a yield point, checkpoint the
+        // sequence and restore it right away, exactly as a park that found the engine moved -- without any other
+        // request running. The expert cache is untouched, so on a fresh server the reply must be byte-identical to
+        // one without round trips: an exactness test of the park/resume path that the engine's own run-to-run
+        // variation (expert placement drifts as the cache warms) cannot blur.
+        static const double rt_every = getenv("QWFN_TS_ROUNDTRIP") ? atof(getenv("QWFN_TS_ROUNDTRIP")) : 0.0;
+        auto rt_last = clk::now();
+        auto ts_roundtrip = [&](int32_t np, const char * where, const std::function<bool()> & redo) -> bool {
+            if (rt_every <= 0 || since(rt_last) < rt_every || S.eng.n_past() != np) return true;
+            const auto t0 = clk::now();
+            engine::checkpoint ck; std::string se;
+            if (!S.eng.checkpoint_save(ck, se)) { e = "roundtrip: save failed: " + se; return false; }
+            const double t_save = since(t0);
+            if (!S.eng.checkpoint_restore(ck, se)) { e = "roundtrip: restore failed: " + se; return false; }
+            if (redo && !redo()) return false;
+            fprintf(stderr, "[timeshare] round trip %s at %d tokens: %.2f GB, save %.0f ms, restore %.0f ms\n", where, np,
+                    ck.bytes() / 1e9, t_save * 1e3, (since(t0) - t_save) * 1e3);
+            rt_last = clk::now();
+            return true;
+        };
         auto ts_park = [&](int32_t np, int n_gen, const char * where, const std::function<bool()> & redo) -> double {
+            if (!ts_roundtrip(np, where, redo)) return -1;
             engine_hold * h = g_hold;
             if (!h || !h->ts || !S.ts.should_yield(h->t)) return 0;
             if (S.eng.n_past() != np || S.pool_budget == 0) { S.ts.refused(h->t); return 0; }
