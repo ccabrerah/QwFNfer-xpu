@@ -647,11 +647,13 @@ struct timeshare {
     double quantum   = 30.0;    // seconds a request holds the engine before it may have to yield
     double linger    = 1.0;     // seconds the engine waits for a finished request's session
     double half_life = 300.0;   // decay of the per-session usage the choice is based on
+    double idle_every = 10.0;   // seconds between a waiting request's idle calls (keepalive, client check)
     struct ticket {
         uint64_t    id = 0;
         std::string session;
         tp          arrived;
         bool        parked = false;   // it ran and yielded; its sequence is checkpointed
+        bool        abandoned = false;   // its client left while it waited: out of the scheduler, release() is a no-op
         double      used = 0;         // engine seconds, this request
         int         n_parks = 0;
     };
@@ -667,7 +669,7 @@ struct timeshare {
     std::string linger_session;
     struct usage_t { double s = 0; tp t{}; };
     std::unordered_map<std::string, usage_t> usage;
-    long long n_admitted = 0, n_rejected = 0, n_parks = 0, n_park_refused = 0, n_lingered = 0;
+    long long n_admitted = 0, n_rejected = 0, n_parks = 0, n_park_refused = 0, n_lingered = 0, n_abandoned = 0;
     double    t_park = 0, t_resume = 0;   // seconds spent checkpointing and restoring
 
     double decayed(const std::string & s, tp now) const {   // m held
@@ -706,20 +708,32 @@ struct timeshare {
         t.id = next_id++; t.session = session; t.arrived = std::chrono::steady_clock::now();
         return true;
     }
-    // Wait for the engine. `idle` runs every ~10 s while waiting, outside the lock (a parked
-    // stream's keepalive).
-    void wait_turn(std::unique_lock<std::mutex> & l, ticket & t, const std::function<void()> & idle) {
+    // Wait for the engine. `idle` runs every ~10 s while waiting, outside the lock (a parked stream's
+    // keepalive); when it returns false (the client left) the request gives up its place: it leaves the
+    // scheduler at once (its open slot is free again) and wait_turn returns false.
+    bool wait_turn(std::unique_lock<std::mutex> & l, ticket & t, const std::function<bool()> & idle) {
         waiting.push_back(&t);
-        auto next_idle = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        const auto every = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(idle_every));
+        auto next_idle = std::chrono::steady_clock::now() + every;
         for (;;) {
             const tp now = std::chrono::steady_clock::now();
             if (pick(now) == &t) break;
             tp until = next_idle;
             if (now < linger_until && linger_until < until) until = linger_until;
             cv.wait_until(l, until);
-            if (idle && std::chrono::steady_clock::now() >= next_idle) {
-                l.unlock(); idle(); l.lock();
-                next_idle = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            // The deadline moves on whether or not there is an idle call: left in the past it would turn the
+            // wait_until above into a spin (a first-turn waiter has none, and spun after 10 s).
+            if (std::chrono::steady_clock::now() >= next_idle) {
+                if (idle) {
+                    l.unlock(); const bool keep = idle(); l.lock();
+                    if (!keep && pick(std::chrono::steady_clock::now()) != &t) {
+                        waiting.erase(std::find(waiting.begin(), waiting.end(), &t));
+                        t.abandoned = true; n_abandoned++; n_open--;
+                        cv.notify_all();
+                        return false;
+                    }
+                }
+                next_idle = std::chrono::steady_clock::now() + every;
             }
         }
         waiting.erase(std::find(waiting.begin(), waiting.end(), &t));
@@ -731,6 +745,7 @@ struct timeshare {
         if (now < linger_until && t.session == linger_session) { slice_start = linger_slice; n_lingered++; }
         else slice_start = now;
         linger_until = tp{};
+        return true;
     }
     void acquire(ticket & t) {
         std::unique_lock<std::mutex> l(m);
@@ -759,17 +774,19 @@ struct timeshare {
         if (running == &t) slice_start = std::chrono::steady_clock::now();
         n_park_refused++;
     }
-    // The engine is checkpointed and released by the caller: wait for the next turn.
-    void park(ticket & t, const std::function<void()> & idle) {
+    // The engine is checkpointed and released by the caller: wait for the next turn. False: the client
+    // left while parked (see wait_turn).
+    bool park(ticket & t, const std::function<bool()> & idle) {
         std::unique_lock<std::mutex> l(m);
         charge(t, std::chrono::steady_clock::now());
         t.parked = true; t.n_parks++; n_parks++;
         running = nullptr;
         cv.notify_all();
-        wait_turn(l, t, idle);
+        return wait_turn(l, t, idle);
     }
     void release(ticket & t) {
         std::lock_guard<std::mutex> l(m);
+        if (t.abandoned) return;   // already out (wait_turn)
         const tp now = std::chrono::steady_clock::now();
         if (running == &t) {
             charge(t, now); running = nullptr;
@@ -791,7 +808,7 @@ struct timeshare {
         for (const ticket * t : waiting) row(t, t->parked ? "parked" : "waiting");
         return {{"max_open", max_open}, {"quantum_s", quantum}, {"linger_s", linger}, {"open", open},
                 {"admitted", n_admitted}, {"rejected", n_rejected}, {"parks", n_parks}, {"park_refused", n_park_refused},
-                {"lingered", n_lingered}, {"park_s", t_park}, {"resume_s", t_resume}};
+                {"lingered", n_lingered}, {"abandoned", n_abandoned}, {"park_s", t_park}, {"resume_s", t_resume}};
     }
 };
 
@@ -906,6 +923,9 @@ struct engine_hold {
     timeshare::ticket t;
     std::unique_lock<std::mutex> lk;
     bool ts = false;
+    // Whether the client has gone (its socket closed): set by the route from httplib's
+    // Request::is_connection_closed, valid while the request is being served.
+    std::function<bool()> client_gone;
     explicit engine_hold(server & s) : S(s), lk(s.mu, std::defer_lock) {}
     void lock() {
         if (ts) S.ts.acquire(t);
@@ -1952,7 +1972,8 @@ int main(int argc, char ** argv) {
         // the reply so far, the prompt left to feed) never leaves it. On resume the checkpoint is restored
         // unless nobody used the engine meanwhile, and then `redo` puts back what a restore drops (a decode
         // step's draft, a prefill's pending image embeddings). Returns -1 when the resume failed (the dirty
-        // guard then resets the engine), else the seconds spent parked (0: did not park).
+        // guard then resets the engine), -2 when the client left while parked (the engine, now holding another
+        // request's sequence, is left alone), else the seconds spent parked (0: did not park).
         auto ts_park = [&](int32_t np, int n_gen, const char * where, const std::function<bool()> & redo) -> double {
             engine_hold * h = g_hold;
             if (!h || !h->ts || !S.ts.should_yield(h->t)) return 0;
@@ -1983,15 +2004,28 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "[timeshare] request %llu (%s) parks %s: %d of %zu tokens in context, %d generated, %.2f GB checkpoint in %.0f ms\n",
                     (unsigned long long) h->t.id, h->t.session.c_str(), where, np, hist.size(), n_gen, ck_bytes / 1e9, t_save * 1e3);
             const auto tp0 = clk::now();
+            bool kept = true;
             {
                 // Whatever happens while parked, the engine lock is held again when this scope ends:
                 // the callers' cleanup (the dirty guard, the stream's exception handler) touches the engine.
                 struct relock { std::unique_lock<std::mutex> & l; ~relock() { if (!l.owns_lock()) l.lock(); } } rl{h->lk};
                 h->lk.unlock();
-                S.ts.park(h->t, on_tick ? std::function<void()>(on_tick) : std::function<void()>());   // a stream keeps its keepalives
+                // Every ~10 s while parked: a stream's keepalive, and is the client still there?
+                kept = S.ts.park(h->t, [&]() {
+                    if (on_tick) on_tick();
+                    return !(h->client_gone && h->client_gone());
+                });
             }
             const auto t1 = clk::now();
             S.parked_bytes -= ck_bytes;
+            if (!kept) {   // out of the scheduler already; the engine is someone else's: touch nothing of it
+                ck.reset();
+                dg.ok = true;   // the dirty guard must not reset the engine on the way out
+                e = "client_gone: the client left while the request was parked";
+                fprintf(stderr, "[timeshare] request %llu abandoned after %.1f s parked: its client left\n",
+                        (unsigned long long) h->t.id, std::chrono::duration<double>(t1 - tp0).count());
+                return -2;
+            }
             const bool moved = S.eng_epoch != epoch;
             if (moved) {
                 pool_save(0);   // the sequence that ran meanwhile, if it completed: its next turn restores it
@@ -2013,6 +2047,14 @@ int main(int argc, char ** argv) {
                     parked, moved ? "restored" : "engine untouched, no restore", t_restore * 1e3);
             return std::max(parked, 1e-9);
         };
+        // A client that left: checked every ~2 s at the yield points (a socket probe), so a request nobody
+        // reads any more stops -- a non-streamed one never learns it from a failed write -- and frees its slot.
+        auto gone_at = clk::now();
+        auto client_gone = [&]() {
+            if (!g_hold || !g_hold->client_gone || since(gone_at) < 2.0) return false;
+            gone_at = clk::now();
+            return g_hold->client_gone();
+        };
         // A restore drops the image embeddings not fed yet: set this prompt's images again (the engine
         // matches them by position, so the ones already fed are never read).
         auto ts_redo_prefill = [&]() {
@@ -2031,6 +2073,7 @@ int main(int argc, char ** argv) {
             if (at_boundary && fed == P.boundary) pool_boundary_save(hist, fed);
             if (on_tick) on_tick();
             if (fed < (int32_t) hist.size()) {   // phase 2: a prefill yields between passes
+                if (client_gone()) { e = "client_gone: the client left during the prefill"; return false; }
                 const double parked = ts_park(fed, 0, "mid-prefill", ts_redo_prefill);
                 if (parked < 0) return false;
                 if (parked > 0) {
@@ -2162,6 +2205,7 @@ int main(int argc, char ** argv) {
                 if (!evald.empty()) { tok = evald.front(); evald.erase(evald.begin()); continue; }
                 tok = tok_next; tok_in = false; continue;
             }
+            if (client_gone()) { R.finish = "cancelled"; n++; break; }   // the state is consistent here: a clean stop
             {   // a decode step's start: the engine holds `hist` minus `tok` (sampled, its draft made, not evaluated)
                 const double parked = ts_park((int32_t) hist.size() - 1, n, "mid-decode", [&]() {
                     return S.eng.mtp_step(&tok, 1, e);   // the restore dropped `tok`'s draft: make it again
@@ -2543,6 +2587,24 @@ int main(int argc, char ** argv) {
     });
     svr.Get("/slots", [&](const httplib::Request &, httplib::Response & res) {
         json st = stats_json();
+        if (S.ts.max_open > 0) {
+            // Time sharing: one slot per request that may be open (llama.cpp's shape, plus the scheduler's view).
+            // The running one carries the live counters; parked and waiting ones what the scheduler knows.
+            json slots = json::array();
+            const json & open = st["timeshare"]["open"];
+            for (int i = 0; i < S.ts.max_open; i++) {
+                json sl{{"id", i}, {"id_task", -1}, {"n_ctx", S.n_ctx}, {"model", S.model_id}, {"is_processing", false}, {"state", "idle"}};
+                if (i < (int) open.size()) {
+                    const json & o = open[i];
+                    sl["is_processing"] = true; sl["state"] = o["state"]; sl["id_task"] = o["id"]; sl["session"] = o["session"];
+                    sl["engine_s"] = o["engine_s"]; sl["age_s"] = o["age_s"]; sl["parks"] = o["parks"]; sl["session_usage_s"] = o["session_usage_s"];
+                    if (o["state"] == "running") { sl["n_past"] = st["context"]["n_past"]; sl["next_token"] = {{"n_decoded", st["generation"]["n"]}}; }
+                }
+                slots.push_back(sl);
+            }
+            res.set_content(slots.dump(2, ' ', false, json::error_handler_t::replace), "application/json");
+            return;
+        }
         res.set_content(json::array({ json{
             {"id", 0}, {"id_task", -1}, {"is_processing", st["busy"]},
             {"n_ctx", S.n_ctx}, {"n_past", st["context"]["n_past"]},
@@ -2566,7 +2628,35 @@ int main(int argc, char ** argv) {
             st["busy"].get<bool>() ? 1 : 0,
             st["expert_cache"]["hit_rate"].get<double>(), st["expert_cache"]["vram_served"].get<double>(),
             (unsigned long long) st["expert_cache"]["bytes_from_disk"].get<double>());
-        res.set_content(buf, "text/plain; version=0.0.4");
+        std::string out = buf;
+        if (S.ts.max_open > 0) {   // time sharing: the open requests by state, and its counters
+            const json & ts = st["timeshare"];
+            int running = 0, parked = 0, waiting = 0;
+            for (const auto & o : ts["open"]) {
+                const std::string state = o.value("state", "");
+                running += state == "running"; parked += state == "parked"; waiting += state == "waiting";
+            }
+            char tb[3072];
+            snprintf(tb, sizeof tb,
+                "# HELP qwfn:timeshare_open_requests Open requests by state (running, parked after a yield, waiting for a first turn).\n# TYPE qwfn:timeshare_open_requests gauge\n"
+                "qwfn:timeshare_open_requests{state=\"running\"} %d\nqwfn:timeshare_open_requests{state=\"parked\"} %d\nqwfn:timeshare_open_requests{state=\"waiting\"} %d\n"
+                "# HELP qwfn:timeshare_max_open Most requests open at once (--timeshare).\n# TYPE qwfn:timeshare_max_open gauge\nqwfn:timeshare_max_open %d\n"
+                "# HELP qwfn:timeshare_admitted_total Requests admitted.\n# TYPE qwfn:timeshare_admitted_total counter\nqwfn:timeshare_admitted_total %lld\n"
+                "# HELP qwfn:timeshare_rejected_total Requests refused (503) with every slot open.\n# TYPE qwfn:timeshare_rejected_total counter\nqwfn:timeshare_rejected_total %lld\n"
+                "# HELP qwfn:timeshare_parks_total Yields: a running request parked for another.\n# TYPE qwfn:timeshare_parks_total counter\nqwfn:timeshare_parks_total %lld\n"
+                "# HELP qwfn:timeshare_park_refused_total Yields that could not park (no room for the checkpoint).\n# TYPE qwfn:timeshare_park_refused_total counter\nqwfn:timeshare_park_refused_total %lld\n"
+                "# HELP qwfn:timeshare_abandoned_total Parked or waiting requests whose client left.\n# TYPE qwfn:timeshare_abandoned_total counter\nqwfn:timeshare_abandoned_total %lld\n"
+                "# HELP qwfn:timeshare_lingered_total Turns taken in their session's linger.\n# TYPE qwfn:timeshare_lingered_total counter\nqwfn:timeshare_lingered_total %lld\n"
+                "# HELP qwfn:timeshare_park_seconds_total Seconds spent checkpointing parked requests.\n# TYPE qwfn:timeshare_park_seconds_total counter\nqwfn:timeshare_park_seconds_total %.3f\n"
+                "# HELP qwfn:timeshare_resume_seconds_total Seconds spent restoring them.\n# TYPE qwfn:timeshare_resume_seconds_total counter\nqwfn:timeshare_resume_seconds_total %.3f\n"
+                "# HELP qwfn:timeshare_parked_bytes Host bytes held by parked requests' checkpoints.\n# TYPE qwfn:timeshare_parked_bytes gauge\nqwfn:timeshare_parked_bytes %llu\n",
+                running, parked, waiting, ts.value("max_open", 0),
+                ts.value("admitted", 0LL), ts.value("rejected", 0LL), ts.value("parks", 0LL), ts.value("park_refused", 0LL),
+                ts.value("abandoned", 0LL), ts.value("lingered", 0LL), ts.value("park_s", 0.0), ts.value("resume_s", 0.0),
+                (unsigned long long) ts.value("parked_bytes", (size_t) 0));
+            out += tb;
+        }
+        res.set_content(out, "text/plain; version=0.0.4");
     });
 
     // ---- one chat request, whatever format it came in ---------------------------
@@ -2720,7 +2810,7 @@ int main(int argc, char ** argv) {
     auto run_batch = [&](chat_request & Q, const server::prompt & P, chat_result & C, std::string & err) -> bool {
         if (!generate(P, Q.smp, Q.max_tok, Q.thinking, Q.stops,
                       [](const std::string &, bool) { return true; }, C.R, err, Q.reasoning_budget)) {
-            S.last.msgs = json();   // cache is no longer trustworthy
+            if (err.rfind("client_gone", 0) != 0) S.last.msgs = json();   // cache is no longer trustworthy (an abandoned request never touched it)
             fprintf(stderr, "[qwfn-server] %s: generation failed after %d tokens: %s\n", Q.id.c_str(), C.R.n_gen, err.c_str());
             return false;
         }
@@ -2869,7 +2959,7 @@ int main(int argc, char ** argv) {
             { std::lock_guard<std::mutex> lg(S.live.mu); if (S.ts.max_open == 0) S.live.busy = false; }
             return out;
         }
-        if (out.ok) finish_request(Q, out.C); else S.last.msgs = json();
+        if (out.ok) finish_request(Q, out.C); else if (out.err.rfind("client_gone", 0) != 0) S.last.msgs = json();
         if (ev.write_failed)
             fprintf(stderr, "[qwfn-server] %s: client stopped reading after %d prompt + %d generated tokens (%.0f s); stream dropped\n",
                     Q.id.c_str(), R.n_prompt, R.n_gen, R.t_prompt + R.t_gen);
@@ -2895,6 +2985,7 @@ int main(int argc, char ** argv) {
         // the next turn) must wait, not enter the engine. So the lock is shared
         // with the provider and released when the stream is done.
         auto lk = hold_engine(S, session_key(req, body, Q->msgs));
+        if (lk) lk->client_gone = [&req]() { return req.is_connection_closed(); };
         if (!lk) {
             res.status = 503; res.set_header("Retry-After", "5");
             res.set_content(json{{"error", {{"message", "all " + std::to_string(S.ts.max_open) + " request slots are open; retry shortly"}, {"type", "server_busy"}}}}.dump(), "application/json");
@@ -3029,6 +3120,7 @@ int main(int argc, char ** argv) {
         log_request(req, *Q, body, " (anthropic)");
 
         auto lk = hold_engine(S, session_key(req, body, Q->msgs));
+        if (lk) lk->client_gone = [&req]() { return req.is_connection_closed(); };
         if (!lk) {
             res.status = 503; res.set_header("Retry-After", "5");
             res.set_content(json{{"error", {{"message", "all " + std::to_string(S.ts.max_open) + " request slots are open; retry shortly"}, {"type", "server_busy"}}}}.dump(), "application/json");
@@ -3167,6 +3259,7 @@ int main(int argc, char ** argv) {
         }
 
         auto lk = hold_engine(S, session_key(req, body, json::array({json{{"role", "user"}, {"content", p.substr(0, 4096)}}})));
+        if (lk) lk->client_gone = [&req]() { return req.is_connection_closed(); };
         if (!lk) {
             res.status = 503; res.set_header("Retry-After", "5");
             res.set_content(json{{"error", {{"message", "all " + std::to_string(S.ts.max_open) + " request slots are open; retry shortly"}, {"type", "server_busy"}}}}.dump(), "application/json");
@@ -3181,7 +3274,7 @@ int main(int argc, char ** argv) {
         // from would file that conversation without its message list.
         const bool gen_ok = generate(P, smp, max_tok, /*thinking=*/false, stops,
                                      [](const std::string &, bool) { return true; }, R, e);
-        S.last.msgs = json();
+        if (gen_ok || e.rfind("client_gone", 0) != 0) S.last.msgs = json();
         if (!gen_ok) { fail(res, 500, e, "server_error"); return; }
         res.set_content(json{
             {"id", "cmpl-" + std::to_string(now_unix())}, {"object", "text_completion"},
