@@ -254,8 +254,8 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_SPF_MIN_KV=N` | 25 | 45056 | Below n_kv N the dense path runs. |
 | `GGML_SYCL_SPF_MIN_T=N` | 25 | (256) | Chunks of fewer queries (decode, verify steps, short turns) take the dense / decode path. |
 | `GGML_SYCL_SPF_CHECK=1` / `GGML_SYCL_SPF_DEBUG=1` | 25 | | Run dense and gathered and compare per layer / report where the matcher stops. |
-| `GGML_SYCL_DNNL_DETERMINISTIC=1` | 26 | | oneDNN matmuls in deterministic mode (no split-K atomic accumulation): the same bits every run. |
-| `GGML_SYCL_TOPK_DETERMINISTIC=1` | 27 | | Radix top-k emits in column order, ties to the lowest index, no atomics (the QSA indexer's block selection reproducible). With 26: bit-identical runs. |
+| `GGML_SYCL_DNNL_DETERMINISTIC=1` | 26 | 1 | oneDNN matmuls in deterministic mode (no split-K atomic accumulation): the same bits every run. |
+| `GGML_SYCL_TOPK_DETERMINISTIC=1` | 27 | 1 | Radix top-k emits in column order, ties to the lowest index, no atomics (the QSA indexer's block selection reproducible). With 26: bit-identical runs. |
 
 ## 6. Upstream ggml and runtime variables the launcher sets
 

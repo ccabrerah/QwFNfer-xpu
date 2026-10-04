@@ -26,6 +26,7 @@ export GGML_SYCL_Q8_REUSE=1 GGML_SYCL_Q8_DIRECT=1                               
 export GGML_SYCL_Q8_EPILOGUE=1                                                                       # Q8_0 MUL_MAT -> [SCALE ->] SILU as one launch (patch 21; overlay v4's mixers)
 export GGML_SYCL_DMMV_NCOLS=1                                                                        # 2-4-column Q5_K/Q6_K matvecs through the ESIMD kernel (patch 24; the MTP verify step)
 export GGML_SYCL_FUSE_SPARSE_PREFILL=1 GGML_SYCL_SPF_MIN_KV=45056                                    # long prompts: QSA attention gathered per query on DPAS past n_kv 45K (patch 25)
+export GGML_SYCL_DNNL_DETERMINISTIC=1 GGML_SYCL_TOPK_DETERMINISTIC=1                                 # bit-identical runs: oneDNN matmuls and the radix top-k without atomics (patches 26-27)
 export GGML_SYCL_TOPK_WG=1 GGML_SYCL_FUSE_HC_MIX=1 GGML_SYCL_FUSE_ADDCHAIN=1 GGML_SYCL_FUSE_MOESUM=1 GGML_SYCL_FUSE_CONV=1   # decode fusions (patches 12-15)
 # The MTP draft head (docs/B70-config.md, "MTP"): QWFN_B70_MTP = the head (its experts in Q2_0, all on the device),
 # QWFN_B70_DRAFT_VOCAB = the token ids it may draft (optional). One draft per step, no layer-0 prefetch pass, and the
