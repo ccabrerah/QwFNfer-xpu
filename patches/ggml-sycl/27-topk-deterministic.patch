@@ -1,0 +1,92 @@
+From: Carlos Cabrera H. <6750732+ccabrerah@users.noreply.github.com>
+Subject: [PATCH 27] ggml-sycl: deterministic radix top-k (GGML_SYCL_TOPK_DETERMINISTIC)
+
+GGML_SYCL_TOPK_DETERMINISTIC=1. The radix top-k's final pass claims output slots with work-group atomics, so among
+pivot-equal columns (ties) which ones fill the last slots, and the order of all winners, depend on lane timing. The
+QSA indexer's block scores tie often (masked blocks), so the selected blocks -- and from there the attention -- could
+differ between two runs of the same prompt (measured on this model: identical input, different TOP_K output in layer
+27 of a 20K prefill). With the switch the emit walks the row in column tiles through work-group exclusive scans:
+winners above the pivot in index order, then the lowest-index pivot-equal columns. The split (multi-group) kernel,
+which reserves ranges with global atomics, is bypassed (it only runs for rows of 64K+ columns). Together with patch
+26, two cold runs of the same prompt give bit-identical hidden states at every layer and identical greedy text.
+
+--- a/ggml/src/ggml-sycl/topk-radix.cpp
++++ b/ggml/src/ggml-sycl/topk-radix.cpp
+@@ -50,6 +50,7 @@
+     int32_t *       dst_idx,
+     const int       ncols,
+     const int       k,
++    const bool      deterministic,
+     uint32_t *      slm,
+     const sycl::nd_item<1> & item_ct1
+ ) {
+@@ -133,6 +134,29 @@
+     // columns fill the tail. Both counters live in SLM since the whole row is this group.
+     const uint32_t base_eq = (uint32_t) k - need;
+ 
++    // GGML_SYCL_TOPK_DETERMINISTIC=1: emit in column order through work-group scans instead of atomic slot
++    // grabs. The winners above the pivot come out in index order, and among pivot-equal columns (ties) the
++    // lowest indices win: the same indices in the same order every run. With the atomics, which tied columns
++    // fill the last slots, and the order of all of them, depend on lane timing.
++    if (deterministic) {
++        const auto grp = item_ct1.get_group();
++        uint32_t run_gt = 0, run_eq = 0;   // winners emitted by earlier tiles (uniform across the group)
++        for (int base = 0; base < ncols; base += block_size) {
++            const int col = base + tid;
++            uint32_t gt = 0, eq = 0;
++            if (col < ncols) {
++                const uint32_t kp = top_k_radix_key(src[col]) & mask;
++                gt = kp > prefix; eq = kp == prefix;
++            }
++            const uint32_t ex_gt = sycl::exclusive_scan_over_group(grp, gt, sycl::plus<uint32_t>());
++            const uint32_t ex_eq = sycl::exclusive_scan_over_group(grp, eq, sycl::plus<uint32_t>());
++            if (gt) dst_idx[run_gt + ex_gt] = col;
++            if (eq && run_eq + ex_eq < need) dst_idx[base_eq + run_eq + ex_eq] = col;
++            run_gt += sycl::reduce_over_group(grp, gt, sycl::plus<uint32_t>());
++            run_eq += sycl::reduce_over_group(grp, eq, sycl::plus<uint32_t>());
++        }
++        return;
++    }
+     for (int col = tid; col < ncols; col += block_size) {
+         const uint32_t kp = top_k_radix_key(src[col]) & mask;
+         if (kp > prefix) {
+@@ -147,6 +171,11 @@
+     }
+ }
+ 
++static bool top_k_radix_deterministic() {
++    static const bool on = [] { const char * e = getenv("GGML_SYCL_TOPK_DETERMINISTIC"); return e && atoi(e) != 0; }();
++    return on;
++}
++
+ static void top_k_radix_f32_sycl(
+     ggml_backend_sycl_context & ctx,
+     const float * src,
+@@ -166,6 +195,7 @@
+ 
+     const sycl::range<1> block_dims(block_size);
+     const sycl::range<1> grid_dims(nrows);
++    const bool deterministic = top_k_radix_deterministic();
+ 
+     main_stream->submit([&](sycl::handler &cgh) {
+         sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(SYCL_TOP_K_RADIX_SLM_WORDS), cgh);
+@@ -177,7 +207,7 @@
+ 
+                 top_k_radix_select_f32(
+                     src + (int64_t) row * ncols, dst_indices + (int64_t) row * k,
+-                    (int) ncols, k,
++                    (int) ncols, k, deterministic,
+                     slm.get_multi_ptr<sycl::access::decorated::no>().get(),
+                     item_ct1);
+             });
+@@ -522,7 +552,9 @@
+     const int       k,
+     dpct::queue_ptr main_stream
+ ) {
+-    const int nparts = top_k_radix_split_groups(ctx.device, ncols, nrows);
++    // The split kernel reserves output ranges per group with global atomics; the deterministic emit is the
++    // single-group kernel's (rows here are far below the 64K-column split threshold anyway).
++    const int nparts = top_k_radix_deterministic() ? 1 : top_k_radix_split_groups(ctx.device, ncols, nrows);
+     if (nparts > 1) {
+         top_k_radix_split_f32_sycl(ctx, src, dst_indices, ncols, nrows, k, nparts, main_stream);
+     } else {

@@ -1,0 +1,23 @@
+From: Carlos Cabrera H. <6750732+ccabrerah@users.noreply.github.com>
+Subject: [PATCH 26] ggml-sycl: oneDNN matmuls in deterministic mode (GGML_SYCL_DNNL_DETERMINISTIC)
+
+GGML_SYCL_DNNL_DETERMINISTIC=1 sets oneDNN's deterministic attribute on the DnnlGemmWrapper matmul (the bf16/f16
+GEMM path). oneDNN may split a long reduction across work-groups and add the partial sums atomically; the same matmul
+on the same inputs then differs in the last bits between runs (measured on this model: the hyper-connection mixer's
+bf16 [10240 x 320] x f32 [10240 x 1024] at the start of every layer, different bits on a rerun in one process), and
+greedy text diverges at near-ties. With the attribute every run of a graph gives the same bits.
+
+--- a/ggml/src/ggml-sycl/gemm.hpp
++++ b/ggml/src/ggml-sycl/gemm.hpp
+@@ -56,6 +56,11 @@
+         const auto c_md    = dnnl::memory::desc(c_dims, ct, c_strides);
+         dnnl::primitive_attr primitive_attr;
+         primitive_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
++        // GGML_SYCL_DNNL_DETERMINISTIC=1: oneDNN may split a long reduction (K) across work-groups and add the partial
++        // sums atomically, so the same matmul on the same inputs differs in the last bits from run to run. Its
++        // deterministic attribute forbids that; with it every run of a graph gives the same bits.
++        static const bool deterministic = [] { const char * e = getenv("GGML_SYCL_DNNL_DETERMINISTIC"); return e && atoi(e) != 0; }();
++        if (deterministic) primitive_attr.set_deterministic(true);
+ 
+ #ifdef GGML_SYCL_F16
+         primitive_attr.set_fpmath_mode(dnnl::fpmath_mode::f16);

@@ -1577,7 +1577,25 @@ void engine::vram_lend_end() {
 // mul_mat_id in the same chunks. The sweep is what a prefill costs, so its
 // count per prompt goes from ceil(n / ubatch), with the ubatch shrinking as
 // the context grows, to ceil(n / n_batch).
+// QWFN_HASH_PREFILL (diagnostic): FNV-1a hashes of the prefill's per-layer intermediates, to find where two runs of
+// the same prompt first differ (run-to-run determinism).
+static uint64_t fnv64(const void * p, size_t n, uint64_t h = 1469598103934665603ull) {
+    const uint8_t * b = (const uint8_t *) p;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
 bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, std::string & err) {
+    // =1: per-layer hashes; =2: every node of layer 0's first graph-A chunk (each kept as an output so it has its own
+    // memory -- which also stops fusions that need the intermediate unread), then exit.
+    static const int hash_pf_mode = getenv("QWFN_HASH_PREFILL") ? atoi(getenv("QWFN_HASH_PREFILL")) : 0;
+    static const bool hash_pf = hash_pf_mode > 0;
+    // =3: every node of every graph-A chunk of layer QWFN_HASH_LAYER (no rerun: compare two processes), then exit.
+    static const int hash_layer = getenv("QWFN_HASH_LAYER") ? atoi(getenv("QWFN_HASH_LAYER")) : 0;
+    auto dev_hash = [&](ggml_tensor * t, size_t bytes) {
+        std::vector<uint8_t> tmp(bytes);
+        ggml_backend_tensor_get(t, tmp.data(), 0, bytes);
+        return fnv64(tmp.data(), bytes);
+    };
     const int64_t n_embd = hp_.n_embd, hc = hp_.hc_count, U = hp_.n_expert_used;
     const int64_t n_past = n_past_, PH = hp_.ple_n_head();
     const auto t0 = std::chrono::steady_clock::now();
@@ -1717,7 +1735,59 @@ bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, s
                 }
             }
             const auto tgb = std::chrono::steady_clock::now();
+            const bool node_hash = hash_pf_mode == 2 && il == 0 && off == 0;
+            const bool layer_hash = hash_pf_mode == 3 && (int) il == hash_layer;
+            if (node_hash || layer_hash)   // nodes over 256 MB stay shared (an attention chunk's mask alone is n_kv x T)
+                for (int k = 0; k < ggml_graph_n_nodes(g); k++) if (ggml_nbytes(ggml_graph_node(g, k)) <= (256u << 20)) ggml_set_output(ggml_graph_node(g, k));
             run_on(g, true);
+            if (layer_hash) {
+                ggml_backend_synchronize(w_.backend());
+                for (int k = 0; k < ggml_graph_n_nodes(g); k++) {
+                    ggml_tensor * t = ggml_graph_node(g, k);
+                    if (!t->buffer || !ggml_is_contiguous(t) || !(t->flags & GGML_TENSOR_FLAG_OUTPUT)) continue;
+                    std::string srcs;
+                    for (int j = 0; j < 3 && t->src[j]; j++) {
+                        char b[96]; snprintf(b, sizeof b, " src%d %s [%lld,%lld,%lld]", j, ggml_type_name(t->src[j]->type),
+                                             (long long) t->src[j]->ne[0], (long long) t->src[j]->ne[1], (long long) t->src[j]->ne[2]);
+                        srcs += b;
+                    }
+                    fprintf(stderr, "[lnode] layer %u chunk %lld node %3d %-14s %s %016llx |%s\n", il, (long long) off, k, ggml_op_desc(t),
+                            ggml_type_name(t->type), (unsigned long long) dev_hash(t, ggml_nbytes(t)), srcs.c_str());
+                }
+            }
+            if (node_hash) {
+                // Each node: its op, inputs (type, shape, and a hash of a weight's bytes), and its output's hash after
+                // this run and after a second run of the same graph on the same inputs: a node that differs between
+                // the two runs in one process is a non-deterministic kernel; one that only differs across processes
+                // depends on memory state.
+                ggml_backend_synchronize(w_.backend());
+                const int nn = ggml_graph_n_nodes(g);
+                std::vector<uint64_t> h1(nn, 0);
+                for (int k = 0; k < nn; k++) {
+                    ggml_tensor * t = ggml_graph_node(g, k);
+                    if (t->buffer && ggml_is_contiguous(t)) h1[k] = dev_hash(t, ggml_nbytes(t));
+                }
+                ggml_backend_graph_compute(w_.backend(), g);
+                ggml_backend_synchronize(w_.backend());
+                for (int k = 0; k < nn; k++) {
+                    ggml_tensor * t = ggml_graph_node(g, k);
+                    std::string srcs;
+                    for (int j = 0; j < 2 && t->src[j]; j++) {
+                        const ggml_tensor * sj = t->src[j];
+                        char b[200];
+                        snprintf(b, sizeof b, " src%d %s [%lld,%lld,%lld]%s", j, ggml_type_name(sj->type), (long long) sj->ne[0], (long long) sj->ne[1], (long long) sj->ne[2],
+                                 (sj->op == GGML_OP_NONE && sj->buffer && ggml_is_contiguous(sj)) ? (" w=" + std::to_string(dev_hash((ggml_tensor *) sj, ggml_nbytes(sj)) & 0xffffff)).c_str() : "");
+                        srcs += b;
+                    }
+                    if (!t->buffer || !ggml_is_contiguous(t)) { fprintf(stderr, "[node] %3d %-14s (not contiguous)%s\n", k, ggml_op_desc(t), srcs.c_str()); continue; }
+                    const uint64_t h2 = dev_hash(t, ggml_nbytes(t));
+                    fprintf(stderr, "[node] %3d %-14s %s %016llx%s |%s\n", k, ggml_op_desc(t), ggml_type_name(t->type), (unsigned long long) h1[k],
+                            h1[k] == h2 ? "" : " RERUN-DIFFERS", srcs.c_str());
+                }
+                fprintf(stderr, "[node] done\n");
+                fflush(stderr);
+                std::_Exit(0);
+            }
             const auto tgr = std::chrono::steady_clock::now();
             ggml_free(c);
             ai.release();
@@ -1738,10 +1808,18 @@ bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, s
         }
         cur_res = 1 - cur_res;
         pending = true;
+        if (hash_pf_mode == 3 && (int) il == hash_layer) { fprintf(stderr, "[lnode] done\n"); fflush(stderr); std::_Exit(0); }
         const auto trb0 = std::chrono::steady_clock::now();
         ggml_backend_tensor_get(t_sel_, sel_.data(), 0, (size_t) U * T * sizeof(int32_t));
         ggml_backend_tensor_get(t_w_,   wgt_.data(), 0, (size_t) U * T * sizeof(float));
         t_pf_readback += std::chrono::duration<double>(std::chrono::steady_clock::now() - trb0).count();
+        if (hash_pf)
+            fprintf(stderr, "[hash] n_past %lld layer %2u A: moe_in %016llx shared %016llx routing %016llx weights %016llx\n",
+                    (long long) n_past, il,
+                    (unsigned long long) dev_hash(t_cur_, (size_t) n_embd * T * sizeof(float)),
+                    (unsigned long long) dev_hash(t_sh_,  (size_t) n_embd * T * sizeof(float)),
+                    (unsigned long long) fnv64(sel_.data(), (size_t) U * T * sizeof(int32_t)),
+                    (unsigned long long) fnv64(wgt_.data(), (size_t) U * T * sizeof(float)));
         if (t_xdump_) {
             if (!routers_dumped_) { if (!dump_routers(dump_dir_, err)) return false; routers_dumped_ = true; }
             dump_layer(il, T);
@@ -1787,6 +1865,11 @@ bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, s
                 ggml_backend_tensor_set(t_pc_, xfer_.data(), (size_t) off * n_embd * 4, (size_t) Tc * n_embd * 4);
             }
             t_pf_moe += std::chrono::duration<double>(std::chrono::steady_clock::now() - tm0).count();
+        }
+        if (hash_pf) {
+            if (pf_.on_device()) ggml_backend_synchronize(w_.backend());
+            fprintf(stderr, "[hash] n_past %lld layer %2u B: moe_out %016llx\n", (long long) n_past, il,
+                    (unsigned long long) dev_hash(t_pc_, (size_t) n_embd * T * sizeof(float)));
         }
         const auto tz0 = std::chrono::steady_clock::now();
         // Device-side fill: this used to upload n_embd*T*4 bytes of host zeros
@@ -1861,6 +1944,7 @@ bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, s
         ggml_build_forward_expand(g, logits);
         run_on(g, true);
         ggml_backend_tensor_get(logits, logits_.data(), 0, (size_t) n_vocab_ * sizeof(float));   // one position: logits_ holds two for a decoded pair
+        if (hash_pf) fprintf(stderr, "[hash] n_past %lld logits %016llx\n", (long long) n_past, (unsigned long long) fnv64(logits_.data(), (size_t) n_vocab_ * sizeof(float)));
         ggml_free(c);
         t_pf_head += std::chrono::duration<double>(std::chrono::steady_clock::now() - th0).count();
     }
