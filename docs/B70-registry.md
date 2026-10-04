@@ -32,6 +32,7 @@ patch in detail in [`B70-SYCL.md`](B70-SYCL.md).
 | `--batch 8192` / `4096` | prefill -19% / -24%; each halving doubles the passes over the expert set | only if VRAM is needed elsewhere |
 | `--batch 24576` | +3-5% prefill with v2, decode unaffected; not adopted yet | re-measure decode after a long prefill with v3 (51% VRAM coverage) |
 | Power cap below 140 W | 140 W -6%, 130 W -13-15% | — |
+| Power cap 120 W (vs 140 / 160 W), overlay v4 with the draft head | 140 W +6-7%, 160 W +11-13% over 120 W, prefill and decode alike (short decode 30.5 / 32.6 / 33.8 tok/s; 100K prefill 443 / 471 / 499); card power in decode 120 / 139 / 156 W | 120 W kept for acoustics (coil whine at higher caps) |
 | `--vram` above 25 (overlay v4) | 25 leaves ~0.7 GB free at a full context with an image and nothing evicted; 26 was below that already with v2 (1.8 GB free after init, under the engine's reserve check) | a card with more VRAM |
 | Rank-counting argsort (one barrier instead of bitonic stages) | +4% decode graph time | a top-k that reads each value once |
 | A larger locked RAM expert tier (`--ram 11` / `13` vs 8, preferred config) | 15% fewer expert misses but decode unchanged within the between-start I/O spread; 40K prefill 3.7% slower at 11, 7% at 13 | once expert-read speed is stable between starts |
@@ -118,3 +119,13 @@ above. Effort: S = a kernel, a switch or one measurement session, M = a few days
 | Startup expert profile *(Strata)* | warm first requests after a model switch | S-M | maybe | rank (layer, expert) pairs from a routing dump; pre-fill the VRAM tier at load |
 | The CPU experts' per-call overhead | ~0.3 ms per CPU-computed expert of which the dot products are ~0.05-0.1 (thread wake-up, activation quantization, the CPU graph) | M | yes | per-call timing of the CPU MoE path; a persistent worker pool |
 | Gated-delta-net writing its rollback snapshot itself at T=2 | ~1 ms per verify step (36 x 3 MB copies and their kernels) | M | MTP | the state and its snapshot in one allocation, so the existing fused cache write applies |
+
+## Overlay v4 with the draft head and time sharing (2026-10)
+
+Overlay v4 back as the base on the current stack (patches 01-27, draft head, exclusive expert tiers, time sharing).
+
+| Change | Measured | Status |
+|---|---|---|
+| Overlay v4 at `--vram 24` | every check passes on one request, but three concurrent sessions run out of device memory (v4's dense tensors leave less headroom than v2's for the time-shared state) | rejected |
+| Overlay v4 at `--vram 23` | all checks pass, three concurrent sessions included; 48.9% of expert blocks in VRAM (v2: 66.9% at 24); vs v2 prefill -9-10% (20K 408 vs 446, 100K 450 vs 490 tok/s), short-prompt decode ~-20% (28-32 vs 39-40 tok/s) | adopted (quality: natural-text NLL ~1.45-1.5 vs ~2.02) |
+| Reasoning effort xhigh vs medium (the template's system sentence only) | one prompt, three attempts each: ~4x the tokens at xhigh on both overlays; on v4 the xhigh drawings were also far more elaborate | no change needed |
