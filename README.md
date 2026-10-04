@@ -56,10 +56,52 @@ prefix cache and vision unchanged. Configuration: [`docs/B70-config.md`](docs/B7
 | multi-column ESIMD matvec for the verify step: a 2-4-column Q5_K / Q6_K MUL_MAT (the MTP verify step's positions) dequantizes each block pair once and MACs it against every column, instead of leaving the one-column ESIMD kernel for the generic n-column MMVQ | patch 24 (`GGML_SYCL_DMMV_NCOLS=1`) | verify-step layer graphs 32.0 -> 29.9 ms, decode +5-7% (essay 41.3 -> 44.2, code 42.0 -> 44.1 tok/s); identical answers |
 | gathered sparse prefill attention: a long prompt chunk's QSA attention (selection mask + dense FA over every cached cell) becomes one kernel per (query, kv head) over that query's ~2,052 chosen cells straight from the q8_0 cache, the GQA group's heads as DPAS matrix rows (after vLLM's QSA kernel); dense below 45K cached cells or 256 queries | patch 25 + engine graph order (`GGML_SYCL_FUSE_SPARSE_PREFILL=1 GGML_SYCL_SPF_MIN_KV=45056`) | prefill +12% at ~100K and at 126K + image (432 -> 485, 419 -> 468 tok/s), 124.5K alone 295 -> 254 s; short prompts and decode unchanged; max per-layer difference vs dense ~1e-3 relative |
 | deterministic GPU arithmetic: oneDNN matmuls without split-K atomics and a radix top-k that emits in index order (ties to the lowest index), so two runs of the same prompt give bit-identical hidden states and identical greedy text | patches 26-27 (`GGML_SYCL_DNNL_DETERMINISTIC=1 GGML_SYCL_TOPK_DETERMINISTIC=1`) | reproducible runs; at 100K context decode +13% (the top-k no longer serialises on tied blocks), prefill -2.5% |
+| time-shared engine: up to N open requests take turns (a quantum each, parking at decode steps and between prefill passes, least-used session first), checkpointed through the prefix cache | server (`--timeshare N --quantum S --linger S`) | a short request behind a 100K prefill: first token 4 s instead of 174 s; parking exact; see [Two serving features](#two-serving-features-time-sharing-and-the-ram-prefix-cache) |
 
 Every change is off by default in the patched ggml tree and checked with `test-backend-ops`; the details and the
 rejected alternatives are in [`docs/B70-SYCL.md`](docs/B70-SYCL.md) and [`docs/B70-config.md`](docs/B70-config.md), and
 everything tried so far (adopted, rejected, and ideas not yet tried) in [`docs/B70-registry.md`](docs/B70-registry.md). Every command-line flag and environment variable: [`docs/PARAMETERS.md`](docs/PARAMETERS.md).
+
+## Two serving features: time sharing and the RAM prefix cache
+
+The engine holds one sequence at a time: its KV cache, the DeltaNet layers' recurrent state and the draft head's
+state. Upstream serves one request after another. Two additions make it behave well with several clients.
+
+### Prefix cache in RAM (`--prefix-cache GB`)
+
+A conversation the engine switches away from is checkpointed whole into host memory -- the KV rows it filled, the
+recurrent state, the draft head's caches -- and restored when that conversation comes back, instead of re-prefilling
+it. Reusing a KV prefix alone is not enough here: the recurrent layers carry state that cannot be rebuilt from a
+prefix of the cache. Entries are evicted least recently used first.
+
+- Cost: ~16 KB per token at `--kv q8_0` plus ~118 MB of recurrent state per entry (a 21K-token conversation is
+  ~460 MB). A 20K-token restore takes ~110 ms; a 100K-token checkpoint (1.9 GB) restores in ~0.75 s, where
+  re-prefilling it takes ~3.5 minutes.
+- `--prefix-cache-boundary N` also checkpoints a chat prompt at the end of its history, so a client that re-renders
+  the previous reply differently (token boundaries, whitespace) still restores everything before it.
+  `--prefix-cache-min N` skips short one-off requests.
+
+### Time sharing (`--timeshare N --quantum S --linger S`)
+
+Up to N requests are open at once and share the engine in turns, so a short request no longer waits for another
+client's whole answer:
+
+- One request runs at a time, for a quantum (default 30 s). Then, at its next yield point, it parks if another open
+  request should run: its sequence is checkpointed into the prefix-cache budget, the engine is released, and it
+  resumes later exactly where it stopped. Yield points are a decode step's start and the end of a prefill pass
+  (`--batch` tokens), so a long prompt does not block the others either.
+- The next request is the one whose session has used the engine least lately (decayed usage; ties by arrival). A
+  session is an `X-Session-Id` header, OpenAI's `user` or Anthropic's `metadata.user_id`, or else the conversation's
+  opening. When a request finishes, its session's next turn gets a short linger (default 1 s) and continues that
+  session's quantum, so an agent loop of quick turns still yields.
+- Request N+1 gets 503. A request whose client disconnects -- running, parked or waiting -- gives up its slot.
+  `/slots` lists the open requests with their state and engine time; `/metrics` has `qwfn:timeshare_*` counters.
+
+Measured on the B70: a short request sent during a 100K-token prefill got its first token after **4 s instead of
+174 s**; parking costs 40-115 ms at short contexts and ~1.8 s round trip at 100K. Parking is exact: with the
+deterministic arithmetic switches (patches 26-27), a reply with park/resume round trips mid-decode and mid-prefill
+is byte-identical to one without. In front of a proxy that limits concurrency per backend, allow N requests to this
+one. Every flag and variable: [`docs/PARAMETERS.md`](docs/PARAMETERS.md).
 
 ## Preferred config
 
