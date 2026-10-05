@@ -3,12 +3,12 @@
 
 **All the fun of running qwen38-flash-next fast, but on the Intel ARC**
 
-A derivative of [QwFNfer](https://github.com/Apolog1ze-Dev/QwFNfer) purpose built for Intel Arc Battlemage.
+An engine for running qwen38-flash-next as fast as possible on a B70. A derivative of the [QwFNfer](https://github.com/Apolog1ze-Dev/QwFNfer) engine that adds B70 support and miscellaneour QoL functionality for usage as your main LLM provider.
 
 In a nutshell:
 
-* Uses custom kernels and has engine work that improves performance over a direct port
-* Meant for single B70 GPU, 32GB system ram machines. The kinda poor man's AI workstation.
+* Uses custom kernels and has engine work that improves performance over a direct port.
+* Meant for single 32GB B70 GPU, 32GB system ram machines. The not-really-poor-neither-rich man's AI workstation.
 * Adds timesharing and supports quickly resuming multiple sessions as a mitigation for single prompt processing.
 * Incorporates optimizations coming from multiple inspirations from other engines and CUDA paths.
 
