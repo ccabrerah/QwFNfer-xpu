@@ -28,6 +28,7 @@ export GGML_SYCL_DMMV_NCOLS=1                                                   
 export GGML_SYCL_Q8W_NCOLS=1                                                                         # 2-4-column Q8_0 matvecs through patch 18's wide kernel (patch 28; the MTP verify step)
 export QWFN_LEND_RESTORE=1                                                                           # after a streamed prompt, read the lent layers' VRAM experts back before decode
 export QWFN_MTP_SHARED_CELLS=1                                                                       # the draft head attends over the trunk's selected cells (last attention layer), not its whole cache
+export QWFN_PF_VRAM=1                                                                                # a streamed prefill copies VRAM-resident experts on the device instead of reading them (needs patch 30)
 export GGML_SYCL_FUSE_SPARSE_PREFILL=1 GGML_SYCL_SPF_MIN_KV=45056                                    # long prompts: QSA attention gathered per query on DPAS past n_kv 45K (patch 25)
 export GGML_SYCL_DNNL_DETERMINISTIC=1 GGML_SYCL_TOPK_DETERMINISTIC=1                                 # bit-identical runs: oneDNN matmuls and the radix top-k without atomics (patches 26-27)
 export GGML_SYCL_TOPK_WG=1 GGML_SYCL_FUSE_HC_MIX=1 GGML_SYCL_FUSE_ADDCHAIN=1 GGML_SYCL_FUSE_MOESUM=1 GGML_SYCL_FUSE_CONV=1   # decode fusions (patches 12-15)

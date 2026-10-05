@@ -149,6 +149,8 @@ A B B A, 120 W.
 | Wide one-token Q8_0 MoE matvec for the Q8_0 down layers | no gain (the 34-byte blocks only allow 16-bit loads) | rejected |
 | The draft head over the trunk's selected cells (`QWFN_MTP_SHARED_CELLS=1`) | the head's dense attention grew with context (1.4 ms per step short, 5.8-6.7 ms at 52-60K); over the ~2K cells the trunk's last attention layer chose: 1.9-2.0 ms; agent turns +7%, short prompts and acceptance unchanged | **adopted** |
 
-Open from this round: a short streamed turn's prefill still sweeps every expert from disk (a 1.7K-token turn at 55K
+| A streamed prompt takes VRAM-resident experts from the tier (`QWFN_PF_VRAM=1`, patch 30) | a 1.7K-token turn at 55K context: disk reads 39.4 -> 24.6 GB, prompt 17.3 -> 13.6 s (-21%); a 52K prompt -6.5%; per-layer prefill hashes bit-identical | **adopted** |
+
+Open from this round (before `QWFN_PF_VRAM`): a short streamed turn's prefill still swept every expert from disk (a 1.7K-token turn at 55K
 context takes 14-17 s); the restore reads at ~2 GB/s and could overlap reads with uploads; ~2 ms per short-prompt step
 is spent outside the decode timers.

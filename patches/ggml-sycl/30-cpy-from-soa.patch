@@ -1,0 +1,32 @@
+From: Carlos Cabrera H. <6750732+ccabrerah@users.noreply.github.com>
+Subject: [PATCH 30] ggml-sycl: CPY from Q2_0_SOA / IQ4_NL_SOA back to the file's blocks
+
+A contiguous run of whole blocks in the SOA layout ([codes, 16 bytes per block][scales, 2 bytes per block]: what the
+expert tier holds for one expert's part, patches 09 / 17) becomes the canonical 18-byte blocks. Lets a prefill copy a
+VRAM-resident expert into its staging on the device instead of reading it from disk and uploading it. Exact (a byte
+permutation). Patch 29 (a wide Q8_0 MoE matvec) was tried and is not in the series.
+
+--- a/ggml/src/ggml-sycl/cpy.cpp
++++ b/ggml/src/ggml-sycl/cpy.cpp
+@@ -1282,6 +1282,21 @@
+                                                   nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11,
+                                                   nb12, nb13, main_stream);
+ #endif
++    } else if (((src0->type == GGML_TYPE_Q2_0_SOA && src1->type == GGML_TYPE_Q2_0) ||
++                (src0->type == GGML_TYPE_IQ4_NL_SOA && src1->type == GGML_TYPE_IQ4_NL)) &&
++               ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
++        // patch 30: one SOA slice ([codes][scales], 16 + 2 bytes per block) back to the canonical 18-byte blocks
++        static_assert(sizeof(block_q2_0) == 18, "q2_0 block");
++        const int64_t nb = ne / ggml_blck_size(src1->type);
++        const uint8_t * sp = (const uint8_t *) src0_ddc;
++        uint8_t *       dp = (uint8_t *) src1_ddc;
++        main_stream->parallel_for(sycl::range<1>((size_t) nb), [=](sycl::id<1> id) {
++            const int64_t j = id[0];
++            uint8_t * b = dp + j * 18;
++            b[0] = sp[nb * 16 + j * 2 + 0];
++            b[1] = sp[nb * 16 + j * 2 + 1];
++            for (int k = 0; k < 16; k++) b[2 + k] = sp[j * 16 + k];
++        });
+     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
+         ggml_cpy_f32_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
+                               nb11, nb12, nb13, main_stream);
