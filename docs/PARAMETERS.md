@@ -131,6 +131,7 @@ Extra arguments are appended to the server's command line (later values win).
 | `QWFN_MTP_EXPERTS_VRAM` | 1 | with MTP | The draft head's experts on the device (else in host memory, computed on the CPU). |
 | `QWFN_MTP_DRAFT_VOCAB` | file | with MTP | Token ids the head may draft (a smaller LM head for the draft). |
 | `QWFN_NO_SPEC_L0` | 1 | with MTP | No layer-0 prefetch pass ahead of each step. |
+| `QWFN_MTP_SHARED_CELLS` | 1 | with MTP | The draft head attends over the cells the trunk's last attention layer selected for the same position (QSA), with that layer's mask, instead of densely over its whole cache. Drafts only; positions the last decode step did not cover stay dense. |
 
 ### Drafting and prompt lookup (server)
 
