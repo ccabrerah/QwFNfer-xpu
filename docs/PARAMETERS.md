@@ -121,6 +121,7 @@ Extra arguments are appended to the server's command line (later values win).
 | `QWFN_QSA_PACK` | 1 | 1 | Pack the QSA block tables into one upload per chunk. |
 | `QWFN_Q2_SOA` | 1 | 1 | VRAM tier's q2_0 experts in the SOA layout (needs ggml-sycl patch 09). |
 | `QWFN_IQ4_SOA` | 1 | 1 | VRAM tier's iq4_nl experts in the SOA layout (patch 17). |
+| `QWFN_Q8_SOA` | 1 | 1 | VRAM tier's q8_0 experts in the SOA layout, read by patch 31's one-token MoE matvec (overlay v4's five Q8_0 expert-down layers: 2.15 -> 0.77 ms per verify step). |
 | `QWFN_PREDICT_CUR2` | 1 | 1 | Predict layer L+1's routing from this layer's FFN-mix input through L+1's router (cheaper, as accurate). |
 | `QWFN_RAM_EXCLUSIVE` | 1 | set by the deployment | Exclusive expert tiers: RAM holds what VRAM does not; a promotion reads the VRAM victim back into RAM. |
 | `QWFN_RAM_LENT_INCLUSIVE` | 1 | | With exclusive tiers, keep the layers lent to the prefill inclusive. |
@@ -129,6 +130,7 @@ Extra arguments are appended to the server's command line (later values win).
 | `QWFN_LEND_RESTORE_BATCH` | 1-64 | 32 | Experts per batched read in the restore. |
 | `QWFN_PF_VRAM` | 1 | 1 | A streamed prefill takes the experts the VRAM tier holds from the tier (a device copy; ggml-sycl patch 30 converts the SOA layouts back) instead of reading them from disk and uploading them. Exact; device staging only. |
 | `QWFN_SWAP_MIN_EF` | N | | Exclusive tiers: do not read back victims used fewer than N times (measured slower; off). |
+| `QWFN_PROMOTE_SIDE` | 1 | | Decode's expert promotions (upload, swap read-back, SOA reorder) on a second in-order queue (ggml-sycl patch 33), beside the layer's kernels; off inside prefills and image lends. |
 | `QWFN_MTP_EXPERTS_VRAM` | 1 | with MTP | The draft head's experts on the device (else in host memory, computed on the CPU). |
 | `QWFN_MTP_DRAFT_VOCAB` | file | with MTP | Token ids the head may draft (a smaller LM head for the draft). |
 | `QWFN_NO_SPEC_L0` | 1 | with MTP | No layer-0 prefetch pass ahead of each step. |
@@ -250,7 +252,7 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_FUSE_MOESUM=1` | 15 | 1 | MoE weighted sum reading the expert rows in place. |
 | `GGML_SYCL_FUSE_CONV=1` | 15 | 1 | One-token DeltaNet conv as one kernel. |
 | `GGML_SYCL_FUSE_IDX=1` | 16 | 1 | Prefill indexer per-head score sum as one kernel (bit-identical). |
-| `GGML_SYCL_IQ4_SOA_LPR=32\|16\|8` | 17 | | Force the IQ4_NL_SOA matvec's lanes per row (tuning). |
+| `GGML_SYCL_IQ4_SOA_LPR=16\|8\|4` | 17 | 8 | Force the IQ4_NL_SOA matvec's lanes per row. 8 on this model's 20-block expert-down rows: -17% against the default 16. |
 | `GGML_SYCL_IQ4_SOA_LUT=mode` | 17 | | IQ4_NL_SOA lookup mode (1, default: a 256-entry table in local memory). |
 | `GGML_SYCL_Q8W=1` | 18 | 1 | One-token Q8_0 matvec, a whole block per lane. |
 | `GGML_SYCL_Q8_REUSE=1` | 19 | 1 | Reuse a one-token q8_1 activation across matmuls sharing their input. |
@@ -265,6 +267,9 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_TOPK_DETERMINISTIC=1` | 27 | 1 | Radix top-k emits in column order, ties to the lowest index, no atomics (the QSA indexer's block selection reproducible). With 26: bit-identical runs. |
 | `GGML_SYCL_Q8W_NCOLS=1` | 28 | 1 | 2-4-column Q8_0 matvecs (the MTP verify step) through patch 18's wide kernel, each weight block loaded once for all columns; needs `GGML_SYCL_Q8W`. A column's result equals the one-column kernel's. |
 | (no switch) | 30 | | CPY from Q2_0_SOA / IQ4_NL_SOA to the canonical blocks (used by `QWFN_PF_VRAM`). Patch 29 was tried and is not in the series. |
+| `GGML_SYCL_Q8_SOA_LPR=16\|8\|4` | 31 | (8) | Q8_0_SOA one-token MoE matvec lanes per row (default: the widest with no idle lane). Patch 31 also adds the type, its conversions, dequantize and CPY. |
+| `GGML_SYCL_Q2_LPR=16\|8\|4` | 32 | 8 | Lanes per row of the one-token q2_0 MoE kernels (gate/up + SwiGLU fused, and the wide matvec); 8 on 40-block rows: -9% against 16. |
+| (no switch) | 33 | | `ggml_backend_sycl_init_side_queue`: a backend on its own in-order queue of the device (for `QWFN_PROMOTE_SIDE`). |
 
 ## 6. Upstream ggml and runtime variables the launcher sets
 
