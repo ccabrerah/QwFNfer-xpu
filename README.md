@@ -1,11 +1,20 @@
+
 # QwFNfer-xpu
 
-A heavily optimized build of [QwFNfer](https://github.com/Apolog1ze-Dev/QwFNfer), the purpose-built
-Qwen3.8-Flash-Next inference engine, for the **Intel Arc Pro B70** (32 GB, Battlemage) through ggml's SYCL
-backend. The engine is upstream's; this fork adds a ggml-sycl patch series tuned for the card
-(`patches/ggml-sycl/`), engine changes for the B70's memory layout and launch costs, a dense-weight overlay, and a
-measured run configuration. Everything else (the three-tier expert cache, the sparse attention, the server
-and its OpenAI and Anthropic APIs) works as upstream documents it.
+**All the fun of running qwen38-flash-next fast, but on the Intel ARC**
+
+A derivative of [QwFNfer](https://github.com/Apolog1ze-Dev/QwFNfer) purpose built for Intel Arc Battlemage.
+
+In a nutshell:
+
+* Uses custom kernels and has engine work that improves performance over a direct port
+* Meant for single B70 GPU, 32GB system ram machines. The kinda poor man's AI workstation.
+* Adds timesharing and supports quickly resuming multiple sessions as a mitigation for single prompt processing.
+* Incorporates optimizations coming from multiple inspirations from other engines and CUDA paths.
+
+## Is it faster?
+
+Yes, and it works on top an Intel ARC native stack.
 
 ## Major improvements
 
