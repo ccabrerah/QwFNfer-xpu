@@ -2140,8 +2140,12 @@ int main(int argc, char ** argv) {
         // Confidence gate (Strata's rule): a draft enters the step only while the head gives it at least min_p
         // (its own softmax at temperature 1); the step then takes up to --mtp-drafts. 0 = the cost model above.
         static const float min_p = getenv("QWFN_MTP_MIN_P") ? (float) atof(getenv("QWFN_MTP_MIN_P")) : 0.0f;
+        // QWFN_MTP_MIN_P2: the first draft always (or by min_p), a later one only while the head gives it at least
+        // this much -- a second position is worth its cost only on a confident continuation.
+        static const float min_p2 = getenv("QWFN_MTP_MIN_P2") ? (float) atof(getenv("QWFN_MTP_MIN_P2")) : 0.0f;
+        auto gate = [&](int k) { return k == 0 ? min_p : std::max(min_p, min_p2); };
         auto drafts_wanted = [&]() {
-            if (min_p > 0.0f) return (int) std::min<uint32_t>(S.mtp_drafts, (uint32_t) engine::MTP_MAX_DRAFTS);
+            if (min_p > 0.0f || min_p2 > 0.0f) return (int) std::min<uint32_t>(S.mtp_drafts, (uint32_t) engine::MTP_MAX_DRAFTS);
             // The k that maximises expected tokens per unit of step cost: tokens(k) =
             // 1 + a1 + a1 a2 + ... , cost(k) = 1 + k * draft_cost.
             const int cap = (int) std::min<uint32_t>(S.mtp_drafts, (uint32_t) engine::MTP_MAX_DRAFTS);
@@ -2277,14 +2281,14 @@ int main(int argc, char ** argv) {
                 if (lk_step) {
                     // drafted above
                 } else if (!sampled) {
-                    if (!S.eng.mtp_draft_more(want, e, min_p)) return false;
+                    if (!S.eng.mtp_draft_more(want, e, std::max(min_p, min_p2))) return false;
                     for (int k = 0; k < S.eng.mtp_draft_count(); k++) {
-                        if (S.eng.mtp_draft_p_k(k) < min_p) break;
+                        if (S.eng.mtp_draft_p_k(k) < gate(k)) break;
                         drafts.push_back(S.eng.mtp_draft_k(k));
                     }
                 } else {
                     for (int k = 0; k < want; k++) {
-                        if (S.eng.mtp_draft_p_k(k) < min_p) break;
+                        if (S.eng.mtp_draft_p_k(k) < gate(k)) break;
                         const float * hl = S.eng.mtp_logits_k(k);
                         if (!hl) break;
                         auto qd = smp.dist(hl, S.eng.n_vocab());
@@ -2582,7 +2586,7 @@ int main(int argc, char ** argv) {
                         {"cache_t_wait_spec", c.t_wait_spec}, {"cache_t_wait_demand", c.t_wait_demand},
                         // the draft head (--mtp): whole head, its three parts, and the rollbacks of rejected drafts
                         {"t_mtp", S.eng.t_mtp}, {"t_mtp_pre", S.eng.t_mtp_pre}, {"t_mtp_moe", S.eng.t_mtp_moe},
-                        {"t_mtp_post", S.eng.t_mtp_post}, {"t_rollback", S.eng.t_rollback}, {"n_rollback", S.eng.n_rollback}, {"n_mtp_shared", S.eng.n_mtp_shared}, {"n_mtp_dense", S.eng.n_mtp_dense},
+                        {"t_mtp_post", S.eng.t_mtp_post}, {"t_rollback", S.eng.t_rollback}, {"n_rollback", S.eng.n_rollback}, {"n_mtp_shared", S.eng.n_mtp_shared}, {"n_mtp_dense", S.eng.n_mtp_dense}, {"n_mtp_chain", S.eng.n_mtp_chain},
                         {"t_spec_l0", S.eng.t_spec_l0}, {"n_spec_l0", S.eng.n_spec_l0},
                         {"graph_a_mb", S.eng.graph_a_mb}, {"graph_a_n", S.eng.graph_a_n}}},
             // cumulative layer-major prefill split: seconds, and expert bytes read from disk vs copied from the RAM tier

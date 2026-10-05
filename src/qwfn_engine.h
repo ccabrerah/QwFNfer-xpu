@@ -395,7 +395,7 @@ public:
     uint64_t mtp_n = 0, mtp_acc = 0, mtp_top3 = 0, mtp_prompt_n = 0, mtp_prompt_acc = 0;
     double   t_mtp = 0, t_rollback = 0;
     uint64_t n_rollback = 0;
-    uint64_t n_mtp_shared = 0, n_mtp_dense = 0;   // head drafts over the trunk's cells / densely
+    uint64_t n_mtp_shared = 0, n_mtp_dense = 0, n_mtp_chain = 0;   // head drafts over the trunk's cells / densely / chained over them
     static int   margin_bucket(float m);
     static float margin_edge(int b);   // lower edge of bucket b
     uint64_t check_moe_gpu_calls = 0, check_moe_cpu_calls = 0;   // QWFN_CHECK_MOE bookkeeping
@@ -476,6 +476,7 @@ private:
     ggml_context *             scctx_ = nullptr;
     ggml_backend_buffer_t      scbuf_ = nullptr;
     ggml_tensor *              sc_cells_ = nullptr, * sc_mask_ = nullptr;
+    ggml_tensor *              sc_xcells_ = nullptr, * sc_xmask_ = nullptr;   // a chained draft's cells / mask (built on the host)
     int64_t                    sc_base_ = 0, sc_n_ = 0, sc_nc_ = 0, sc_ncmax_ = 0;
     std::vector<ggml_tensor *> rb_rs_, rb_conv_;
     ggml_tensor *              rb_ple_conv_ = nullptr;

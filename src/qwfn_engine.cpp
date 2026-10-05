@@ -472,10 +472,12 @@ bool engine::init(const model_index * hot, const model_index * cold,
             if (mtp_on_ && shared) {
                 for (uint32_t l = 0; l < hp_.n_layer; l++) if (hp_.is_attn_layer(l)) sc_layer_ = (int) l;
                 sc_ncmax_ = qd_.k_blocks * qd_.ratio;
-                ggml_init_params sp{}; sp.mem_size = ggml_tensor_overhead() * 4; sp.no_alloc = true;
+                ggml_init_params sp{}; sp.mem_size = ggml_tensor_overhead() * 8; sp.no_alloc = true;
                 scctx_ = ggml_init(sp);
                 sc_cells_ = ggml_new_tensor_2d(scctx_, GGML_TYPE_I32, sc_ncmax_, 1 + MTP_MAX_DRAFTS);
                 sc_mask_  = ggml_new_tensor_2d(scctx_, GGML_TYPE_F16, sc_ncmax_, 1 + MTP_MAX_DRAFTS);
+                sc_xcells_ = ggml_new_tensor_1d(scctx_, GGML_TYPE_I32, sc_ncmax_ + MTP_MAX_DRAFTS + 1);
+                sc_xmask_  = ggml_new_tensor_1d(scctx_, GGML_TYPE_F16, sc_ncmax_ + MTP_MAX_DRAFTS + 1);
                 scbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(scctx_, w_.buft());
                 if (!scbuf_) { err = "no device memory for the head's shared cells"; return false; }
                 sc_on_ = sc_layer_ >= 0;
@@ -3565,12 +3567,32 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
     ggml_cgraph *  g = ggml_new_graph_custom(c, 1024, false);
     graph_builder gb(c, &hpm_, &wm_, &w_); gb.bind(&st_mtp_, g, pos); gb.mtp_out = t_mtp_out_;
     // QWFN_MTP_SHARED_CELLS: positions the last decode step covered attend over the trunk's selected cells.
-    if (sc_on_ && sc_n_ > 0 && sc_nc_ > 0 && sc_nc_ <= sc_ncmax_ && pos >= sc_base_ && pos + n <= sc_base_ + sc_n_) {
+    // Only positions up to the last committed one have their own column: a rejected draft's column (after a
+    // rollback) belongs to a token that is no longer there.
+    const int64_t sc_last = std::min<int64_t>(sc_base_ + sc_n_ - 1, (int64_t) n_past_ - 1);
+    static const bool chain_on = !getenv("QWFN_MTP_SHARED_CHAIN") || atoi(getenv("QWFN_MTP_SHARED_CHAIN")) != 0;
+    if (sc_on_ && sc_n_ > 0 && sc_nc_ > 0 && sc_nc_ <= sc_ncmax_ && pos >= sc_base_ && pos + n - 1 <= sc_last) {
         const size_t o = (size_t) (pos - sc_base_);
         gb.hd_cells = ggml_view_2d(c, sc_cells_, sc_nc_, n, sc_cells_->nb[1], o * sc_cells_->nb[1]);
         gb.hd_mask  = ggml_view_2d(c, sc_mask_,  sc_nc_, n, sc_mask_->nb[1],  o * sc_mask_->nb[1]);
         gb.hd_nc    = sc_nc_;
         n_mtp_shared++;
+    } else if (chain_on && sc_on_ && sc_xcells_ && sc_n_ > 0 && sc_nc_ > 0 && sc_nc_ <= sc_ncmax_ && n == 1 &&
+               sc_last >= sc_base_ && pos > sc_last && pos - sc_last <= MTP_MAX_DRAFTS) {
+        // A chained draft past the last committed position L: the cells the trunk chose for L (they include L's
+        // block, always selected), plus the chain's own rows outside that block, masked to this position.
+        const int64_t L = sc_last, r = qsa_ratio_ > 0 ? qsa_ratio_ : 1;
+        std::vector<int32_t> cells((size_t) sc_nc_);
+        ggml_backend_tensor_get(sc_cells_, cells.data(), (size_t) (L - sc_base_) * sc_cells_->nb[1], (size_t) sc_nc_ * sizeof(int32_t));
+        for (int64_t q = L + 1; q <= pos; q++) if (q / r != L / r) cells.push_back((int32_t) q);
+        std::vector<ggml_fp16_t> m(cells.size());
+        for (size_t i = 0; i < cells.size(); i++) m[i] = ggml_fp32_to_fp16(cells[i] <= pos ? 0.0f : -INFINITY);
+        ggml_backend_tensor_set(sc_xcells_, cells.data(), 0, cells.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(sc_xmask_,  m.data(),     0, m.size() * sizeof(ggml_fp16_t));
+        gb.hd_cells = ggml_view_2d(c, sc_xcells_, (int64_t) cells.size(), 1, sc_xcells_->nb[0] * cells.size(), 0);
+        gb.hd_mask  = ggml_view_2d(c, sc_xmask_,  (int64_t) m.size(),     1, sc_xmask_->nb[0]  * m.size(),     0);
+        gb.hd_nc    = (int64_t) cells.size();
+        n_mtp_chain++;
     } else n_mtp_dense++;
     // The head's attention is dense over its own cache. One query sees every key
     // written so far, so it needs no mask at all; two positions (after an accepted
