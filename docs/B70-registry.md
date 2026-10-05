@@ -15,7 +15,7 @@ Measurement notes that apply throughout:
 - **Quality** is natural-text NLL (lower is better) over 1,024 tokens after an 8K prompt, measured both through
   prefill and token by token through the decode path (the reference for the sparse attention).
 
-Last updated: 2026-10-04.
+Last updated: 2026-10-05.
 
 ## Adopted
 
@@ -118,7 +118,7 @@ above. Effort: S = a kernel, a switch or one measurement session, M = a few days
 | Host RAM large enough for every expert not in VRAM (~22 GB on top of the system) *(Strata's design)* | takes the NVMe out of decode: est. +15-20% short-prompt decode, more at long context, and no read variance | hardware | yes | re-size `--ram` with an A-B-B-A after the upgrade |
 | Startup expert profile *(Strata)* | warm first requests after a model switch | S-M | maybe | rank (layer, expert) pairs from a routing dump; pre-fill the VRAM tier at load |
 | The CPU experts' per-call overhead | ~0.3 ms per CPU-computed expert of which the dot products are ~0.05-0.1 (thread wake-up, activation quantization, the CPU graph) | M | yes | per-call timing of the CPU MoE path; a persistent worker pool |
-| Gated-delta-net writing its rollback snapshot itself at T=2 | ~1 ms per verify step (36 x 3 MB copies and their kernels) | M | MTP | the state and its snapshot in one allocation, so the existing fused cache write applies |
+| ~~Gated-delta-net writing its rollback snapshot itself at T=2~~ **tried 2026-10-05: exact, no measurable gain (see below)** | ~1 ms per verify step (36 x 3 MB copies and their kernels) | M | MTP | the state and its snapshot in one allocation, so the existing fused cache write applies |
 | Prefix cache on disk, kept across restarts *(Pennyroyal's HiCache/NIXL tier)* | a returning long conversation after a restart restores in ~1-2 s instead of a full prefill (~225 s at 100K); the RAM pool can shrink or spill parked sessions | M | when the process restarts mid-conversation | write each pool entry to NVMe in the background while idle; a namespace hash of everything that changes the bytes (weights, engine commit, ggml tree, KV type, context, head, draft vocabulary, determinism switches); byte-exact round trip through disk |
 | BF16 recurrent (gated-delta-net) state, F32 compute *(Pennyroyal)* | ~1% decode (113 MB/token less traffic); rollback snapshots and the 118 MB fixed part of every checkpoint halve | M | small | the GDN kernel loading/storing BF16 state; decode-only NLL and a 100K needle check |
 
@@ -131,3 +131,24 @@ Overlay v4 back as the base on the current stack (patches 01-27, draft head, exc
 | Overlay v4 at `--vram 24` | every check passes on one request, but three concurrent sessions run out of device memory (v4's dense tensors leave less headroom than v2's for the time-shared state) | rejected |
 | Overlay v4 at `--vram 23` | all checks pass, three concurrent sessions included; 48.9% of expert blocks in VRAM (v2: 66.9% at 24); vs v2 prefill -9-10% (20K 408 vs 446, 100K 450 vs 490 tok/s), short-prompt decode ~-20% (28-32 vs 39-40 tok/s) | adopted (quality: natural-text NLL ~1.45-1.5 vs ~2.02) |
 | Reasoning effort xhigh vs medium (the template's system sentence only) | one prompt, three attempts each: ~4x the tokens at xhigh on both overlays; on v4 the xhigh drawings were also far more elaborate | no change needed |
+
+## Decode on overlay v4: budget and fixes (2026-10-05)
+
+Measured through the server with a per-request split of the engine's decode counters: short prompts, and an agent-style
+conversation (a ~52K-token first prompt, then turns of ~1.7K new tokens and a short answer). One server per arm,
+A B B A, 120 W.
+
+| Change | Measured | Status |
+|---|---|---|
+| Budget | short prompts: the layer graphs are ~70% of a step (35.5 of ~50 ms per verify step). After any streamed prompt the reply ran at 20-23 tok/s with the same graphs: ~25 experts per step not in VRAM against ~3, because the prefill borrows a third of the expert tier as staging and, with exclusive tiers, the experts those layers held end up on disk | the map |
+| Restore the borrowed layers' VRAM experts before the reply (`QWFN_LEND_RESTORE=1`; batched reads, hottest first, 3 s budget) | agent turns at 55K context 22.6 -> 28.7 tok/s (+28%), after a 52K prompt +14-20%; experts per step not in VRAM 24 -> 7-9; 1.6-3 s more on each streamed prompt | **adopted** |
+| Keep the borrowed layers inclusive in RAM (`QWFN_RAM_LENT_INCLUSIVE=1`) | turns +13%, short prompts -3%, still 11-20 experts per step not in VRAM | rejected |
+| Turns through the cache-batched prompt path (`--prefill-decode-max 2048`, no product cap) | out of device resources on a 1.7K-token turn at 52K context | rejected |
+| Patch 28: 2-4-column wide Q8_0 matvec (`GGML_SYCL_Q8W_NCOLS=1`) | the verify step's dense Q8_0 was on the stock multi-column kernel: 11.8 -> 9.3 ms per step; short-prompt decode +9% (32.6 -> 35.5 tok/s) | **adopted** |
+| Rollback snapshots in the recurrent state's own allocation (the fused state write at T = 2) | exact, no measurable gain (31.5 vs 31.6 ms per step) | rejected |
+| Wide one-token Q8_0 MoE matvec for the Q8_0 down layers | no gain (the 34-byte blocks only allow 16-bit loads) | rejected |
+| The draft head over the trunk's selected cells (`QWFN_MTP_SHARED_CELLS=1`) | the head's dense attention grew with context (1.4 ms per step short, 5.8-6.7 ms at 52-60K); over the ~2K cells the trunk's last attention layer chose: 1.9-2.0 ms; agent turns +7%, short prompts and acceptance unchanged | **adopted** |
+
+Open from this round: a short streamed turn's prefill still sweeps every expert from disk (a 1.7K-token turn at 55K
+context takes 14-17 s); the restore reads at ~2 GB/s and could overlap reads with uploads; ~2 ms per short-prompt step
+is spent outside the decode timers.
