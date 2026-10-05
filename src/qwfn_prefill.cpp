@@ -516,12 +516,14 @@ bool prefill_streamer::load_layer(uint32_t layer, std::string & err) {
 // types copied as they are. Same bytes as the read would have staged.
 bool prefill_streamer::copy_from_vram(const hbuf & b, std::string & err) {
     const size_t n_nodes = b.vres.size() * EXPERT_NPARTS;
+    // The graph's size bounds nodes and leafs alike: every CPY brings two leaf tensors (its source and destination).
+    const size_t g_size = 2 * n_nodes + 16;
     ggml_init_params ip{};
-    ip.mem_size = ggml_tensor_overhead() * (3 * n_nodes + 8) + ggml_graph_overhead_custom(n_nodes + 8, false);
+    ip.mem_size = ggml_tensor_overhead() * (3 * n_nodes + 8) + ggml_graph_overhead_custom(g_size, false);
     ip.no_alloc = true;
     ggml_context * c = ggml_init(ip);
     if (!c) { err = "prefill: no context for the VRAM copies"; return false; }
-    ggml_cgraph * g = ggml_new_graph_custom(c, n_nodes + 8, false);
+    ggml_cgraph * g = ggml_new_graph_custom(c, g_size, false);
     for (const vram_slice & v : b.vres) {
         for (int q = 0; q < EXPERT_NPARTS; q++) {
             if (v.bytes[q] != slice_[q]) { ggml_free(c); err = "prefill: VRAM slice size differs from the file's"; return false; }
