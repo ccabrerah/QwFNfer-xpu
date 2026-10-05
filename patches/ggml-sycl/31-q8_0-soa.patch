@@ -1,0 +1,321 @@
+From: Carlos Cabrera H. <6750732+ccabrerah@users.noreply.github.com>
+Subject: [PATCH 31] ggml-sycl: Q8_0_SOA, a q8_0 expert layout and its one-token MoE matvec
+
+The SOA layout of patches 09 / 17 ([codes][scales] per 2-D slice, codes 16-byte aligned) for q8_0: 32 code bytes and
+a 2-byte scale per block. The one-token MoE matvec takes 16-byte half blocks, LPR lanes per row (8 for rows of 20
+blocks: no idle lane), four sub-groups per work-group; the stock kernel runs one 16-lane work-group per row and reads
+a q8_0 expert-down at ~85 GB/s. GGML_SYCL_Q8_SOA_LPR=16|8|4 forces the lanes per row. Also: the upload / read-back
+conversions take the block size (18 or 34 bytes), a dequantize for the multi-token path, and patch 30's CPY back to
+the file's blocks for Q8_0_SOA.
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 2e066fd..39fe2cb 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -432,7 +432,8 @@ extern "C" {
+         GGML_TYPE_Q2_0    = 42,
+         GGML_TYPE_Q2_0_SOA = 43, // q2_0, each 2-D slice as [codes][scales]; SYCL only, never in files
+         GGML_TYPE_IQ4_NL_SOA = 44, // iq4_nl, each 2-D slice as [codes][scales]; SYCL only, never in files
+-        GGML_TYPE_COUNT   = 45,
++        GGML_TYPE_Q8_0_SOA = 45, // q8_0, each 2-D slice as [codes][scales]; SYCL only, never in files
++        GGML_TYPE_COUNT   = 46,
+     };
+ 
+     // [TAG_GGML_PREC]
+diff --git a/ggml/src/ggml-sycl/convert.cpp b/ggml/src/ggml-sycl/convert.cpp
+index 05b5378..efde798 100644
+--- a/ggml/src/ggml-sycl/convert.cpp
++++ b/ggml/src/ggml-sycl/convert.cpp
+@@ -79,6 +79,19 @@ static void dequantize_q2_0_soa_sycl(const void * __restrict__ vx, dst_t * __res
+         });
+ }
+ 
++// Q8_0_SOA (patch 31): k elements of whole slices as [codes, 32 bytes per block][scales]; one work-item per element.
++template <typename dst_t>
++static void dequantize_q8_0_soa_sycl(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k,
++                                     dpct::queue_ptr stream) {
++    const int64_t nblocks = k / QK8_0;
++    const int8_t * qs = (const int8_t *) vx;
++    const sycl::half * ds = (const sycl::half *) ((const uint8_t *) vx + nblocks * QK8_0);
++    stream->parallel_for(sycl::range<1>((size_t) k), [=](sycl::id<1> id) {
++        const int64_t i = id[0];
++        y[i] = (dst_t) ((float) ds[i / QK8_0] * (float) qs[i]);
++    });
++}
++
+ // IQ4_NL_SOA (patch 17): k elements of whole slices as [codes][scales]; one work-item per code byte, which holds
+ // element j (low nibble) and element j + 16 (high nibble) of its block, as dequantize_iq4_nl.
+ template <typename dst_t>
+@@ -711,6 +724,8 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
+             return dequantize_q2_0_soa_sycl;
+         case GGML_TYPE_IQ4_NL_SOA:
+             return dequantize_iq4_nl_soa_sycl;
++        case GGML_TYPE_Q8_0_SOA:
++            return dequantize_q8_0_soa_sycl;
+         case GGML_TYPE_Q1_0:
+             return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;
+         case GGML_TYPE_Q2_0:
+@@ -805,6 +820,8 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
+             return dequantize_q2_0_soa_sycl;
+         case GGML_TYPE_IQ4_NL_SOA:
+             return dequantize_iq4_nl_soa_sycl;
++        case GGML_TYPE_Q8_0_SOA:
++            return dequantize_q8_0_soa_sycl;
+         case GGML_TYPE_Q1_0:
+             return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;
+         case GGML_TYPE_Q2_0:
+diff --git a/ggml/src/ggml-sycl/cpy.cpp b/ggml/src/ggml-sycl/cpy.cpp
+index 3176a21..00b480a 100644
+--- a/ggml/src/ggml-sycl/cpy.cpp
++++ b/ggml/src/ggml-sycl/cpy.cpp
+@@ -1282,6 +1282,19 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
+                                                   nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11,
+                                                   nb12, nb13, main_stream);
+ #endif
++    } else if (src0->type == GGML_TYPE_Q8_0_SOA && src1->type == GGML_TYPE_Q8_0 &&
++               ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
++        // patch 31: the same for Q8_0_SOA ([codes, 32 bytes per block][scales]) -> 34-byte q8_0 blocks
++        const int64_t nb = ne / QK8_0;
++        const uint8_t * sp = (const uint8_t *) src0_ddc;
++        uint8_t *       dp = (uint8_t *) src1_ddc;
++        main_stream->parallel_for(sycl::range<1>((size_t) nb), [=](sycl::id<1> id) {
++            const int64_t j = id[0];
++            uint8_t * b = dp + j * 34;
++            b[0] = sp[nb * 32 + j * 2 + 0];
++            b[1] = sp[nb * 32 + j * 2 + 1];
++            for (int k = 0; k < 32; k++) b[2 + k] = sp[j * 32 + k];
++        });
+     } else if (((src0->type == GGML_TYPE_Q2_0_SOA && src1->type == GGML_TYPE_Q2_0) ||
+                 (src0->type == GGML_TYPE_IQ4_NL_SOA && src1->type == GGML_TYPE_IQ4_NL)) &&
+                ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index eeba3ab..ee4efff 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -934,41 +934,59 @@ catch (sycl::exception const &exc) {
+ // slices must be packed (the MUL_MAT_ID weights the engine builds, and 1-D transfer handles, are).
+ // patch 17: IQ4_NL_SOA uses the same layout -- an iq4_nl block is a 2-byte scale and 16 code bytes, like q2_0's --
+ // with 32 elements per block instead of 64.
++// patch 31: Q8_0_SOA, the same layout for q8_0 (a 2-byte scale and 32 code bytes per block of 32).
+ static_assert(sizeof(block_iq4_nl) == sizeof(block_q2_0), "iq4_nl and q2_0 blocks share the SOA conversion");
+-static bool ggml_sycl_is_soa(const ggml_type t) { return t == GGML_TYPE_Q2_0_SOA || t == GGML_TYPE_IQ4_NL_SOA; }
++static_assert(sizeof(block_q8_0) == 34, "q8_0 block: a 2-byte scale, 32 code bytes");
++static bool ggml_sycl_is_soa(const ggml_type t) {
++    return t == GGML_TYPE_Q2_0_SOA || t == GGML_TYPE_IQ4_NL_SOA || t == GGML_TYPE_Q8_0_SOA;
++}
++// bytes per block of an SOA type (its scale is the block's first 2 bytes, the codes the rest)
++static size_t soa_blk_bytes(const ggml_type t) { return t == GGML_TYPE_Q8_0_SOA ? sizeof(block_q8_0) : sizeof(block_q2_0); }
+ static bool q2_0_soa_geometry(const ggml_tensor * t, size_t offset, size_t size, int64_t & bps, int64_t & nslices) {
+-    const int64_t QK = t->type == GGML_TYPE_IQ4_NL_SOA ? QK4_NL : QK2_0;
++    const int64_t QK = t->type == GGML_TYPE_Q2_0_SOA ? QK2_0 : t->type == GGML_TYPE_Q8_0_SOA ? QK8_0 : QK4_NL;
++    const size_t  B  = soa_blk_bytes(t->type);
+     bps = (t->ne[0] / QK) * t->ne[1];
+     nslices = t->ne[2] * t->ne[3];
+-    const size_t slice_bytes = (size_t) bps * sizeof(block_q2_0);
+-    if (t->ne[0] % QK != 0 || t->nb[1] != (size_t) (t->ne[0] / QK) * sizeof(block_q2_0)) return false;
++    const size_t slice_bytes = (size_t) bps * B;
++    if (t->ne[0] % QK != 0 || t->nb[1] != (size_t) (t->ne[0] / QK) * B) return false;
+     if (t->ne[2] > 1 && t->nb[2] != slice_bytes) return false;
+     if (t->ne[3] > 1 && t->nb[3] != slice_bytes * t->ne[2]) return false;
+     return offset == 0 && size == slice_bytes * (size_t) nslices;
+ }
+-// canonical q2_0 blocks (src) <-> [codes][scales] per slice (dst); one work-item per block
+-static void q2_0_to_soa(const uint8_t * src, uint8_t * dst, int64_t bps, int64_t nslices, dpct::queue_ptr q) {
++// canonical blocks (src) <-> [codes][scales] per slice (dst); one work-item per block. B: bytes per block (18 for
++// q2_0 / iq4_nl, 34 for q8_0), of which the first 2 are the scale.
++template <int B>
++static void soa_to(const uint8_t * src, uint8_t * dst, int64_t bps, int64_t nslices, dpct::queue_ptr q) {
++    constexpr int C = B - 2;
+     const int64_t n = bps * nslices;
+     q->parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+         const int64_t g = id[0], s = g / bps, j = g % bps;
+-        const uint8_t * b = src + g * sizeof(block_q2_0);
+-        uint8_t * slice = dst + s * bps * sizeof(block_q2_0);
+-        for (int k = 0; k < 16; k++) slice[j * 16 + k] = b[2 + k];
+-        slice[bps * 16 + j * 2 + 0] = b[0];
+-        slice[bps * 16 + j * 2 + 1] = b[1];
++        const uint8_t * b = src + g * B;
++        uint8_t * slice = dst + s * bps * B;
++        for (int k = 0; k < C; k++) slice[j * C + k] = b[2 + k];
++        slice[bps * C + j * 2 + 0] = b[0];
++        slice[bps * C + j * 2 + 1] = b[1];
+     });
+ }
+-static void q2_0_from_soa(const uint8_t * src, uint8_t * dst, int64_t bps, int64_t nslices, dpct::queue_ptr q) {
++template <int B>
++static void soa_from(const uint8_t * src, uint8_t * dst, int64_t bps, int64_t nslices, dpct::queue_ptr q) {
++    constexpr int C = B - 2;
+     const int64_t n = bps * nslices;
+     q->parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+         const int64_t g = id[0], s = g / bps, j = g % bps;
+-        const uint8_t * slice = src + s * bps * sizeof(block_q2_0);
+-        uint8_t * b = dst + g * sizeof(block_q2_0);
+-        b[0] = slice[bps * 16 + j * 2 + 0];
+-        b[1] = slice[bps * 16 + j * 2 + 1];
+-        for (int k = 0; k < 16; k++) b[2 + k] = slice[j * 16 + k];
++        const uint8_t * slice = src + s * bps * B;
++        uint8_t * b = dst + g * B;
++        b[0] = slice[bps * C + j * 2 + 0];
++        b[1] = slice[bps * C + j * 2 + 1];
++        for (int k = 0; k < C; k++) b[2 + k] = slice[j * C + k];
+     });
+ }
++static void q2_0_to_soa(ggml_type t, const uint8_t * src, uint8_t * dst, int64_t bps, int64_t nslices, dpct::queue_ptr q) {
++    if (t == GGML_TYPE_Q8_0_SOA) soa_to<34>(src, dst, bps, nslices, q); else soa_to<18>(src, dst, bps, nslices, q);
++}
++static void q2_0_from_soa(ggml_type t, const uint8_t * src, uint8_t * dst, int64_t bps, int64_t nslices, dpct::queue_ptr q) {
++    if (t == GGML_TYPE_Q8_0_SOA) soa_from<34>(src, dst, bps, nslices, q); else soa_from<18>(src, dst, bps, nslices, q);
++}
+ 
+ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                                                 ggml_tensor *tensor,
+@@ -987,7 +1005,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+         uint8_t * tmp = sycl::malloc_device<uint8_t>(size, *stream);
+         GGML_ASSERT(tmp);
+         SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tmp, data, size).wait()));
+-        q2_0_to_soa(tmp, (uint8_t *) tensor->data, bps, nslices, stream);
++        q2_0_to_soa(tensor->type, tmp, (uint8_t *) tensor->data, bps, nslices, stream);
+         SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+         sycl::free(tmp, *stream);
+         return;
+@@ -1026,7 +1044,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+         SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
+         uint8_t * tmp = sycl::malloc_device<uint8_t>(size, *stream);
+         GGML_ASSERT(tmp);
+-        q2_0_from_soa((const uint8_t *) tensor->data, tmp, bps, nslices, stream);
++        q2_0_from_soa(tensor->type, (const uint8_t *) tensor->data, tmp, bps, nslices, stream);
+         SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(data, tmp, size).wait()));
+         sycl::free(tmp, *stream);
+         return;
+@@ -6330,7 +6348,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
+         GGML_ASSERT(q2_0_soa_geometry(tensor, offset, size, bps, nslices) && "Q2_0_SOA: whole packed slices only");
+         ggml_sycl_pool_alloc<uint8_t> tmp(sycl_ctx->pool(), size);
+         SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tmp.get(), data, size)));
+-        q2_0_to_soa(tmp.get(), (uint8_t *) tensor->data, bps, nslices, stream);
++        q2_0_to_soa(tensor->type, tmp.get(), (uint8_t *) tensor->data, bps, nslices, stream);
+         return;
+     }
+     SYCL_CHECK(CHECK_TRY_ERROR(
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index 69dd1ec..e83d5a0 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -3187,6 +3187,87 @@ static void launch_mul_mat_vec_iq4_nl_soa_moe(
+     else                           go(std::integral_constant<int, WARP_SIZE / 4>{});
+ }
+ 
++// ---- Q8_0_SOA one-token MoE matvec (patch 31) ----
++// One expert's slice: the 32 code bytes of block (row, b) at slice + blk*32 (16-byte aligned), its scale in the half
++// array after all the slice's codes. A lane takes a 16-byte half block per step, so a row of `bpr` blocks is 2*bpr
++// contiguous chunks shared by LPR lanes (q8_0 expert-down rows here are 20 blocks = 40 chunks: LPR 8 -> 5 full steps).
++// The arithmetic is vec_dot_q8_0_q8_1's (d_w * d_y * sum q_w*q_y), summed per half block.
++template <int LPR>
++static void mul_mat_vec_q8_0_soa_moe(
++    const void * __restrict__ vx_base, const void * __restrict__ vy_base,
++    float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
++    const int ncols, const int nrows,
++    const size_t expert_weight_stride, const size_t dst_row_stride,
++    const size_t src1_row_stride,
++    const sycl::nd_item<3> & it) {
++    constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
++    const int expert_idx = it.get_group(1);
++    const int i02        = ids_dev[expert_idx];
++    const int lane       = it.get_local_id(2);
++    const int row        = (it.get_group(2) * it.get_local_range(1) + it.get_local_id(1)) * ROWS_PER_SG + lane / LPR;
++    const int t          = lane % LPR;
++
++    const uint8_t *    slice = (const uint8_t *) vx_base + (size_t) i02 * expert_weight_stride;
++    const block_q8_1 * y     = (const block_q8_1 *) ((const char *) vy_base + (size_t) expert_idx * src1_row_stride);
++    float *            dst   = (float *) ((char *) dst_base + (size_t) expert_idx * dst_row_stride);
++
++    const int bpr = ncols / QK8_0;
++    const sycl::half * scales = (const sycl::half *) (slice + (size_t) nrows * bpr * QK8_0);
++    float acc = 0.0f;
++    if (row < nrows) {
++        const uint8_t * rq = slice + (size_t) row * bpr * QK8_0;
++        for (int c = t; c < 2 * bpr; c += LPR) {
++            const int b = c >> 1, h = c & 1;
++            const sycl::uint4 q = *(const sycl::uint4 *) (rq + (size_t) c * 16);
++            const int * u = (const int *) y[b].qs + 4 * h;
++            int sumi = 0;
++            sumi = dpct::dp4a((int) q.x(), u[0], sumi);
++            sumi = dpct::dp4a((int) q.y(), u[1], sumi);
++            sumi = dpct::dp4a((int) q.z(), u[2], sumi);
++            sumi = dpct::dp4a((int) q.w(), u[3], sumi);
++            acc += (float) scales[(size_t) row * bpr + b] * (float) y[b].ds[0] * (float) sumi;
++        }
++    }
++#pragma unroll
++    for (int mask = LPR / 2; mask > 0; mask >>= 1) {
++        acc += dpct::permute_sub_group_by_xor(it.get_sub_group(), acc, mask);
++    }
++    if (row < nrows && t == 0) {
++        dst[row] = acc;
++    }
++}
++
++static void launch_mul_mat_vec_q8_0_soa_moe(
++    const void * vx_base, const void * vy, const int32_t * ids_dev,
++    float * dst_base, const int ncols, const int nrows, const int n_experts_used,
++    const size_t expert_weight_stride, const size_t dst_row_stride,
++    const size_t src1_row_stride, dpct::queue_ptr stream) {
++    const int chunks = 2 * (ncols / QK8_0);
++    constexpr int SG_PER_WG = 4;
++    // GGML_SYCL_Q8_SOA_LPR=16|8|4 forces the lanes per row (tuning); otherwise the widest that leaves no lane idle
++    // on the last step, else 16
++    static const int lpr_env = [] { const char * e = getenv("GGML_SYCL_Q8_SOA_LPR"); return e ? atoi(e) : 0; }();
++    const int lpr = lpr_env ? lpr_env : chunks % WARP_SIZE == 0 ? WARP_SIZE : chunks % (WARP_SIZE / 2) == 0 ? WARP_SIZE / 2
++                                      : chunks % (WARP_SIZE / 4) == 0 ? WARP_SIZE / 4 : WARP_SIZE;
++    auto go = [&](auto lpr_tag) {
++        constexpr int LPR = decltype(lpr_tag)::value;
++        constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
++        const int n_sg = (nrows + ROWS_PER_SG - 1) / ROWS_PER_SG;
++        const sycl::range<3> block_nums(1, (unsigned) n_experts_used, (unsigned) ((n_sg + SG_PER_WG - 1) / SG_PER_WG));
++        const sycl::range<3> block_dims(1, SG_PER_WG, WARP_SIZE);
++        stream->submit([&](sycl::handler & cgh) {
++            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
++                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                    mul_mat_vec_q8_0_soa_moe<LPR>(vx_base, vy, dst_base, ids_dev, ncols, nrows,
++                        expert_weight_stride, dst_row_stride, src1_row_stride, item);
++                });
++        });
++    };
++    if (lpr >= WARP_SIZE)          go(std::integral_constant<int, WARP_SIZE>{});
++    else if (lpr >= WARP_SIZE / 2) go(std::integral_constant<int, WARP_SIZE / 2>{});
++    else                           go(std::integral_constant<int, WARP_SIZE / 4>{});
++}
++
+ static bool ggml_sycl_moe_q2w_enabled() {
+     static const bool v = [] { const char * e = getenv("GGML_SYCL_MOE_Q2W"); return e && atoi(e) != 0; }();
+     return v;
+@@ -3315,6 +3396,12 @@ bool ggml_sycl_mul_mat_vec_q_id(
+                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+             return true;
++        case GGML_TYPE_Q8_0_SOA:
++            // 16-byte loads: every slice must start 16-byte aligned (whole rows of 32-byte codes keep it so)
++            if (ncols % QK8_0 != 0 || ((uintptr_t) vx_base | expert_weight_stride) % 16 != 0) return false;
++            launch_mul_mat_vec_q8_0_soa_moe(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
++                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
++            return true;
+         case GGML_TYPE_IQ4_NL_SOA:
+             if (ncols % QK4_NL != 0) return false;
+             launch_mul_mat_vec_iq4_nl_soa_moe(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 1710c69..e7de3f7 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -702,6 +702,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+         .type_size                = sizeof(block_iq4_nl),
+         .is_quantized             = true,
+     },
++    [GGML_TYPE_Q8_0_SOA] = {
++        .type_name                = "q8_0_soa",
++        .blck_size                = QK8_0,
++        .type_size                = sizeof(block_q8_0),
++        .is_quantized             = true,
++    },
+     [GGML_TYPE_Q4_0] = {
+         .type_name                = "q4_0",
+         .blck_size                = QK4_0,

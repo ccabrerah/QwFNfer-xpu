@@ -57,7 +57,7 @@ struct expert_handle {
 // instead of the file's bytes (the streamed prefill).
 struct ram_slice { uint32_t expert; const uint8_t * part[EXPERT_NPARTS]; };
 // One VRAM-resident expert's parts in the device tier, for a prefill that copies them on the device instead of
-// reading them (QWFN_PF_VRAM). type: the tier's (Q2_0_SOA / IQ4_NL_SOA, or the file's type); bytes: per part.
+// reading them (QWFN_PF_VRAM). type: the tier's (Q2_0_SOA / IQ4_NL_SOA / Q8_0_SOA, or the file's type); bytes: per part.
 struct vram_slice { uint32_t expert; ggml_backend_buffer_t buf; uint8_t * part[EXPERT_NPARTS];
                     ggml_type type[EXPERT_NPARTS]; size_t bytes[EXPERT_NPARTS]; };
 
@@ -139,6 +139,8 @@ public:
         // The same for the iq4_nl parts (GGML_TYPE_IQ4_NL_SOA, ggml-sycl patch 17): an iq4_nl block has q2_0's byte
         // structure, so it takes the same layout. Taken only when the backend supports it.
         bool iq4_soa = false;
+        // And the q8_0 parts (GGML_TYPE_Q8_0_SOA, ggml-sycl patch 31): a 2-byte scale and 32 code bytes per block.
+        bool q8_soa = false;
         // Extra device bytes appended to the tier that the prefill streamer
         // borrows as its staging. During decode they hold expert slots like
         // the rest of the tier (the layers whose slots fall in that tail are
@@ -348,7 +350,7 @@ private:
         std::vector<uint8_t>  slot_cold;      // provenance: filled from the cold checkpoint
         std::vector<uint8_t>  slot_speculative; // admitted by a prediction, not yet used
         std::vector<uint8_t>  slot_pinned;
-        // Exclusive tiers: the block is in the device layout (Q2_0_SOA / IQ4_NL_SOA parts as [codes][scales]), as
+        // Exclusive tiers: the block is in the device layout (Q2_0_SOA / IQ4_NL_SOA / Q8_0_SOA parts as [codes][scales]), as
         // a swap read it back; to_file_layout() converts it before a CPU use, a promotion uploads it raw.
         std::vector<uint8_t>  slot_soa;
         std::vector<int32_t>  free_slots;          // released by swaps: the next swap's destinations
@@ -395,15 +397,19 @@ private:
     bool promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot);
     void fill_gpu_handle(const layer_pool & lp, uint32_t gslot, expert_handle & h) const;
     // The type the VRAM tier presents a part as: Q2_0_SOA for q2_0 when q2_soa is on, IQ4_NL_SOA for iq4_nl when
-    // iq4_soa is on.
+    // iq4_soa is on, Q8_0_SOA for q8_0 when q8_soa is on.
     ggml_type gpu_type(ggml_type t) const {
         if (q2_soa_  && t == GGML_TYPE_Q2_0)   return GGML_TYPE_Q2_0_SOA;
         if (iq4_soa_ && t == GGML_TYPE_IQ4_NL) return GGML_TYPE_IQ4_NL_SOA;
+        if (q8_soa_  && t == GGML_TYPE_Q8_0)   return GGML_TYPE_Q8_0_SOA;
         return t;
     }
-    static bool is_soa(ggml_type t) { return t == GGML_TYPE_Q2_0_SOA || t == GGML_TYPE_IQ4_NL_SOA; }
+    static bool is_soa(ggml_type t) {
+        return t == GGML_TYPE_Q2_0_SOA || t == GGML_TYPE_IQ4_NL_SOA || t == GGML_TYPE_Q8_0_SOA;
+    }
     bool      q2_soa_ = false;
     bool      iq4_soa_ = false;
+    bool      q8_soa_ = false;
 
     int32_t  find_slot(layer_pool & lp, uint32_t expert_id) const;
     // Slots referenced by the fetch() call in progress. Every handle it has

@@ -317,6 +317,19 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
                     fprintf(stderr, "[qwfn] expert VRAM tier: iq4_nl parts as IQ4_NL_SOA %s\n",
                             iq4_soa_ ? "(codes and scales in separate aligned arrays)" : "requested, but the backend does not support it: plain iq4_nl");
                 }
+                if (cfg.q8_soa && cfg.vram_backend) {
+                    // The same question for Q8_0_SOA (ggml-sycl patch 31).
+                    ggml_init_params tp{}; tp.mem_size = ggml_tensor_overhead() * 8; tp.no_alloc = true;
+                    ggml_context * tc = ggml_init(tp);
+                    ggml_tensor * as  = ggml_new_tensor_3d(tc, GGML_TYPE_Q8_0_SOA, 256, 4, 2);
+                    ggml_tensor * b   = ggml_new_tensor_3d(tc, GGML_TYPE_F32, 256, 1, 1);
+                    ggml_tensor * ids = ggml_new_tensor_2d(tc, GGML_TYPE_I32, 1, 1);
+                    ggml_tensor * op  = ggml_mul_mat_id(tc, as, b, ids);
+                    q8_soa_ = ggml_backend_supports_op(cfg.vram_backend, op);
+                    ggml_free(tc);
+                    fprintf(stderr, "[qwfn] expert VRAM tier: q8_0 parts as Q8_0_SOA %s\n",
+                            q8_soa_ ? "(codes and scales in separate aligned arrays)" : "requested, but the backend does not support it: plain q8_0");
+                }
                 fprintf(stderr, "[qwfn] expert VRAM tier: %.2f GB, %zu blocks (%.1f%%)%s\n",
                         (perm_bytes + ext_bytes) / 1e9, total_gslots_,
                         100.0 * (double) total_gslots_ / (double) (n_layer * hot->hp().n_expert),
@@ -330,12 +343,13 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
         // A swap reads the victim's device bytes straight into a free RAM slot, before the upload that overwrites
         // them on the same in-order stream: it needs the VRAM tier and asynchronous promotions from a pinned arena,
         // and one file (a cold block has other types). Device layouts go back by to_file_layout(): Q2_0_SOA and
-        // IQ4_NL_SOA are both 18-byte blocks (a 2-byte scale, 16 code bytes) in the file.
+        // IQ4_NL_SOA are 18-byte blocks (a 2-byte scale, 16 code bytes) in the file, Q8_0_SOA 34-byte ones (32 codes).
         const char * why = nullptr;
         if (!vram_buf_) why = "no VRAM tier";
         else if (!cfg.vram_backend || !cfg.async_promote || !arena_pinned_) why = "promotions are not asynchronous from a pinned arena";
         else if (cold_) why = "a cold tier is in use";
-        else if (ggml_type_size(GGML_TYPE_Q2_0) != 18 || ggml_type_size(GGML_TYPE_IQ4_NL) != 18) why = "unexpected block sizes";
+        else if (ggml_type_size(GGML_TYPE_Q2_0) != 18 || ggml_type_size(GGML_TYPE_IQ4_NL) != 18 ||
+                 ggml_type_size(GGML_TYPE_Q8_0) != 34) why = "unexpected block sizes";
         if (why) fprintf(stderr, "[qwfn] exclusive expert tiers requested but off: %s\n", why);
         else { exclusive_ = true; exclusive_split(hot->hp().n_expert); }
     }
@@ -470,17 +484,18 @@ void expert_cache::to_file_layout(layer_pool & lp, uint32_t s) {
 void expert_cache::soa_to_file(const layer_pool & lp, uint8_t * slot) {
     for (int q = 0; q < EXPERT_NPARTS; q++) {
         if (!is_soa(gpu_type(lp.part_type[q]))) continue;
-        // Q2_0_SOA / IQ4_NL_SOA (ggml-sycl patches 09, 17), uploaded as one slice: [codes of every block][scales of
-        // every block] -> 18-byte blocks, a 2-byte scale then 16 code bytes (both types)
-        const size_t bytes = lp.g_part_bytes[q], nblk = bytes / 18;
+        // Q2_0_SOA / IQ4_NL_SOA / Q8_0_SOA (ggml-sycl patches 09, 17, 31), uploaded as one slice: [codes of every
+        // block][scales of every block] -> B-byte blocks, a 2-byte scale then B - 2 code bytes (B = 18, or 34 for q8_0)
+        const size_t B = ggml_type_size(lp.part_type[q]), C = B - 2;
+        const size_t bytes = lp.g_part_bytes[q], nblk = bytes / B;
         uint8_t * p = slot + lp.part_off[q] + lp.part_pay[q];
         if (soa_scratch_.size() < bytes) soa_scratch_.resize(bytes);
         memcpy(soa_scratch_.data(), p, bytes);
-        const uint8_t * codes = soa_scratch_.data(), * scales = codes + nblk * 16;
+        const uint8_t * codes = soa_scratch_.data(), * scales = codes + nblk * C;
         for (size_t j = 0; j < nblk; j++) {
-            p[j * 18 + 0] = scales[j * 2 + 0];
-            p[j * 18 + 1] = scales[j * 2 + 1];
-            memcpy(p + j * 18 + 2, codes + j * 16, 16);
+            p[j * B + 0] = scales[j * 2 + 0];
+            p[j * B + 1] = scales[j * 2 + 1];
+            memcpy(p + j * B + 2, codes + j * C, C);
         }
     }
 }
