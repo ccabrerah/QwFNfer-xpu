@@ -124,6 +124,9 @@ Extra arguments are appended to the server's command line (later values win).
 | `QWFN_PREDICT_CUR2` | 1 | 1 | Predict layer L+1's routing from this layer's FFN-mix input through L+1's router (cheaper, as accurate). |
 | `QWFN_RAM_EXCLUSIVE` | 1 | set by the deployment | Exclusive expert tiers: RAM holds what VRAM does not; a promotion reads the VRAM victim back into RAM. |
 | `QWFN_RAM_LENT_INCLUSIVE` | 1 | | With exclusive tiers, keep the layers lent to the prefill inclusive. |
+| `QWFN_LEND_RESTORE` | 1 | 1 | After a streamed prompt (or an image's projector staging), read back the VRAM experts of the layers the prefill borrowed, hottest first, before the next decode. Without it, exclusive tiers leave those experts on disk and the reply refills them through misses. |
+| `QWFN_LEND_RESTORE_MS` | ms | 3000 | The restore's time budget. |
+| `QWFN_LEND_RESTORE_BATCH` | 1-64 | 32 | Experts per batched read in the restore. |
 | `QWFN_SWAP_MIN_EF` | N | | Exclusive tiers: do not read back victims used fewer than N times (measured slower; off). |
 | `QWFN_MTP_EXPERTS_VRAM` | 1 | with MTP | The draft head's experts on the device (else in host memory, computed on the CPU). |
 | `QWFN_MTP_DRAFT_VOCAB` | file | with MTP | Token ids the head may draft (a smaller LM head for the draft). |
@@ -256,6 +259,7 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_SPF_CHECK=1` / `GGML_SYCL_SPF_DEBUG=1` | 25 | | Run dense and gathered and compare per layer / report where the matcher stops. |
 | `GGML_SYCL_DNNL_DETERMINISTIC=1` | 26 | 1 | oneDNN matmuls in deterministic mode (no split-K atomic accumulation): the same bits every run. |
 | `GGML_SYCL_TOPK_DETERMINISTIC=1` | 27 | 1 | Radix top-k emits in column order, ties to the lowest index, no atomics (the QSA indexer's block selection reproducible). With 26: bit-identical runs. |
+| `GGML_SYCL_Q8W_NCOLS=1` | 28 | 1 | 2-4-column Q8_0 matvecs (the MTP verify step) through patch 18's wide kernel, each weight block loaded once for all columns; needs `GGML_SYCL_Q8W`. A column's result equals the one-column kernel's. |
 
 ## 6. Upstream ggml and runtime variables the launcher sets
 

@@ -1,0 +1,102 @@
+From: Carlos Cabrera H. <6750732+ccabrerah@users.noreply.github.com>
+Subject: [PATCH 28] ggml-sycl: 2-4-column wide Q8_0 matvec (GGML_SYCL_Q8W_NCOLS)
+
+GGML_SYCL_Q8W_NCOLS=1 (with GGML_SYCL_Q8W=1). A speculative-decoding verify step multiplies the dense Q8_0 weights by
+2-4 activation columns. Those went through the stock reorder ncols kernel (2-byte loads, two lanes per block), while
+one column runs on patch 18's wide kernel (a whole block per lane in two 16-byte loads). This is the wide kernel for 2-4
+columns: each lane loads a weight block once and dots it with every column's q8_1 block. Per column, the accumulation
+and the sub-group reduction are the one-column kernel's, so column c's result equals that kernel's for column c alone.
+
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -1257,6 +1257,72 @@
+         });
+ }
+ 
++// GGML_SYCL_Q8W_NCOLS=1 (patch 28): the wide kernel for NC = 2..4 columns (the MTP verify step). Each lane loads a
++// weight block once and dots it with the NC activation blocks; per column the accumulation and the sub-group reduction
++// are the one-column kernel's, so column c's result is what that kernel gives for column c alone.
++static bool ggml_sycl_q8w_ncols_enabled() {
++    static const bool on = [] { const char * e = getenv("GGML_SYCL_Q8W_NCOLS"); return e && atoi(e) != 0; }();
++    return on;
++}
++
++template <int NC>
++static void reorder_mul_mat_vec_q8_0_q8_1_wide_ncols_sycl(const void * vx, const void * vy, float * dst, const int ncols,
++                                                          const int nrows, const int stride_col_y_bytes,
++                                                          const int stride_col_dst, dpct::queue_ptr stream) {
++    GGML_ASSERT(ncols % QK8_0 == 0);
++    constexpr int sg_per_wg = 8;
++    const int     nb        = ncols / QK8_0;
++    const size_t  d_base    = (size_t) ncols * nrows;   // scales follow all quants: [qs0|...|qsN][d0|...|dN]
++    const int     n_wg      = ceil_div(nrows, sg_per_wg);
++    stream->parallel_for(
++        sycl::nd_range<1>(sycl::range<1>((size_t) n_wg * sg_per_wg * WARP_SIZE), sycl::range<1>(sg_per_wg * WARP_SIZE)),
++        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++            const sycl::sub_group sg  = it.get_sub_group();
++            const int             row = (int) it.get_group(0) * sg_per_wg + (int) sg.get_group_linear_id();
++            if (row >= nrows) {
++                return;   // the whole sub-group shares the row
++            }
++            const int         lane = sg.get_local_linear_id();
++            const int8_t *    xq   = (const int8_t *) vx + (size_t) row * nb * QK8_0;
++            const ggml_half * xd   = (const ggml_half *) ((const char *) vx + d_base) + (size_t) row * nb;
++            float             sum[NC];
++#pragma unroll
++            for (int c = 0; c < NC; c++) {
++                sum[c] = 0.0f;
++            }
++#pragma unroll 2
++            for (int i = lane; i < nb; i += WARP_SIZE) {
++                const sycl::int4 * xv = (const sycl::int4 *) (xq + (size_t) i * QK8_0);
++                const sycl::int4   x0 = xv[0], x1 = xv[1];
++                const float        dx = static_cast<float>(xd[i]);
++#pragma unroll
++                for (int c = 0; c < NC; c++) {
++                    const char *        vyc = (const char *) vy + (size_t) c * stride_col_y_bytes;
++                    const sycl::int4 *  yv  = (const sycl::int4 *) ((const int8_t *) vyc + (size_t) i * QK8_1);
++                    const sycl::half2 * yds = (const sycl::half2 *) (vyc + ncols);
++                    const sycl::int4    y0 = yv[0], y1 = yv[1];
++                    int                 sq = 0;
++#pragma unroll
++                    for (int j = 0; j < 4; j++) {
++                        sq = dpct::dp4a(x0[j], y0[j], sq);
++                    }
++#pragma unroll
++                    for (int j = 0; j < 4; j++) {
++                        sq = dpct::dp4a(x1[j], y1[j], sq);
++                    }
++                    sum[c] += dx * static_cast<float>(yds[i][0]) * sq;
++                }
++            }
++#pragma unroll
++            for (int c = 0; c < NC; c++) {
++                const float r = sycl::reduce_over_group(sg, sum[c], sycl::plus<float>());
++                if (lane == 0) {
++                    dst[(size_t) c * stride_col_dst + row] = r;
++                }
++            }
++        });
++}
++
+ // GGML_SYCL_Q8_EPILOGUE (patch 21): the same kernel with dst[row] = silu(scale * acc), computed exactly as the separate
+ // SCALE (scale * x + 0.0f) and UNARY(SILU) (op_silu) kernels would.
+ static void reorder_mul_mat_vec_q8_0_q8_1_wide_silu_sycl(const void * vx, const void * vy, float * dst, const int ncols,
+@@ -2508,7 +2574,16 @@
+             case GGML_TYPE_Q8_0:
+                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
+                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
++                    if (i == 0 && src1_ncols >= 2 && src1_ncols <= 4 && ggml_sycl_q8w_enabled() && ggml_sycl_q8w_ncols_enabled()) {
++                        const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
++                        const int stride_col_dst     = dst->ne[0];
++                        switch (src1_ncols) {   // patch 28
++                            case 2: reorder_mul_mat_vec_q8_0_q8_1_wide_ncols_sycl<2>(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stride_col_y_bytes, stride_col_dst, stream); break;
++                            case 3: reorder_mul_mat_vec_q8_0_q8_1_wide_ncols_sycl<3>(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stride_col_y_bytes, stride_col_dst, stream); break;
++                            default: reorder_mul_mat_vec_q8_0_q8_1_wide_ncols_sycl<4>(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stride_col_y_bytes, stride_col_dst, stream); break;
++                        }
++                        return;
++                    } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
+                         const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
+                         const int stride_col_dst     = dst->ne[0];
+                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q8_0_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
