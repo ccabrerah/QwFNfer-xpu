@@ -17,7 +17,7 @@ In a nutshell:
 
 ## Is it faster?
 
-There is no other way to use this GPU on other machines, so we are infinite% faster that the competition.
+There is no other way to use this GPU on other similar engines, which makes us infinite% faster than the competition.
 
 ## On perf
 
