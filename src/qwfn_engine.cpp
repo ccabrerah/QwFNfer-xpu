@@ -468,6 +468,20 @@ bool engine::init(const model_index * hot, const model_index * cold,
             qdT_.ratio = qd_.ratio; qdT_.k_blocks = qd_.k_blocks;
             fprintf(stderr, "[qwfn] decode QSA state: %.1f MB (pooled block keys for %lld blocks, %lld kept)\n",
                     ggml_backend_buffer_get_size(qbuf_) / 1e6, (long long) NBmax, (long long) qd_.k_blocks);
+            static const bool shared = getenv("QWFN_MTP_SHARED_CELLS") && atoi(getenv("QWFN_MTP_SHARED_CELLS")) != 0;
+            if (mtp_on_ && shared) {
+                for (uint32_t l = 0; l < hp_.n_layer; l++) if (hp_.is_attn_layer(l)) sc_layer_ = (int) l;
+                sc_ncmax_ = qd_.k_blocks * qd_.ratio;
+                ggml_init_params sp{}; sp.mem_size = ggml_tensor_overhead() * 4; sp.no_alloc = true;
+                scctx_ = ggml_init(sp);
+                sc_cells_ = ggml_new_tensor_2d(scctx_, GGML_TYPE_I32, sc_ncmax_, 1 + MTP_MAX_DRAFTS);
+                sc_mask_  = ggml_new_tensor_2d(scctx_, GGML_TYPE_F16, sc_ncmax_, 1 + MTP_MAX_DRAFTS);
+                scbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(scctx_, w_.buft());
+                if (!scbuf_) { err = "no device memory for the head's shared cells"; return false; }
+                sc_on_ = sc_layer_ >= 0;
+                fprintf(stderr, "[qwfn] mtp: the head attends over layer %d's selected cells (%lld per position)\n",
+                        sc_layer_, (long long) sc_ncmax_);
+            }
         }
     }
 
@@ -766,7 +780,7 @@ void engine::set_embeddings(int32_t pos, const float * emb, int32_t n) {
 
 void engine::reset() {
     mtp_have_h_ = false; mtp_kv_valid_ = true; mtp_draft_ = -1; rb_valid_ = false;
-    st_.reset(); n_past_ = 0;
+    st_.reset(); n_past_ = 0; sc_n_ = 0;
     pool_dirty_ = true;
     if (qbuf_) {
         const int64_t NBmax = qd_.bias->ne[0];
@@ -824,7 +838,7 @@ bool engine::checkpoint_restore(const checkpoint & in, std::string & err) {
     reset();
     st_.restore(in.n_past, in.st.data());
     clear_embeddings();
-    n_past_ = in.n_past;
+    n_past_ = in.n_past; sc_n_ = 0;
     if (mtp_on_) {
         const size_t row = (size_t) hp_.n_embd * hp_.hc_count;
         if (in.mtp_st.size() == st_mtp_.checkpoint_bytes(in.n_past) && in.mtp_h.size() == row && in.mtp_kv_valid) {
@@ -2339,6 +2353,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             // pair two chained calls so the second reads through the first's writes.
             auto attn_dec = [&](graph_builder & gbx, ggml_tensor * x, uint32_t l) -> ggml_tensor * {
                 qd_.pool_cache = pool_cache_[l];
+                if (sc_on_ && (int) l == sc_layer_) { gbx.sc_cells = sc_cells_; gbx.sc_mask = sc_mask_; gbx.sc_layer = (int) l; }
                 if (T == 1) return gbx.sparse_attn_decode(x, vpos(c), sections, (int) l, qd_);
                 // T positions as T chained calls: each reads through the writes of the ones before. The
                 // projections, which read no cache, run once for the T positions (QWFN_QSA_PROJ_EACH=1: per call).
@@ -2362,6 +2377,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     qsa_decode_inputs & q = k == 0 ? qd_ : qdk_[k - 1];
                     q.pool_cache = pool_cache_[l];
                     pj.col = k;
+                    gbx.sc_col = k;
                     ggml_tensor * xk = ggml_view_2d(c, x, n_embd, 1, x->nb[1], (size_t) k * x->nb[1]);
                     ggml_tensor * ok = gbx.sparse_attn_decode(xk, ggml_view_1d(c, inp_pos_one_, 4, (size_t) k * 4 * sizeof(int32_t)), sections, (int) l, q, &ch,
                                                               proj_each ? nullptr : &pj);
@@ -3513,6 +3529,10 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             }
         }
     }
+    if (sc_on_) {   // which positions the shared-cell buffers now describe (the QSA decode graphs wrote them)
+        if (use_qd && T <= 1 + MTP_MAX_DRAFTS) { sc_base_ = n_past_; sc_n_ = T; sc_nc_ = qd_.k_blocks * qd_.ratio; }
+        else sc_n_ = 0;
+    }
     rb_depth_ = (force_decode && T >= 2 && rbbuf_ != nullptr) ? (int) std::min<int64_t>(T - 1, rb_nsnap_) : 0;
     rb_valid_ = rb_depth_ > 0;
     if (ibuf) ggml_backend_buffer_free(ibuf);
@@ -3540,6 +3560,14 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
     ggml_context * c = ggml_init(ip);
     ggml_cgraph *  g = ggml_new_graph_custom(c, 1024, false);
     graph_builder gb(c, &hpm_, &wm_, &w_); gb.bind(&st_mtp_, g, pos); gb.mtp_out = t_mtp_out_;
+    // QWFN_MTP_SHARED_CELLS: positions the last decode step covered attend over the trunk's selected cells.
+    if (sc_on_ && sc_n_ > 0 && sc_nc_ > 0 && sc_nc_ <= sc_ncmax_ && pos >= sc_base_ && pos + n <= sc_base_ + sc_n_) {
+        const size_t o = (size_t) (pos - sc_base_);
+        gb.hd_cells = ggml_view_2d(c, sc_cells_, sc_nc_, n, sc_cells_->nb[1], o * sc_cells_->nb[1]);
+        gb.hd_mask  = ggml_view_2d(c, sc_mask_,  sc_nc_, n, sc_mask_->nb[1],  o * sc_mask_->nb[1]);
+        gb.hd_nc    = sc_nc_;
+        n_mtp_shared++;
+    } else n_mtp_dense++;
     // The head's attention is dense over its own cache. One query sees every key
     // written so far, so it needs no mask at all; two positions (after an accepted
     // pair) need one -inf, at the second position's own key for the first row, on

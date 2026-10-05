@@ -2582,7 +2582,7 @@ int main(int argc, char ** argv) {
                         {"cache_t_wait_spec", c.t_wait_spec}, {"cache_t_wait_demand", c.t_wait_demand},
                         // the draft head (--mtp): whole head, its three parts, and the rollbacks of rejected drafts
                         {"t_mtp", S.eng.t_mtp}, {"t_mtp_pre", S.eng.t_mtp_pre}, {"t_mtp_moe", S.eng.t_mtp_moe},
-                        {"t_mtp_post", S.eng.t_mtp_post}, {"t_rollback", S.eng.t_rollback}, {"n_rollback", S.eng.n_rollback},
+                        {"t_mtp_post", S.eng.t_mtp_post}, {"t_rollback", S.eng.t_rollback}, {"n_rollback", S.eng.n_rollback}, {"n_mtp_shared", S.eng.n_mtp_shared}, {"n_mtp_dense", S.eng.n_mtp_dense},
                         {"t_spec_l0", S.eng.t_spec_l0}, {"n_spec_l0", S.eng.n_spec_l0},
                         {"graph_a_mb", S.eng.graph_a_mb}, {"graph_a_n", S.eng.graph_a_n}}},
             // cumulative layer-major prefill split: seconds, and expert bytes read from disk vs copied from the RAM tier

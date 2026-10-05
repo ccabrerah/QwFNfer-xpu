@@ -394,6 +394,7 @@ public:
     uint64_t mtp_n = 0, mtp_acc = 0, mtp_top3 = 0, mtp_prompt_n = 0, mtp_prompt_acc = 0;
     double   t_mtp = 0, t_rollback = 0;
     uint64_t n_rollback = 0;
+    uint64_t n_mtp_shared = 0, n_mtp_dense = 0;   // head drafts over the trunk's cells / densely
     static int   margin_bucket(float m);
     static float margin_edge(int b);   // lower edge of bucket b
     uint64_t check_moe_gpu_calls = 0, check_moe_cpu_calls = 0;   // QWFN_CHECK_MOE bookkeeping
@@ -467,6 +468,14 @@ private:
     // they stood after the first token of a two-token step, and the PLE conv.
     ggml_context *             rbctx_ = nullptr;
     ggml_backend_buffer_t      rbbuf_ = nullptr;
+    // QWFN_MTP_SHARED_CELLS: the last decode step's cells and cell masks of the last attention layer, one column per
+    // position (sc_base_ .. sc_base_ + sc_n_ - 1, sc_nc_ cells each); the draft head attends over them.
+    bool                       sc_on_ = false;
+    int                        sc_layer_ = -1;
+    ggml_context *             scctx_ = nullptr;
+    ggml_backend_buffer_t      scbuf_ = nullptr;
+    ggml_tensor *              sc_cells_ = nullptr, * sc_mask_ = nullptr;
+    int64_t                    sc_base_ = 0, sc_n_ = 0, sc_nc_ = 0, sc_ncmax_ = 0;
     std::vector<ggml_tensor *> rb_rs_, rb_conv_;
     ggml_tensor *              rb_ple_conv_ = nullptr;
     bool                       rb_valid_ = false;   // the snapshots describe the current state minus one token

@@ -395,6 +395,43 @@ ggml_tensor * graph_builder::sparse_attn(ggml_tensor * cur, ggml_tensor * inp_po
                         GGML_ROPE_TYPE_IMROPE, hp_->n_ctx_train, hp_->rope_freq_base,
                         1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
+    if (hd_cells) {
+        // QWFN_MTP_SHARED_CELLS (the draft head): K and V into the head's cache at its positions, then each position
+        // attends over the cells the trunk's last attention layer chose for the same position, with that layer's
+        // cell mask -- the decode path's 9-node gather + attention, which the SYCL backend runs as one kernel.
+        const int64_t kvd = hd * nh_kv, NC = hd_nc;
+        ggml_tensor * kc2 = st_->k_cache(il), * vc2 = st_->v_cache(il);
+        kc2 = ggml_reshape_2d(ctx0, kc2, kvd, kc2->ne[0] / kvd);
+        vc2 = ggml_reshape_2d(ctx0, vc2, kvd, vc2->ne[0] / kvd);
+        ggml_tensor * wi = ggml_view_1d(ctx0, inp_pos, T, 0);                    // the positions (section 0) = cache rows
+        ggml_tensor * kc_w = ggml_set_rows(ctx0, kc2, ggml_reshape_2d(ctx0, K, kvd, T), wi);
+        ggml_tensor * vc_w = ggml_set_rows(ctx0, vc2, ggml_reshape_2d(ctx0, V, kvd, T), wi);
+        ggml_build_forward_expand(gf_, kc_w);
+        ggml_build_forward_expand(gf_, vc_w);
+        ggml_tensor * out = nullptr;
+        for (int64_t t = 0; t < T; t++) {
+            ggml_tensor * Qt = ggml_view_3d(ctx0, Q, hd, nh, 1, Q->nb[1], Q->nb[2], (size_t) t * Q->nb[2]);
+            ggml_tensor * qp = ggml_permute(ctx0, Qt, 0, 2, 1, 3);                // [hd, 1, nh]
+            ggml_tensor * mk = ggml_view_2d(ctx0, hd_mask, NC, 1, hd_mask->nb[1], (size_t) t * hd_mask->nb[1]);
+            ggml_build_forward_expand(gf_, qp);
+            ggml_build_forward_expand(gf_, mk);
+            ggml_tensor * ck = ggml_view_1d(ctx0, hd_cells, NC, (size_t) t * hd_cells->nb[1]);
+            auto gather = [&](ggml_tensor * cache_w) {
+                ggml_tensor * g = ggml_get_rows(ctx0, cache_w, ck);                // F32 [kvd, NC]
+                g = ggml_permute(ctx0, ggml_reshape_3d(ctx0, g, hd, nh_kv, NC), 0, 2, 1, 3);
+                return ggml_cast(ctx0, g, GGML_TYPE_F16);
+            };
+            ggml_tensor * Kg = gather(kc_w);
+            ggml_tensor * Vg = gather(vc_w);
+            ggml_tensor * o = ggml_flash_attn_ext(ctx0, qp, Kg, Vg, mk, 1.0f / sqrtf((float) hd), 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+            o = ggml_reshape_2d(ctx0, o, hd * nh, 1);
+            out = out ? ggml_concat(ctx0, out, o, 1) : o;
+        }
+        out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, gate));
+        return ggml_mul_mat(ctx0, Wl(il, "attn_output.weight"), out);
+    }
+
     // Append this ubatch to the caches.
     ggml_tensor * kc = st_->k_cache(il);
     ggml_tensor * vc = st_->v_cache(il);
@@ -582,6 +619,10 @@ ggml_tensor * graph_builder::sparse_attn_decode_T(const qsa_proj & pj, const qsa
     ggml_tensor * dpos = ggml_sub(ctx0, cp, ggml_reshape_2d(ctx0, first(qT.npast_f, T), 1, T));  // cell - n_past(k)
     ggml_tensor * ok   = ggml_step(ctx0, ggml_scale_bias(ctx0, dpos, -1.0f, 0.5f));
     ggml_tensor * mask = ggml_cast(ctx0, ggml_scale_bias(ctx0, ok, 1e30f, -1e30f), GGML_TYPE_F16);   // [NC, T]
+    if (sc_cells && il == sc_layer) {   // QWFN_MTP_SHARED_CELLS: the T positions' cells for the draft head
+        ggml_build_forward_expand(gf_, ggml_cpy(ctx0, cells, ggml_view_2d(ctx0, sc_cells, NC, T, sc_cells->nb[1], 0)));
+        ggml_build_forward_expand(gf_, ggml_cpy(ctx0, mask, ggml_view_2d(ctx0, sc_mask, NC, T, sc_mask->nb[1], 0)));
+    }
 
     // ---- K and V of the T positions into the caches ------------------------
     ggml_tensor * kc = st_->k_cache(il), * vc = st_->v_cache(il);
@@ -689,6 +730,13 @@ ggml_tensor * graph_builder::sparse_attn_decode(ggml_tensor * cur, ggml_tensor *
     ggml_tensor * dpos = ggml_sub(ctx0, cp, qd.npast_f);                              // cell - n_past
     ggml_tensor * ok   = ggml_step(ctx0, ggml_scale_bias(ctx0, dpos, -1.0f, 0.5f));   // 1 if cell <= n_past
     ggml_tensor * mask = ggml_cast(ctx0, ggml_scale_bias(ctx0, ok, 1e30f, -1e30f), GGML_TYPE_F16);  // 0 / -inf
+    if (sc_cells && il == sc_layer) {   // QWFN_MTP_SHARED_CELLS: this position's cells for the draft head
+        const int64_t col = sc_col >= 0 ? sc_col : (proj ? proj->col : 0);
+        ggml_build_forward_expand(gf_, ggml_cpy(ctx0, ggml_reshape_2d(ctx0, cells, NC, 1),
+                ggml_view_2d(ctx0, sc_cells, NC, 1, sc_cells->nb[1], (size_t) col * sc_cells->nb[1])));
+        ggml_build_forward_expand(gf_, ggml_cpy(ctx0, mask,
+                ggml_view_2d(ctx0, sc_mask, NC, 1, sc_mask->nb[1], (size_t) col * sc_mask->nb[1])));
+    }
 
     // ---- q, k, v; cache writes; gather the selected cells -----------------
     ggml_tensor * Q, * K, * gate = nullptr;

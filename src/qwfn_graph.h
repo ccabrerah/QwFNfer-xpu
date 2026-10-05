@@ -178,6 +178,11 @@ public:
     // to run a layer's block speculatively on an approximate residual, purely to
     // predict that layer's routing; the exact pass that follows does the writes.
     void set_persist(bool p) { persist_ = p; }
+    // QWFN_MTP_SHARED_CELLS: the trunk's decode graphs copy layer sc_layer's selected cells and cell mask into
+    // sc_cells / sc_mask (column = the step's position); the draft head's attention then reads hd_cells / hd_mask
+    // (column t = its position t, hd_nc cells each) instead of attending densely over its whole cache.
+    ggml_tensor * sc_cells = nullptr, * sc_mask = nullptr; int sc_layer = -1; int64_t sc_col = -1;   // sc_col: the column of a chained one-position call
+    ggml_tensor * hd_cells = nullptr, * hd_mask = nullptr; int64_t hd_nc = 0;
 
     // GPU-only fusions that change the summation order (so the CPU path, which
     // is kept bit-exact against llama.cpp, does not take them): the mean over
