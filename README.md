@@ -14,7 +14,16 @@ In a nutshell:
 
 ## Is it faster?
 
-Yes, and it works on top an Intel ARC native stack.
+There is no other way to use this GPU on other machines, so we are infinite% faster that the competition.
+
+## On perf
+
+For the V4 quant (see recipe, a "Q3-level" set), on a Ryzen 5700, 32GB dual channel system ram, on a dedicated linux system with a B70 power limited to 120W you get:
+
+* 30 TP decode
+* 400-500 prefill
+
+A weaker "Q2 level" quant gets you to 40TPS, but with a noticeable downgrade on inference.
 
 ## Major improvements
 
