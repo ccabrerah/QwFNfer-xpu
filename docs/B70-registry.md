@@ -154,3 +154,8 @@ A B B A, 120 W.
 Open from this round (before `QWFN_PF_VRAM`): a short streamed turn's prefill still swept every expert from disk (a 1.7K-token turn at 55K
 context takes 14-17 s); the restore reads at ~2 GB/s and could overlap reads with uploads; ~2 ms per short-prompt step
 is spent outside the decode timers.
+
+Profile of a 20K prefill on this configuration: the MoE step is launch-bound -- ~35 s of wall time for ~11 s of
+kernels, because every expert's rows of every chunk go through a separate dequantize -> convert -> gemm (~98K expert
+matmuls for 20K tokens). A grouped MoE kernel (one launch per layer and chunk) is the largest prefill lever left;
+promotions per layer per token stay at 2 (1 and 3 measured slower).
