@@ -15,6 +15,7 @@
 // re-prefills, because the recurrent layers cannot be rewound: unlike a KV cache
 // you cannot simply forget the tail of a scan.
 
+#include "qwfn_argmax.h"
 #include "qwfn_engine.h"
 #include "qwfn_lookup.h"
 #include "qwfn_model.h"
@@ -205,11 +206,7 @@ struct sampler {
             }
             lg = pen.data();
         }
-        if (cfg.temp <= 0.0f) {
-            int best = 0;
-            for (int64_t v = 1; v < n; v++) if (lg[v] > lg[best]) best = (int) v;
-            return best;
-        }
+        if (cfg.temp <= 0.0f) return qwfn_argmax(lg, n);
         std::vector<int> idx;
         top_indices(lg, n, (int) std::min<int64_t>(cfg.top_k > 0 ? cfg.top_k : n, n), idx);
         const int k = (int) idx.size();

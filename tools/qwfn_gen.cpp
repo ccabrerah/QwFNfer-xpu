@@ -3,6 +3,7 @@
 // Works in token ids so it can be compared against llama.cpp directly without
 // needing a tokenizer.
 
+#include "qwfn_argmax.h"
 #include "qwfn_engine.h"
 #include "qwfn_model.h"
 
@@ -48,7 +49,7 @@ static int ckpt_test(engine & eng, const engine_config & cfg, const std::vector<
             done += take;
         }
     };
-    auto argmax = [&](const float * l) { int b = 0; for (int64_t v = 1; v < V; v++) if (l[v] > l[b]) b = (int) v; return b; };
+    auto argmax = [&](const float * l) { return qwfn_argmax(l, V); };
     auto nll = [&](const float * l, int32_t tok) {
         float mx = l[0]; for (int64_t v = 1; v < V; v++) mx = std::max(mx, l[v]);
         double z = 0.0; for (int64_t v = 0; v < V; v++) z += std::exp((double) l[v] - mx);
@@ -295,7 +296,7 @@ int main(int argc, char ** argv) {
     if (!replay.empty()) n_gen = std::min<int>(n_gen, (int) replay.size());
     const auto t0 = std::chrono::steady_clock::now();
     double nll_sum = 0.0; int nll_n = 0;
-    auto argmax = [&](const float * l) { int b = 0; for (int64_t v = 1; v < eng.n_vocab(); v++) if (l[v] > l[b]) b = (int) v; return b; };
+    auto argmax = [&](const float * l) { return qwfn_argmax(l, eng.n_vocab()); };
     auto score  = [&](const float * l, int32_t tok) {   // -log softmax(l)[tok]
         float mx = l[0]; for (int64_t v = 1; v < eng.n_vocab(); v++) mx = std::max(mx, l[v]);
         double z = 0.0; for (int64_t v = 0; v < eng.n_vocab(); v++) z += std::exp((double) l[v] - mx);
