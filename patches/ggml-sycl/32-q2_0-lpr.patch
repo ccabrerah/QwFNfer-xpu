@@ -1,0 +1,51 @@
+From: Carlos Cabrera H. <6750732+ccabrerah@users.noreply.github.com>
+Subject: [PATCH 32] ggml-sycl: GGML_SYCL_Q2_LPR, lanes per row of the one-token q2_0 MoE kernels
+
+The wide q2_0 MoE matvec and the fused gate/up/SwiGLU take 16 lanes per row for rows of 16 or more blocks. An expert
+gate/up row here is 40 blocks: 16 lanes run 3 steps with 8 lanes idle in the last. GGML_SYCL_Q2_LPR=16|8|4 forces the
+lanes per row (8: 5 full steps, 2 rows per sub-group) for tuning; the default is unchanged.
+
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index e83d5a0..7c1113a 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -2954,6 +2954,11 @@ static void launch_mul_mat_vec_q_moe(
+ }
+ 
+ 
++static int ggml_sycl_q2_lpr() {
++    static const int v = [] { const char * e = getenv("GGML_SYCL_Q2_LPR"); return e ? atoi(e) : 0; }();
++    return v;
++}
++
+ // ---- wide q2_0 MoE matvec (GGML_SYCL_MOE_Q2W=1), see scripts/box/moeq2w/apply_moeq2w.py ----
+ // byte k of a q2_0 block holds elements 4k..4k+3 in bits 0-1, 2-3, 4-5, 6-7
+ static __dpct_inline__ int q2_0_expand_byte(const uint32_t q) {
+@@ -3057,8 +3062,11 @@ static void launch_mul_mat_vec_q2_0_moe_wide(
+                 });
+         });
+     };
+-    if (blocks_per_row >= WARP_SIZE) go(std::integral_constant<int, WARP_SIZE>{});
+-    else                             go(std::integral_constant<int, WARP_SIZE / 2>{});
++    // patch 32: GGML_SYCL_Q2_LPR=16|8|4 forces the lanes per row (tuning); otherwise by row length
++    const int lpr = ggml_sycl_q2_lpr() ? ggml_sycl_q2_lpr() : blocks_per_row >= WARP_SIZE ? WARP_SIZE : WARP_SIZE / 2;
++    if (lpr >= WARP_SIZE)          go(std::integral_constant<int, WARP_SIZE>{});
++    else if (lpr >= WARP_SIZE / 2) go(std::integral_constant<int, WARP_SIZE / 2>{});
++    else                           go(std::integral_constant<int, WARP_SIZE / 4>{});
+ }
+ 
+ // ---- IQ4_NL_SOA one-token MoE matvec (patch 17) ----
+@@ -3353,8 +3361,11 @@ void ggml_sycl_mul_mat_vec_q2_0_moe_glu(const void * vx_gate, const void * vx_up
+                 });
+         });
+     };
+-    if (blocks_per_row >= WARP_SIZE) go(std::integral_constant<int, WARP_SIZE>{});
+-    else                             go(std::integral_constant<int, WARP_SIZE / 2>{});
++    // patch 32: GGML_SYCL_Q2_LPR=16|8|4 forces the lanes per row (tuning); otherwise by row length
++    const int lpr = ggml_sycl_q2_lpr() ? ggml_sycl_q2_lpr() : blocks_per_row >= WARP_SIZE ? WARP_SIZE : WARP_SIZE / 2;
++    if (lpr >= WARP_SIZE)          go(std::integral_constant<int, WARP_SIZE>{});
++    else if (lpr >= WARP_SIZE / 2) go(std::integral_constant<int, WARP_SIZE / 2>{});
++    else                           go(std::integral_constant<int, WARP_SIZE / 4>{});
+ }
+ 
+ bool ggml_sycl_mul_mat_vec_q_id(
