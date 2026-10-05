@@ -56,6 +56,10 @@ struct expert_handle {
 // One expert's payloads in the RAM tier, for a reader that can take them
 // instead of the file's bytes (the streamed prefill).
 struct ram_slice { uint32_t expert; const uint8_t * part[EXPERT_NPARTS]; };
+// One VRAM-resident expert's parts in the device tier, for a prefill that copies them on the device instead of
+// reading them (QWFN_PF_VRAM). type: the tier's (Q2_0_SOA / IQ4_NL_SOA, or the file's type); bytes: per part.
+struct vram_slice { uint32_t expert; ggml_backend_buffer_t buf; uint8_t * part[EXPERT_NPARTS];
+                    ggml_type type[EXPERT_NPARTS]; size_t bytes[EXPERT_NPARTS]; };
 
 struct tier_view {
     uint8_t *             part[EXPERT_NPARTS]   = {nullptr, nullptr, nullptr};   // slot 0 of each part
@@ -262,6 +266,8 @@ public:
     // Every valid, hot block of `layer` in the RAM tier, with its payload pointers.
     // Main thread only; the pointers hold while nothing admits into that layer.
     void ram_resident_slices(uint32_t layer, std::vector<ram_slice> & out);
+    // The VRAM-resident experts of `layer` (its tier present: not lent), valid ones only.
+    void vram_resident_parts(uint32_t layer, std::vector<vram_slice> & out);
 
     // The VRAM tier is two buffers: a permanent one and a dynamic one of
     // lend_bytes that holds expert slots during decode and is FREED for the

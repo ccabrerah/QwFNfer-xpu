@@ -630,6 +630,9 @@ bool engine::init(const model_index * hot, const model_index * cold,
     // the file (QWFN_SWEEP_FILE_ONLY=1 reads everything, for comparison).
     if (!getenv("QWFN_SWEEP_FILE_ONLY"))
         pf_.set_resident_source([this](uint32_t layer, std::vector<ram_slice> & out) { ec_.ram_resident_slices(layer, out); });
+    // QWFN_PF_VRAM: and the experts the VRAM tier holds are copied on the device instead of read and uploaded.
+    if (getenv("QWFN_PF_VRAM") && atoi(getenv("QWFN_PF_VRAM")) != 0)
+        pf_.set_vram_source([this](uint32_t layer, std::vector<vram_slice> & out) { ec_.vram_resident_parts(layer, out); });
 
     gA_.assign(hp_.n_layer, layer_graph{});
     gA_bucket_.assign(hp_.n_layer, -1);
@@ -1557,6 +1560,7 @@ void engine::prefill_leave() {
     if (pwbuf_) { ggml_backend_buffer_free(pwbuf_); pwbuf_ = nullptr; }
     if (pwctx_) { ggml_free(pwctx_); pwctx_ = nullptr; }
     in_prefill_ = false;
+    pf_.drop_vram_staging();   // QWFN_PF_VRAM: a staged VRAM list is only valid inside the prefill that took it
     ec_.lend_end();
     client_lent_ = false;
     sync_tier_epoch();

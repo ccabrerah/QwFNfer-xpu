@@ -220,14 +220,16 @@ bool prefill_streamer::read_into(hbuf & b, uint32_t layer, std::string & err) {
         // aligned edge may re-read the fringe of a held slice: the same bytes.
         std::vector<const uint8_t *> held(n_expert, nullptr);
         for (const ram_slice & r : b.residents) if (r.expert < n_expert) held[r.expert] = r.part[q];
+        auto in_vram = [&](uint32_t x) { return x < b.in_vram.size() && b.in_vram[x]; };
         for (uint32_t e = 0; e < n_expert; ) {
+            if (in_vram(e)) { bytes_from_vram += r0.nbytes; e++; continue; }   // copied on the device at load
             if (held[e]) {
                 copies.push_back(copy_job{ b.p + off + b.part_pad[q] + (size_t) e * r0.nbytes, held[e], r0.nbytes });
                 bytes_from_ram += r0.nbytes;
                 e++; continue;
             }
             uint32_t e2 = e + 1;
-            while (e2 < n_expert && !held[e2]) e2++;
+            while (e2 < n_expert && !held[e2] && !in_vram(e2)) e2++;
             const uint64_t rs = r0.offset + (uint64_t) e * r0.nbytes, re = r0.offset + (uint64_t) e2 * r0.nbytes;
             const uint64_t a0 = dio_align_down(rs), a1 = std::min<uint64_t>(dio_align_up(re), begin + span);
             for (uint64_t p = a0; p < a1; p += CHUNK) {
@@ -293,7 +295,34 @@ void prefill_streamer::reader_loop() {
 
 void prefill_streamer::fill_residents(hbuf & b, uint32_t layer, bool from_ram) {
     b.residents.clear();
+    b.vres.clear();
+    b.in_vram.clear();
     if (from_ram && res_src_) res_src_(layer, b.residents);
+    // VRAM residents only for a read that completes inside this prefill (the tier is stable then) and only with the
+    // device staging; drop_vram_staging() forgets such a buffer when the prefill ends.
+    if (from_ram && vram_src_ && dev_buft_ && dev_backend_) {
+        vram_src_(layer, b.vres);
+        if (!b.vres.empty()) {
+            const uint32_t n_expert = mi_->hp().n_expert;
+            b.in_vram.assign(n_expert, 0);
+            for (const vram_slice & v : b.vres) if (v.expert < n_expert) b.in_vram[v.expert] = 1;
+            std::vector<ram_slice> keep;
+            for (const ram_slice & r : b.residents) if (r.expert >= n_expert || !b.in_vram[r.expert]) keep.push_back(r);
+            b.residents.swap(keep);
+        }
+    }
+}
+
+void prefill_streamer::drop_vram_staging() {
+    std::lock_guard<std::mutex> lk(m_);
+    for (int i = 0; i < 2; i++) {
+        hbuf & b = hb_[i];
+        if (b.vres.empty()) continue;
+        if (reading_ && want_buf_ == i) continue;   // cannot happen at a prefill's end (its last prefetch has no list)
+        if (want_layer_ == b.layer && want_buf_ == i) want_layer_ = -1;   // a queued, unstarted job: cancel it
+        b.layer = -1; b.ready = false; b.vres.clear(); b.in_vram.clear();
+    }
+    if (loaded_ != UINT32_MAX) loaded_ = UINT32_MAX;   // the device staging no longer matches any layer
 }
 
 prefill_streamer::hbuf * prefill_streamer::enqueue_locked(uint32_t layer, bool from_ram) {
@@ -414,7 +443,26 @@ bool prefill_streamer::load_layer(uint32_t layer, std::string & err) {
             // before the next one, and the host does not wait for it either.
             static const bool legacy_upload = getenv("QWFN_LEGACY_UPLOAD") != nullptr;
             const uint8_t * src = b.p + part_off_[q] + part_pad_[q];
-            if (legacy_upload || !dev_backend_) {
+            if (!b.in_vram.empty()) {
+                // QWFN_PF_VRAM: only the runs of experts the tier does not hold; copy_from_vram() fills the rest.
+                for (uint32_t e = 0; e < n_expert; ) {
+                    if (b.in_vram[e]) { e++; continue; }
+                    uint32_t e2 = e + 1;
+                    while (e2 < n_expert && !b.in_vram[e2]) e2++;
+                    const uint32_t n = e2 - e;
+                    if (legacy_upload || !dev_backend_) {
+                        for (uint32_t x = e; x < e2; x++)
+                            ggml_backend_tensor_set(xfer_, src + (size_t) x * slice_[q], dev_off_[q] + (size_t) x * dev_slice_[q], slice_[q]);
+                    } else if (dev_slice_[q] == slice_[q]) {
+                        ggml_backend_tensor_set_async(dev_backend_, xfer_, src + (size_t) e * slice_[q],
+                                dev_off_[q] + (size_t) e * dev_slice_[q], (size_t) n * slice_[q]);
+                    } else {
+                        ggml_backend_tensor_set_2d_async(dev_backend_, xfer_, src + (size_t) e * slice_[q],
+                                dev_off_[q] + (size_t) e * dev_slice_[q], slice_[q], n, dev_slice_[q], slice_[q]);
+                    }
+                    e = e2;
+                }
+            } else if (legacy_upload || !dev_backend_) {
                 for (uint32_t e = 0; e < n_expert; e++)
                     ggml_backend_tensor_set(xfer_, src + (size_t) e * slice_[q],
                             dev_off_[q] + (size_t) e * dev_slice_[q], slice_[q]);
@@ -427,6 +475,7 @@ bool prefill_streamer::load_layer(uint32_t layer, std::string & err) {
             }
             d += dev_slice_[q] * n_expert;
         }
+        if (!b.vres.empty() && !copy_from_vram(b, err)) return false;
         t_upload += std::chrono::duration<double>(std::chrono::steady_clock::now() - tu).count();
         if (getenv("QWFN_VERIFY_UPLOAD")) {
             // Byte-compare every expert slice in its padded device slot against
@@ -459,6 +508,39 @@ bool prefill_streamer::load_layer(uint32_t layer, std::string & err) {
     }
 
     loaded_ = layer;
+    return true;
+}
+
+// QWFN_PF_VRAM: the VRAM tier's copy of each listed expert into its device staging slot, on the device stream after
+// the uploads: one CPY per part, the tier's SOA layouts converted back to the file's (ggml-sycl patch 30), other
+// types copied as they are. Same bytes as the read would have staged.
+bool prefill_streamer::copy_from_vram(const hbuf & b, std::string & err) {
+    const size_t n_nodes = b.vres.size() * EXPERT_NPARTS;
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * (3 * n_nodes + 8) + ggml_graph_overhead_custom(n_nodes + 8, false);
+    ip.no_alloc = true;
+    ggml_context * c = ggml_init(ip);
+    if (!c) { err = "prefill: no context for the VRAM copies"; return false; }
+    ggml_cgraph * g = ggml_new_graph_custom(c, n_nodes + 8, false);
+    for (const vram_slice & v : b.vres) {
+        for (int q = 0; q < EXPERT_NPARTS; q++) {
+            if (v.bytes[q] != slice_[q]) { ggml_free(c); err = "prefill: VRAM slice size differs from the file's"; return false; }
+            const int64_t nel = (int64_t) (v.bytes[q] / ggml_type_size(v.type[q])) * ggml_blck_size(v.type[q]);
+            if (nel != (int64_t) (slice_[q] / ggml_type_size(part_type_[q])) * ggml_blck_size(part_type_[q])) {
+                ggml_free(c); err = "prefill: VRAM slice element count differs"; return false;
+            }
+            ggml_tensor * src = ggml_new_tensor_1d(c, v.type[q], nel);
+            src->data = v.part[q]; src->buffer = v.buf;
+            ggml_tensor * dst = ggml_new_tensor_1d(c, part_type_[q], nel);
+            dst->data = dev_base_ + dev_off_[q] + (size_t) v.expert * dev_slice_[q]; dst->buffer = dev_buf_;
+            ggml_tensor * cp = ggml_cpy(c, src, dst);
+            cp->buffer = dev_buf_;
+            ggml_build_forward_expand(g, cp);
+        }
+    }
+    const bool ok = ggml_backend_graph_compute_async(dev_backend_, g) == GGML_STATUS_SUCCESS;
+    ggml_free(c);
+    if (!ok) { err = "prefill: VRAM copies failed"; return false; }
     return true;
 }
 

@@ -2588,7 +2588,7 @@ int main(int argc, char ** argv) {
             // cumulative layer-major prefill split: seconds, and expert bytes read from disk vs copied from the RAM tier
             {"prefill_split", {{"t_prefill", S.eng.t_prefill}, {"t_graph_a", S.eng.t_pf_graphA}, {"t_moe", S.eng.t_pf_moe},
                                {"t_read", S.eng.t_pf_read}, {"bytes_read", S.eng.prefill_bytes_read()},
-                               {"bytes_from_ram", S.eng.prefill_bytes_from_ram()},
+                               {"bytes_from_ram", S.eng.prefill_bytes_from_ram()}, {"bytes_from_vram", S.eng.prefill_bytes_from_vram()},
                                {"t_zero", S.eng.t_pf_zero}, {"t_readback", S.eng.t_pf_readback},
                                {"t_sync", S.eng.t_pf_sync}, {"t_prefetch", S.eng.t_pf_prefetch},
                                {"t_head", S.eng.t_pf_head}, {"t_warm", S.eng.t_warm},

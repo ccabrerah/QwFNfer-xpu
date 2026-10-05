@@ -344,6 +344,7 @@ public:
     double t_replay_alloc = 0, t_replay_launch = 0, t_replay_wait = 0; uint64_t n_replay = 0;   // the cached decode graphs' replays, split
     uint64_t prefill_bytes_read()     const { return pf_.bytes_read; }       // expert bytes the streamed sweeps read
     uint64_t prefill_bytes_from_ram() const { return pf_.bytes_from_ram; }   // ...and took from the RAM tier instead
+    uint64_t prefill_bytes_from_vram() const { return pf_.bytes_from_vram; }   // ...and copied from the VRAM tier (QWFN_PF_VRAM)
     expert_cache::census        ram_census()  const { return ec_.ram_census(); }
     const io_engine &          cache_io()    const { return ec_.io(); }
     std::string memory_summary() const;

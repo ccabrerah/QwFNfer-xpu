@@ -1272,6 +1272,25 @@ void expert_cache::ram_resident_slices(uint32_t layer, std::vector<ram_slice> & 
     }
 }
 
+void expert_cache::vram_resident_parts(uint32_t layer, std::vector<vram_slice> & out) {
+    out.clear();
+    if (layer >= blk_.size() || !vram_buf_) return;
+    layer_pool & lp = blk_[layer];
+    if (lp.g_slots == 0 || lp.g_lent) return;
+    for (uint32_t g = 0; g < lp.g_slots; g++) {
+        const uint16_t e = lp.g_slot_expert[g];
+        if (e == SLOT_EMPTY || !lp.g_valid[g] || (lp.g_cold.size() > g && lp.g_cold[g])) continue;
+        if (lp.g_expert_slot[e] != (int32_t) g) continue;   // stale entry
+        vram_slice v; v.expert = e; v.buf = lp.g_buf;
+        for (int q = 0; q < EXPERT_NPARTS; q++) {
+            v.part[q]  = lp.g_part[q] + (size_t) g * lp.g_part_bytes[q];
+            v.type[q]  = gpu_type(lp.part_type[q]);
+            v.bytes[q] = lp.g_part_bytes[q];
+        }
+        out.push_back(v);
+    }
+}
+
 void expert_cache::settle_promotions() {
     if (pending_release_.empty() && pending_swaps_.empty()) return;
     const auto t0 = std::chrono::steady_clock::now();

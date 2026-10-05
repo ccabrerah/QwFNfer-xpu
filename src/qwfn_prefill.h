@@ -77,6 +77,13 @@ public:
     // Who answers "what does the RAM tier hold of this layer" (main thread).
     using resident_source = std::function<void(uint32_t layer, std::vector<ram_slice> &)>;
     void set_resident_source(resident_source f) { res_src_ = std::move(f); }
+    // QWFN_PF_VRAM: who answers "what does the VRAM tier hold of this layer". Those experts are neither read nor
+    // uploaded; load_layer() copies them from the tier into the device staging on the device (ggml-sycl patch 30
+    // converts the SOA layouts back to the file's). Device staging only.
+    using vram_source = std::function<void(uint32_t layer, std::vector<vram_slice> &)>;
+    void set_vram_source(vram_source f) { vram_src_ = std::move(f); }
+    // At the end of a prefill: forget staged layers whose VRAM list may no longer match the tier.
+    void drop_vram_staging();
 
     // Where expert `e`'s part landed. Valid until the next load_layer().
     const uint8_t * part_ptr(uint32_t e, expert_part part) const;
@@ -96,6 +103,7 @@ public:
     double   t_upload = 0;
     uint64_t bytes_read = 0;
     uint64_t bytes_from_ram = 0;   // expert bytes copied from the RAM tier instead of read
+    uint64_t bytes_from_vram = 0;  // expert bytes copied from the VRAM tier on the device (QWFN_PF_VRAM)
 
 private:
     // One host staging buffer plus the layer it holds. The per-part layout
@@ -117,6 +125,8 @@ private:
         size_t    slice[EXPERT_NPARTS]    = {0, 0, 0};
         ggml_type ptype[EXPERT_NPARTS]    = {GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32};
         std::vector<ram_slice> residents;        // what to copy from the RAM tier (set before the read starts)
+        std::vector<vram_slice> vres;            // QWFN_PF_VRAM: what to copy from the VRAM tier (device side, at load)
+        std::vector<uint8_t>    in_vram;         // per expert: in vres (neither read nor uploaded)
     };
 
     // The actual read: fills b's data and layout for `layer`. Reader thread
@@ -128,6 +138,8 @@ private:
     hbuf * enqueue_locked(uint32_t layer, bool from_ram);
     void   fill_residents(hbuf & b, uint32_t layer, bool from_ram);
     resident_source res_src_;
+    vram_source     vram_src_;
+    bool copy_from_vram(const hbuf & b, std::string & err);
 
     const model_index * mi_ = nullptr;
     io_engine           io_;
