@@ -121,6 +121,10 @@ above. Effort: S = a kernel, a switch or one measurement session, M = a few days
 | ~~Gated-delta-net writing its rollback snapshot itself at T=2~~ **tried 2026-10-05: exact, no measurable gain (see below)** | ~1 ms per verify step (36 x 3 MB copies and their kernels) | M | MTP | the state and its snapshot in one allocation, so the existing fused cache write applies |
 | Prefix cache on disk, kept across restarts *(Pennyroyal's HiCache/NIXL tier)* | a returning long conversation after a restart restores in ~1-2 s instead of a full prefill (~225 s at 100K); the RAM pool can shrink or spill parked sessions | M | when the process restarts mid-conversation | write each pool entry to NVMe in the background while idle; a namespace hash of everything that changes the bytes (weights, engine commit, ggml tree, KV type, context, head, draft vocabulary, determinism switches); byte-exact round trip through disk |
 | BF16 recurrent (gated-delta-net) state, F32 compute *(Pennyroyal)* | ~1% decode (113 MB/token less traffic); rollback snapshots and the 118 MB fixed part of every checkpoint halve | M | small | the GDN kernel loading/storing BF16 state; decode-only NLL and a 100K needle check |
+| Promotion settle one step later | the ~3 ms per step the per-layer promotion settle costs (a second queue alone did not overlap it): up to ~6% decode | M | yes | an event per layer after its promotions; settle layer L's at its next fetch instead of after its MoE |
+| Promotion reorder off the GPU | the SOA reorder kernel per promoted part: ~1-1.5 ms per verify step | M | yes | keep RAM slots in the device layout, so a promotion is a plain copy |
+| Staged Q8_0 experts through patch 31's kernel | ~0.3 ms per verify step (they still take the stock kernel) | S | yes | convert them to Q8_0_SOA in the staging upload |
+| IQ4_NL expert down closer to bandwidth | ~1 ms per verify step (now ~290 GB/s) | S-M | yes | more rows per work-group to amortize the LUT build, or the LUT in registers |
 
 ## Overlay v4 with the draft head and time sharing (2026-10)
 
