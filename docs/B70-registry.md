@@ -150,6 +150,11 @@ A B B A, 120 W.
 | The draft head over the trunk's selected cells (`QWFN_MTP_SHARED_CELLS=1`) | the head's dense attention grew with context (1.4 ms per step short, 5.8-6.7 ms at 52-60K); over the ~2K cells the trunk's last attention layer chose: 1.9-2.0 ms; agent turns +7%, short prompts and acceptance unchanged | **adopted** |
 
 | A streamed prompt takes VRAM-resident experts from the tier (`QWFN_PF_VRAM=1`, patch 30) | a 1.7K-token turn at 55K context: disk reads 39.4 -> 24.6 GB, prompt 17.3 -> 13.6 s (-21%); a 52K prompt -6.5%; per-layer prefill hashes bit-identical | **adopted** |
+| Q8_0 expert-down parts in the SOA layout with their own one-token MoE matvec (`QWFN_Q8_SOA=1`, patch 31) | the stock kernel ran one 16-lane work-group per 680-byte row (~85 GB/s): 2.17 -> 0.8 ms per verify step | **adopted** |
+| 8 lanes per row for the IQ4_NL / Q2_0 expert kernels (`GGML_SYCL_IQ4_SOA_LPR=8`, `GGML_SYCL_Q2_LPR=8`, patch 32) | 20- and 40-block rows left 38% / 17% of 16 lanes idle: IQ4_NL 3.64 -> 3.0, Q2_0 gate/up 2.61 -> 2.4 ms per verify step | **adopted** |
+| Vectorized greedy argmax (temperature 0) | 0.69 -> 0.03 ms per position on the host, same token; together with the two rows above: short-prompt decode +11% (34.0 -> 37.9 tok/s), agent turns at ~55K +6.5% | **adopted** |
+| Expert promotions on a second in-order queue (`QWFN_PROMOTE_SIDE=1`, patch 33) | identical output; the ~3 ms per step of promotion settle unchanged: no overlap on this driver | rejected (switch off) |
+| Power cap 160 W vs 120 W on this configuration | prefill +16-23% (20K 434 -> 534, 100K 458 -> 531 tok/s), short decode +5-11% (noisy), decode after long prompts ~equal | information (the cap is the operator's choice) |
 
 Open from this round (before `QWFN_PF_VRAM`): a short streamed turn's prefill still swept every expert from disk (a 1.7K-token turn at 55K
 context takes 14-17 s); the restore reads at ~2 GB/s and could overlap reads with uploads; ~2 ms per short-prompt step
