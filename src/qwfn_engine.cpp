@@ -965,6 +965,7 @@ const float * engine::eval(const int32_t * hist, int32_t n_hist, int32_t n_new, 
     // followed: take the tier back before a decode, and rebuild whatever the
     // lend invalidated either way.
     if (!streamed && client_lent_) vram_lend_end();
+    if (!streamed) ec_.lend_restore_if_pending();   // QWFN_LEND_RESTORE: after the prompt's last pass, before decode
     if (!streamed) sync_tier_epoch();
     if (streamed && !prefill_enter(err)) return nullptr;
     bool ok = true;

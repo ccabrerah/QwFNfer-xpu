@@ -88,6 +88,9 @@ struct expert_cache_stats {
     uint64_t bytes_h2d = 0, bytes_d2h = 0;
     uint64_t upgrades   = 0;    // cold blocks refetched at full precision on reuse
     uint64_t batch_lookups = 0, batch_misses = 0;   // prompt-batch experts served without admission, and the ones read for it
+    // QWFN_LEND_RESTORE: after a streamed prefill, the lent layers' former VRAM residents read back from disk.
+    uint64_t lend_restored = 0, lend_restore_bytes = 0;
+    double   t_lend_restore = 0;
     uint64_t warm_admitted = 0; // blocks copied into the RAM tier from a prefill's staging
     uint64_t warm_promoted = 0; // of those, pushed on to VRAM
     double   t_warm     = 0;
@@ -268,6 +271,9 @@ public:
     // refills it from the RAM tier. Pointers into it change across that, so
     // tier_epoch() advances and graphs built against it must be rebuilt.
     size_t    lent_bytes() const { return extra_bytes_; }
+    // QWFN_LEND_RESTORE=1: run the restore a prefill left pending (the engine calls this before a decode-type
+    // eval, so a prompt split into several passes restores once, after its last pass).
+    void lend_restore_if_pending() { if (lend_restore_pending_ && vram_extra_) { lend_restore_pending_ = false; lend_restore(); } }
     uint64_t  tier_epoch() const { return tier_epoch_; }
     void      lend_begin();
     void      lend_end();
@@ -470,6 +476,11 @@ private:
     ggml_backend_buffer_t  vram_buf_ = nullptr;      // permanent part of the tier
     ggml_backend_buffer_t  vram_extra_ = nullptr;    // dynamic part, absent during a prefill
     size_t                 extra_bytes_ = 0;
+    // QWFN_LEND_RESTORE=1: per lent layer, the experts its VRAM tier held when a prefill borrowed it, hottest first;
+    // lend_end() reads them back into the tier (time budget QWFN_LEND_RESTORE_MS, default 3000).
+    std::vector<std::vector<uint16_t>> lend_saved_;
+    bool lend_restore_pending_ = false;
+    void lend_restore();
     uint64_t               tier_epoch_ = 0;
     ggml_context *         xfer_ctx_ = nullptr;
     ggml_tensor *          xfer_     = nullptr;   // scratch handle for H2D copies
