@@ -1,0 +1,54 @@
+From: Carlos Cabrera H. <6750732+ccabrerah@users.noreply.github.com>
+Subject: [PATCH 33] ggml-sycl: ggml_backend_sycl_init_side_queue, a backend on its own in-order queue
+
+Every ggml-sycl backend of a device runs on the device's one default queue, so a transfer queued from a second
+backend still waits behind the first one's kernels. The side backend gets its own in-order queue in the same SYCL
+context (device buffers shared); its set/get_tensor_async and synchronize() are independent of the default queue.
+For the engine's expert promotions: their copies run beside the layer's kernels instead of after them.
+
+diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
+index 418a7ba..3d62c95 100644
+--- a/ggml/include/ggml-sycl.h
++++ b/ggml/include/ggml-sycl.h
+@@ -20,6 +20,10 @@ extern "C" {
+ GGML_BACKEND_API ggml_backend_t ggml_backend_sycl_init(int device);
+ 
+ GGML_BACKEND_API bool ggml_backend_is_sycl(ggml_backend_t backend);
++// patch 33: a second backend on the same device whose stream is its own in-order queue (same SYCL context: device
++// buffers are shared). Its transfers and synchronize() neither wait for nor block `backend`'s queue; ordering against
++// it is the caller's job. Also reachable as the reg proc "ggml_backend_sycl_init_side_queue".
++GGML_BACKEND_API ggml_backend_t ggml_backend_sycl_init_side_queue(ggml_backend_t backend);
+ 
+ // devide buffer
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device);
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index ee4efff..8eefba3 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -7819,6 +7819,9 @@ static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, cons
+     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
+         return (void *)ggml_backend_sycl_split_buffer_type;
+     }
++    if (strcmp(name, "ggml_backend_sycl_init_side_queue") == 0) {   // patch 33
++        return (void *)ggml_backend_sycl_init_side_queue;
++    }
+ 
+     // Tensor parallelism (--split-mode tensor) entry points.
+     if (strcmp(name, "ggml_backend_comm_init") == 0) {
+@@ -7918,4 +7921,16 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
+     return sycl_backend;
+ }
+ 
++ggml_backend_t ggml_backend_sycl_init_side_queue(ggml_backend_t backend) {
++    if (!backend || !ggml_backend_is_sycl(backend)) return nullptr;
++    const int device = ((ggml_backend_sycl_context *) backend->context)->device;
++    ggml_backend_t side = ggml_backend_sycl_init(device);
++    if (!side) return nullptr;
++    ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *) side->context;
++    // stream 0 of this context: a new in-order queue of the device (dpct keeps it alive in its queue list); set
++    // before anything (the pool) binds to the default queue
++    ctx->qptrs[device][0] = new sycl::queue(dpct::get_device(device).create_in_order_queue());
++    return side;
++}
++
+ GGML_BACKEND_DL_IMPL(ggml_backend_sycl_reg)

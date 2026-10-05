@@ -141,6 +141,10 @@ public:
         bool iq4_soa = false;
         // And the q8_0 parts (GGML_TYPE_Q8_0_SOA, ggml-sycl patch 31): a 2-byte scale and 32 code bytes per block.
         bool q8_soa = false;
+        // QWFN_PROMOTE_SIDE: decode's promotion copies (upload, swap read-back, SOA reorder) on a second in-order
+        // queue of the device (ggml-sycl patch 33), beside the layer's kernels instead of after them. Off inside a
+        // lend (prefill, image): there the compute queue reads tier slots that promotions may overwrite.
+        bool promote_side = false;
         // Extra device bytes appended to the tier that the prefill streamer
         // borrows as its staging. During decode they hold expert slots like
         // the rest of the tier (the layers whose slots fall in that tail are
@@ -410,6 +414,14 @@ private:
     bool      q2_soa_ = false;
     bool      iq4_soa_ = false;
     bool      q8_soa_ = false;
+    // QWFN_PROMOTE_SIDE (patch 33): the side backend, whether promotions use it now (decode, outside lends), and
+    // whether copies were queued on it since the last settle.
+    ggml_backend_t side_be_   = nullptr;
+    bool           side_on_   = false;
+    bool           side_used_ = false;
+    ggml_backend_t promo_backend() { if (side_on_) { side_used_ = true; return side_be_; } return cfg_.vram_backend; }
+    void      lend_begin_impl();
+    void      lend_end_impl();
 
     int32_t  find_slot(layer_pool & lp, uint32_t expert_id) const;
     // Slots referenced by the fetch() call in progress. Every handle it has

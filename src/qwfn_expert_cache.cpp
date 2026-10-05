@@ -330,6 +330,17 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
                     fprintf(stderr, "[qwfn] expert VRAM tier: q8_0 parts as Q8_0_SOA %s\n",
                             q8_soa_ ? "(codes and scales in separate aligned arrays)" : "requested, but the backend does not support it: plain q8_0");
                 }
+                if (cfg.promote_side && cfg.vram_backend) {
+                    // patch 33: reached through the backend registry (the SYCL backend is loaded dynamically)
+                    ggml_backend_dev_t dev = ggml_backend_get_device(cfg.vram_backend);
+                    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                    using side_fn = ggml_backend_t (*)(ggml_backend_t);
+                    auto fn = reg ? (side_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_init_side_queue") : nullptr;
+                    side_be_ = fn ? fn(cfg.vram_backend) : nullptr;
+                    side_on_ = side_be_ != nullptr;
+                    fprintf(stderr, "[qwfn] expert promotions: %s\n", side_be_ ? "on a side queue (decode)" :
+                            "side queue requested, but the backend has none: on the compute queue");
+                }
                 fprintf(stderr, "[qwfn] expert VRAM tier: %.2f GB, %zu blocks (%.1f%%)%s\n",
                         (perm_bytes + ext_bytes) / 1e9, total_gslots_,
                         100.0 * (double) total_gslots_ / (double) (n_layer * hot->hp().n_expert),
@@ -502,6 +513,7 @@ void expert_cache::soa_to_file(const layer_pool & lp, uint8_t * slot) {
 
 void expert_cache::shutdown() {
     settle_promotions();   // copies still reading the arena must land before it goes
+    if (side_be_) { ggml_backend_free(side_be_); side_be_ = nullptr; side_on_ = false; }
     if (xfer_ctx_) { ggml_free(xfer_ctx_); xfer_ctx_ = nullptr; xfer_ = nullptr; }
     if (vram_buf_) { ggml_backend_buffer_free(vram_buf_); vram_buf_ = nullptr; }
     if (vram_extra_) { ggml_backend_buffer_free(vram_extra_); vram_extra_ = nullptr; }
@@ -756,6 +768,8 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
     // refilled by a disk read while the copy still read it -- is closed by
     // deferring the release to settle_promotions(), after a stream sync.
     last_promote_async_ = cfg_.async_promote && cfg_.vram_backend && arena_pinned_;
+    // QWFN_PROMOTE_SIDE: both copies on one queue (side or compute), so the read-back still lands before the upload
+    ggml_backend_t pb = last_promote_async_ ? promo_backend() : cfg_.vram_backend;
     // Exclusive tiers: the victim's device bytes are read into a free RAM slot (else the coldest resident's) on
     // the same in-order stream as the upload below, so the read lands before they are overwritten; the slot is
     // marked in flight (protected, not mapped) until settle_promotions() maps it and frees this expert's.
@@ -795,7 +809,7 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
                     xfer_->ne[0] = lp.g_part_bytes[q];
                     xfer_->nb[0] = 1;
                     xfer_->nb[1] = xfer_->nb[2] = xfer_->nb[3] = lp.g_part_bytes[q];
-                    ggml_backend_tensor_get_async(cfg_.vram_backend, xfer_, dst + lp.part_off[q] + lp.part_pay[q], 0, lp.g_part_bytes[q]);
+                    ggml_backend_tensor_get_async(pb, xfer_, dst + lp.part_off[q] + lp.part_pay[q], 0, lp.g_part_bytes[q]);
                     st_.bytes_d2h += lp.g_part_bytes[q];
                 }
             }
@@ -819,7 +833,7 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
         }
         xfer_->nb[1] = xfer_->nb[2] = xfer_->nb[3] = lp.g_part_bytes[q];
         const uint8_t * src = host_block + lp.part_off[q] + lp.part_pay[q];
-        if (last_promote_async_) ggml_backend_tensor_set_async(cfg_.vram_backend, xfer_, src, 0, lp.g_part_bytes[q]);
+        if (last_promote_async_) ggml_backend_tensor_set_async(pb, xfer_, src, 0, lp.g_part_bytes[q]);
         else                     ggml_backend_tensor_set(xfer_, src, 0, lp.g_part_bytes[q]);
         st_.bytes_h2d += lp.g_part_bytes[q];
     }
@@ -1307,9 +1321,10 @@ void expert_cache::vram_resident_parts(uint32_t layer, std::vector<vram_slice> &
 }
 
 void expert_cache::settle_promotions() {
-    if (pending_release_.empty() && pending_swaps_.empty()) return;
+    if (pending_release_.empty() && pending_swaps_.empty() && !side_used_) return;
     const auto t0 = std::chrono::steady_clock::now();
     if (cfg_.vram_backend) ggml_backend_synchronize(cfg_.vram_backend);
+    if (side_used_) { ggml_backend_synchronize(side_be_); side_used_ = false; }
     const auto t1 = std::chrono::steady_clock::now();
     // Exclusive tiers: the victims' bytes have landed in their RAM slots, the uploads are done.
     for (const pending_swap & sw : pending_swaps_) finish_swap(sw);
@@ -1330,7 +1345,21 @@ static bool lend_restore_on() {
     return on;
 }
 
+// QWFN_PROMOTE_SIDE: off for the whole lend (its prefill reads tier slots on the compute queue -- QWFN_PF_VRAM's
+// copies, the MoE -- while warm-ups promote into them), back on once lend_end()'s refill has landed.
 void expert_cache::lend_begin() {
+    settle_promotions();
+    side_on_ = false;
+    lend_begin_impl();
+}
+
+void expert_cache::lend_end() {
+    lend_end_impl();
+    settle_promotions();
+    side_on_ = side_be_ != nullptr;
+}
+
+void expert_cache::lend_begin_impl() {
     if (!vram_extra_) return;
     settle_promotions();   // copies still landing in those slots must finish first
     // QWFN_LEND_RESTORE: what the lent layers' tiers hold now, hottest first, read back before the next decode.
@@ -1365,7 +1394,7 @@ void expert_cache::lend_begin() {
     tier_epoch_++;
 }
 
-void expert_cache::lend_end() {
+void expert_cache::lend_end_impl() {
     if (!extra_bytes_ || vram_extra_) return;
     // A prefill just bumped the prompt's experts' counters (capped, but over
     // many ubatches); halve everything so the generation that follows can
