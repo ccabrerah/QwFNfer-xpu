@@ -12,6 +12,9 @@ In a nutshell:
 * Adds timesharing and supports quickly resuming multiple sessions as a mitigation for single prompt processing.
 * Incorporates optimizations coming from multiple inspirations from other engines and CUDA paths.
 
+**New here?** [`docs/BUILDING.md`](docs/BUILDING.md) (build the engine, download and prepare the model), then
+[`docs/RUNNING.md`](docs/RUNNING.md) (the command line, the knobs worth tuning, the power cap).
+
 ## Is it faster?
 
 There is no other way to use this GPU on other machines, so we are infinite% faster that the competition.

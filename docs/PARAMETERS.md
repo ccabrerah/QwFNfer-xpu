@@ -133,6 +133,7 @@ Extra arguments are appended to the server's command line (later values win).
 | `QWFN_MTP_DRAFT_VOCAB` | file | with MTP | Token ids the head may draft (a smaller LM head for the draft). |
 | `QWFN_NO_SPEC_L0` | 1 | with MTP | No layer-0 prefetch pass ahead of each step. |
 | `QWFN_MTP_SHARED_CELLS` | 1 | with MTP | The draft head attends over the cells the trunk's last attention layer selected for the same position (QSA), with that layer's mask, instead of densely over its whole cache. Drafts only; positions the last decode step did not cover stay dense. |
+| `QWFN_MTP_SHARED_CHAIN` | 1 / 0 | (1) | Chained drafts (`--mtp-drafts >= 2`) attend over the trunk's selected cells of the last committed position plus their own rows (host-built mask); 0 = dense. On by default with `QWFN_MTP_SHARED_CELLS`. |
 
 ### Drafting and prompt lookup (server)
 
@@ -140,6 +141,7 @@ Extra arguments are appended to the server's command line (later values win).
 |---|---|---|
 | `QWFN_DRAFT_COST` | 0.7 | Cost of one extra verify position relative to a one-token step, in the draft-length model. |
 | `QWFN_MTP_MIN_P` | 0 (off) | Confidence gate: draft only while the head's own probability is at least this. |
+| `QWFN_MTP_MIN_P2` | 0 (off) | With `--mtp-drafts >= 2`: a 2nd/3rd draft only while the head's probability is at least this (the first draft keeps `QWFN_MTP_MIN_P`). Not recommended: 2 drafts are slower than 1 on the B70 ([`RUNNING.md`](RUNNING.md)). |
 | `QWFN_MTP_ARGMAX_DRAFT` | off | At temperature > 0, draft the head's argmax instead of sampling it (A/B). |
 | `QWFN_LOOKUP_ENTER` | 12 | Prompt lookup: match length that switches a step into the lookup window. |
 | `QWFN_LOOKUP_PATIENCE` | 2 | Steps the lookup window may not pay before switching back. |
