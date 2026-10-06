@@ -168,3 +168,21 @@ Profile of a 20K prefill on this configuration: the MoE step is launch-bound -- 
 kernels, because every expert's rows of every chunk go through a separate dequantize -> convert -> gemm (~98K expert
 matmuls for 20K tokens). A grouped MoE kernel (one launch per layer and chunk) is the largest prefill lever left;
 promotions per layer per token stay at 2 (1 and 3 measured slower).
+
+## Expert-down mid tiers and Swift 1.5 (2026-10-06)
+
+Overlay v4 keeps expert down at IQ4_NL on 43 layers and Q8_0 on five. The mid tiers keep 4-bit down only where ISTA's
+GSQ-RCO IQ3_XXS search does (18 layers) and use the base Q2_0 elsewhere, so more experts fit in VRAM. Same engine and
+flags, 160 W, one server per arm. Replay NLL: a fixed 8K-token text, 128 replayed tokens.
+
+| Layout | Experts in VRAM | Short decode | Agent turns at ~55K | Replay NLL | Status |
+|---|---|---|---|---|---|
+| v4 | 48.9% | 40.0 tok/s | 32.5 tok/s | 1.76 | reference |
+| M2: IQ4_NL x13 + Q8_0 x5 + Q2_0 x30 | 59.5% | 44.1 (+10%) | 38.9 (+20%) | 2.09 | faster, large quality loss |
+| M1: IQ4_NL x18 + Q2_0 x30 | 61.0% | 46.2 (+15%) | 41.2 (+27%) | 2.01 | faster, large quality loss |
+
+Swift 1.5 (a fine-tune of the same model that targets shorter reasoning) runs unchanged on this engine with the
+original model's draft head (acceptance unchanged, ~0.66) and tokenizer (identical). In the same three layouts it was
+6-9% slower in short decode than the original weights (its routers are F32; not yet profiled). Thinking tokens on one
+drawing prompt at xhigh, three samples each: v4 layout 53K (original 47K), M2 18.7K (24.5K), M1 12.3K (24.6K).
+
