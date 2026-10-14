@@ -163,7 +163,6 @@ Extra arguments are appended to the server's command line (later values win).
 |---|---|
 | `QWFN_SYNC_PROMOTE` | Expert promotions to VRAM complete synchronously (default: asynchronous). |
 | `QWFN_VRAM_LRU` | VRAM tier replacement by pure recency (default: frequency with staleness). |
-| `QWFN_PROMOTE_T1` | Verify steps keep the one-token promotion budget. |
 | `QWFN_LATE_FULL` | Full-width late fold of experts promoted mid-step (default: `promote_per_layer` rows per position). |
 | `QWFN_PREFETCH_EARLY` | Submit the next layer's speculative reads before this layer's demand reads land (default: after). |
 | `QWFN_PREDICT_SHARED` / `QWFN_PREDICT_PLAIN` | Predict routing from the residual with the shared expert / the bare residual (A/B). |
@@ -186,7 +185,6 @@ Extra arguments are appended to the server's command line (later values win).
 | `QWFN_LEGACY_PREFILL_MOE` | The grouped prefill MoE instead of `mul_mat_id` on the device. |
 | `QWFN_LEGACY_QSA_DECODE` | The older one-token sparse attention graph. |
 | `QWFN_LEGACY_UPLOAD` | Prefill expert uploads on the default stream. |
-| `QWFN_QSA_CHAIN` / `QWFN_QSA_PROJ_EACH` / `QWFN_QSA_BATCH_EACH` | A verify step's attention as chained one-position calls / projections per call / norms and rope per position. |
 | `QWFN_HC_MEAN_T1_ONLY` / `QWFN_PACK_T1_ONLY` | Stream mean / output packing at one-token steps only. |
 | `QWFN_NO_FUSE` | No graph-level GPU fusions. |
 | `QWFN_NO_INPLACE` | No in-place writes of layer outputs. |

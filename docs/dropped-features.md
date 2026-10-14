@@ -84,3 +84,26 @@ launcher (`scripts/b70/qwfn-b70.sh`) turns on the adopted ones.
   -3%, still 11-20 experts per step not in VRAM after a turn.
 - **Why it failed:** `QWFN_LEND_RESTORE` (kept) solves the same problem better: after the prefill it reads the lent
   layers' former VRAM residents back (hottest first, a ~3 s budget, now pipelined), without costing short prompts.
+
+### `QWFN_PROMOTE_T1` -- the one-token promotion budget at MTP verify steps
+
+- **What it did:** at a verify step of T positions the engine allows `promote_per_layer x T` promotions per layer
+  (each position brings its own experts); this switch kept the one-token budget instead.
+- **Data:** a unitrace profile had shown the verify step's largest extra over a one-token step was expert uploads
+  (pinned host -> device: 155 per step at T=1, 270 at T=2, ~2.5x the copy time). With the one-token budget:
+  layer graphs 27.4-27.6 ms per step either way (null), CPU experts slightly up (essay 3.6 / 3.2 ms vs 2.4 / 2.2).
+- **Why it failed:** the extra uploads were not on the verify step's critical path; a smaller budget only moved
+  experts to the CPU. What actually makes an extra position expensive (~10 ms each on the later stack): the routed
+  MoE grows with the unique experts (+5.1 ms), dense Q8_0 +1.0, attention +0.6.
+
+### `QWFN_QSA_CHAIN`, `QWFN_QSA_PROJ_EACH`, `QWFN_QSA_BATCH_EACH` -- the verify step's attention, old shapes
+
+- **What they did:** restored earlier forms of the T-position (MTP verify) sparse attention: T chained one-position
+  calls (`CHAIN`), the q/k/v projections per call (`PROJ_EACH`), norms / rope / gate per position (`BATCH_EACH`).
+  The kept form computes the projections once for the T positions and then the whole step (cache writes, scoring,
+  top-k, masks) in one graph; the chained calls remain only as the structural fallback for a model without an
+  indexer.
+- **Data:** the one-graph form cut the T=2 attention graph from 155 to 126 kernels (T=1: 117) and the verify step's
+  layer graphs from ~28.0 to ~27.4 ms (~2%), with identical greedy answers and identical draft acceptance per request
+  across four starts. Tok/s differences were inside the I/O spread.
+- **Why dropped:** A/B hooks of an adopted change.

@@ -2366,18 +2366,12 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 qd_.pool_cache = pool_cache_[l];
                 if (sc_on_ && (int) l == sc_layer_) { gbx.sc_cells = sc_cells_; gbx.sc_mask = sc_mask_; gbx.sc_layer = (int) l; }
                 if (T == 1) return gbx.sparse_attn_decode(x, vpos(c), sections, (int) l, qd_);
-                // T positions as T chained calls: each reads through the writes of the ones before. The
-                // projections, which read no cache, run once for the T positions (QWFN_QSA_PROJ_EACH=1: per call).
-                static const bool proj_each = getenv("QWFN_QSA_PROJ_EACH") != nullptr;
-                static const bool batch_each = getenv("QWFN_QSA_BATCH_EACH") != nullptr;   // norms/rope/gate per position again
+                // The projections, which read no cache, run once for the T positions; then the whole step in one
+                // graph: cache writes, scoring, top-k and masks once for the T positions. Without an indexer
+                // (qi_n == 0) the T positions run as T chained calls, each reading through the writes before it.
                 graph_builder::qsa_chain ch;
-                graph_builder::qsa_proj pj;
-                if (!proj_each) pj = batch_each ? gbx.sparse_attn_decode_proj(x, (int) l)
-                                                : gbx.sparse_attn_decode_proj(x, (int) l, vpos(c), sections);
-                // The whole step in one graph: cache writes, scoring, top-k and masks once for the T positions
-                // (QWFN_QSA_CHAIN=1: the T chained one-position calls).
-                static const bool chain_each = getenv("QWFN_QSA_CHAIN") != nullptr;
-                if (pj.qi_n && !chain_each) {
+                graph_builder::qsa_proj pj = gbx.sparse_attn_decode_proj(x, (int) l, vpos(c), sections);
+                if (pj.qi_n) {
                     qsa_decode_inputs qT = qdT_;
                     qT.pool_cache = pool_cache_[l]; qT.n_bucket = qd_.n_bucket; qT.k_blocks = qd_.k_blocks;
                     ggml_tensor * outT = gbx.sparse_attn_decode_T(pj, qT, T, sections, (int) l);
@@ -2391,11 +2385,11 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     gbx.sc_col = k;
                     ggml_tensor * xk = ggml_view_2d(c, x, n_embd, 1, x->nb[1], (size_t) k * x->nb[1]);
                     ggml_tensor * ok = gbx.sparse_attn_decode(xk, ggml_view_1d(c, inp_pos_one_, 4, (size_t) k * 4 * sizeof(int32_t)), sections, (int) l, q, &ch,
-                                                              proj_each ? nullptr : &pj);
+                                                              &pj);
                     out = out ? ggml_concat(c, out, ok, 1) : ok;
                 }
                 if (pj.gate_sig) out = ggml_mul(c, out, pj.gate_sig);   // the T positions' gates at once
-                return proj_each ? out : gbx.sparse_attn_decode_out(out, (int) l);
+                return gbx.sparse_attn_decode_out(out, (int) l);
             };
 
             ggml_tensor * r = vres(c, cur_res);
@@ -3832,9 +3826,9 @@ const float * engine::eval_decode(const int32_t * hist, int32_t n_hist, int32_t 
     if (n_new >= 2 && cfg_.skip_miss) { err = "eval_decode: a verified step and --skip-miss do not combine"; return nullptr; }
     // A step of n positions looks up more experts per layer, so it may promote n times as many: each promotion is an
     // expert upload on the compute queue (a unitrace profile: 270 pinned-host uploads per verify step against 155 per
-    // token). Measured without effect on the step's time; QWFN_PROMOTE_T1=1 keeps the one-token budget for verify steps.
-    static const bool promote_t1 = getenv("QWFN_PROMOTE_T1") != nullptr;
-    ec_.set_max_promotions(cfg_.promote_per_layer * (promote_t1 ? 1u : (uint32_t) n_new));
+    // token). The one-token budget at verify steps was measured without effect on the step's time (dropped, see
+    // docs/dropped-features.md).
+    ec_.set_max_promotions(cfg_.promote_per_layer * (uint32_t) n_new);
     const bool ok = eval_batch(hist, n_hist, n_new, err, /*cache_batched=*/false, /*force_decode=*/true);
     ec_.set_max_promotions(cfg_.promote_per_layer);
     if (!ok) return nullptr;
