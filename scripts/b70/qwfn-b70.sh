@@ -30,6 +30,7 @@ export QWFN_LEND_RESTORE=1                                                      
 export QWFN_MTP_SHARED_CELLS=1                                                                       # the draft head attends over the trunk's selected cells (last attention layer), not its whole cache
 export QWFN_PF_VRAM=1                                                                                # a streamed prefill copies VRAM-resident experts on the device instead of reading them (needs patch 30)
 export QWFN_Q8_SOA=1                                                                                 # q8_0 experts in VRAM as Q8_0_SOA, their own one-token MoE matvec (patch 31)
+export QWFN_PROMOTE_D2D=1                                                         # a promotion's victim staged on device, its read-back on a side queue (patches 33+35): settle ~2.8 -> ~1.7 ms/token, placement identical
 export GGML_SYCL_IQ4_SOA_LPR=8 GGML_SYCL_Q2_LPR=8                                                    # 8 lanes per expert row: no idle lane on 20-/40-block rows (patches 17, 32)
 export GGML_SYCL_FUSE_SPARSE_PREFILL=1 GGML_SYCL_SPF_MIN_KV=45056                                    # long prompts: QSA attention gathered per query on DPAS past n_kv 45K (patch 25)
 export GGML_SYCL_DNNL_DETERMINISTIC=1 GGML_SYCL_TOPK_DETERMINISTIC=1                                 # bit-identical runs: oneDNN matmuls and the radix top-k without atomics (patches 26-27)

@@ -131,7 +131,7 @@ Extra arguments are appended to the server's command line (later values win).
 | `QWFN_PF_VRAM` | 1 | 1 | A streamed prefill takes the experts the VRAM tier holds from the tier (a device copy; ggml-sycl patch 30 converts the SOA layouts back) instead of reading them from disk and uploading them. Exact; device staging only. |
 | `QWFN_SWAP_MIN_EF` | N | | Exclusive tiers: do not read back victims used fewer than N times (measured slower; off). |
 | `QWFN_PROMOTE_SIDE` | 1 | | Decode's expert promotions (upload, swap read-back, SOA reorder) on a second in-order queue (ggml-sycl patch 33), beside the layer's kernels; off inside prefills and image lends. |
-| `QWFN_PROMOTE_D2D` | 1 | | Exclusive tiers: a promotion's victim is copied device-to-device into a 16-entry staging ring on the compute queue (before the upload overwrites its slot) and read back to its RAM slot on a side queue (patches 33 + 35), landing one layer later; placement is identical to off. The settle falls from ~2.8 to ~1.7 ms per token; wall clock ~1.5% at best. |
+| `QWFN_PROMOTE_D2D` | 1 | on | Exclusive tiers: a promotion's victim is copied device-to-device into a 16-entry staging ring on the compute queue (before the upload overwrites its slot) and read back to its RAM slot on a side queue (patches 33 + 35), landing one layer later; placement is identical to off. The settle falls from ~2.8 to ~1.7 ms per token; wall clock ~1.5% at best. |
 | `QWFN_MTP_EXPERTS_VRAM` | 1 | with MTP | The draft head's experts on the device (else in host memory, computed on the CPU). |
 | `QWFN_MTP_DRAFT_VOCAB` | file | with MTP | Token ids the head may draft (a smaller LM head for the draft). |
 | `QWFN_NO_SPEC_L0` | 1 | with MTP | No layer-0 prefetch pass ahead of each step. |
