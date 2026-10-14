@@ -131,6 +131,7 @@ Extra arguments are appended to the server's command line (later values win).
 | `QWFN_PF_VRAM` | 1 | 1 | A streamed prefill takes the experts the VRAM tier holds from the tier (a device copy; ggml-sycl patch 30 converts the SOA layouts back) instead of reading them from disk and uploading them. Exact; device staging only. |
 | `QWFN_SWAP_MIN_EF` | N | | Exclusive tiers: do not read back victims used fewer than N times (measured slower; off). |
 | `QWFN_PROMOTE_SIDE` | 1 | | Decode's expert promotions (upload, swap read-back, SOA reorder) on a second in-order queue (ggml-sycl patch 33), beside the layer's kernels; off inside prefills and image lends. |
+| `QWFN_PROMOTE_D2D` | 1 | | Exclusive tiers: a promotion's victim is copied device-to-device into a 16-entry staging ring on the compute queue (before the upload overwrites its slot) and read back to its RAM slot on a side queue (patches 33 + 35), landing one layer later; placement is identical to off. The settle falls from ~2.8 to ~1.7 ms per token; wall clock ~1.5% at best. |
 | `QWFN_MTP_EXPERTS_VRAM` | 1 | with MTP | The draft head's experts on the device (else in host memory, computed on the CPU). |
 | `QWFN_MTP_DRAFT_VOCAB` | file | with MTP | Token ids the head may draft (a smaller LM head for the draft). |
 | `QWFN_NO_SPEC_L0` | 1 | with MTP | No layer-0 prefetch pass ahead of each step. |
@@ -270,6 +271,7 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_Q8_SOA_LPR=16\|8\|4` | 31 | (8) | Q8_0_SOA one-token MoE matvec lanes per row (default: the widest with no idle lane). Patch 31 also adds the type, its conversions, dequantize and CPY. |
 | `GGML_SYCL_Q2_LPR=16\|8\|4` | 32 | 8 | Lanes per row of the one-token q2_0 MoE kernels (gate/up + SwiGLU fused, and the wide matvec); 8 on 40-block rows: -9% against 16. |
 | (no switch) | 33 | | `ggml_backend_sycl_init_side_queue`: a backend on its own in-order queue of the device (for `QWFN_PROMOTE_SIDE`). |
+| (no switch) | 35 | | `ggml_backend_sycl_copy_d2d_async`: a device-to-device copy queued on a backend's stream (for `QWFN_PROMOTE_D2D`). |
 
 ## 6. Upstream ggml and runtime variables the launcher sets
 

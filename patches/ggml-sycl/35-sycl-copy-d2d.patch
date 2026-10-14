@@ -1,0 +1,48 @@
+From: Carlos Cabrera H. <6750732+ccabrerah@users.noreply.github.com>
+Subject: [PATCH 35] ggml-sycl: ggml_backend_sycl_copy_d2d_async, a device-to-device copy on a backend's queue
+
+For the engine's expert promotions (QWFN_PROMOTE_D2D): the victim's bytes are copied aside on the compute queue
+(microseconds, in order before the upload overwrites the slot) and read back to the host from the staging copy on a side
+queue (patch 33), beside the next layer's kernels. Reachable as the reg proc "ggml_backend_sycl_copy_d2d_async".
+
+diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
+--- a/ggml/include/ggml-sycl.h
++++ b/ggml/include/ggml-sycl.h
+@@ -24,6 +24,9 @@
+ // buffers are shared). Its transfers and synchronize() neither wait for nor block `backend`'s queue; ordering against
+ // it is the caller's job. Also reachable as the reg proc "ggml_backend_sycl_init_side_queue".
+ GGML_BACKEND_API ggml_backend_t ggml_backend_sycl_init_side_queue(ggml_backend_t backend);
++// patch 35: queue a device-to-device copy of n bytes on `backend`'s stream (in order with its kernels and copies); both
++// pointers are device (USM) memory of that device. Also reachable as the reg proc "ggml_backend_sycl_copy_d2d_async".
++GGML_BACKEND_API void ggml_backend_sycl_copy_d2d_async(ggml_backend_t backend, void * dst, const void * src, size_t n);
+ 
+ // devide buffer
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device);
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -7822,6 +7822,9 @@
+     if (strcmp(name, "ggml_backend_sycl_init_side_queue") == 0) {   // patch 33
+         return (void *)ggml_backend_sycl_init_side_queue;
+     }
++    if (strcmp(name, "ggml_backend_sycl_copy_d2d_async") == 0) {   // patch 35
++        return (void *)ggml_backend_sycl_copy_d2d_async;
++    }
+ 
+     // Tensor parallelism (--split-mode tensor) entry points.
+     if (strcmp(name, "ggml_backend_comm_init") == 0) {
+@@ -7933,4 +7936,14 @@
+     return side;
+ }
+ 
++void ggml_backend_sycl_copy_d2d_async(ggml_backend_t backend, void * dst, const void * src, size_t n) try {
++    GGML_ASSERT(backend && ggml_backend_is_sycl(backend));
++    ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *) backend->context;
++    SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream(ctx->device, 0)->memcpy(dst, src, n)));
++}
++catch (sycl::exception const & exc) {
++    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
++    std::exit(1);
++}
++
+ GGML_BACKEND_DL_IMPL(ggml_backend_sycl_reg)

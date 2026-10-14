@@ -90,6 +90,7 @@ struct expert_cache_stats {
     // and the bytes the promotions moved each way.
     double   t_settle_sync = 0, t_settle_finish = 0;
     uint64_t bytes_h2d = 0, bytes_d2h = 0;
+    uint64_t d2d_swaps = 0, d2d_fallback = 0;   // QWFN_PROMOTE_D2D: read-backs staged through the ring / done in place (ring busy)
     uint64_t upgrades   = 0;    // cold blocks refetched at full precision on reuse
     uint64_t batch_lookups = 0, batch_misses = 0;   // prompt-batch experts served without admission, and the ones read for it
     // QWFN_LEND_RESTORE: after a streamed prefill, the lent layers' former VRAM residents read back from disk.
@@ -145,6 +146,11 @@ public:
         // queue of the device (ggml-sycl patch 33), beside the layer's kernels instead of after them. Off inside a
         // lend (prefill, image): there the compute queue reads tier slots that promotions may overwrite.
         bool promote_side = false;
+        // QWFN_PROMOTE_D2D (ggml-sycl patch 35, exclusive tiers): the victim's device bytes are copied device-to-device into
+        // a staging ring on the compute queue (microseconds) before the upload overwrites the slot, and read back to the
+        // RAM slot on a side queue beside the next layer's kernels, finished one layer later. The compute queue then
+        // carries only the upload; before, it carried a read-back and an upload per promotion.
+        bool promote_d2d = false;
         // Extra device bytes appended to the tier that the prefill streamer
         // borrows as its staging. During decode they hold expert slots like
         // the rest of the tier (the layers whose slots fall in that tail are
@@ -268,6 +274,12 @@ public:
     // and cannot be evicted, which is what makes the copy safe: nothing can
     // refill a block the copy engine may still be reading.
     void settle_promotions();
+    // QWFN_PROMOTE_D2D: the per-layer settle. The compute queue is synced (the uploads landed), the read-backs queued by
+    // this layer's promotions go to the side queue without waiting, and the previous layer's finish (they had a layer
+    // to land). Same as settle_promotions() when the mode is off.
+    void settle_promotions_layer();
+    // The mode switch (diagnostic alternation): a full settle, then on/off. No effect without the capability.
+    void set_d2d(bool on);
     bool arena_pinned() const { return arena_pinned_; }
     // Every valid, hot block of `layer` in the RAM tier, with its payload pointers.
     // Main thread only; the pointers hold while nothing admits into that layer.
@@ -420,6 +432,19 @@ private:
     bool           side_on_   = false;
     bool           side_used_ = false;
     ggml_backend_t promo_backend() { if (side_on_) { side_used_ = true; return side_be_; } return cfg_.vram_backend; }
+    // QWFN_PROMOTE_D2D (patch 35): the staging ring (device), its entries' state, and the copy entry point.
+    using d2d_fn = void (*)(ggml_backend_t, void *, const void *, size_t);
+    d2d_fn                 d2d_ = nullptr;
+    bool                   d2d_on_ = false;     // d2d_ is the capability, this the switch (set_d2d(): the A/B alternation)
+    ggml_backend_buffer_t  ring_buf_ = nullptr;
+    uint8_t *              ring_base_ = nullptr;
+    size_t                 ring_entry_ = 0;
+    std::vector<uint8_t>   ring_busy_;
+    uint32_t               ring_next_ = 0;
+    int32_t                ring_take();
+    void                   land_layer(uint32_t layer) { for (const pending_swap & sw : landing_) if (sw.layer == layer) { land_swaps(); return; } }   // before anything touches this layer's pool
+    void                   land_swaps();         // sync the side queue; free the ring entries of landing_ and run the diagnostic check
+    void                   issue_readbacks();   // queue the unissued ring read-backs on the side queue (the compute queue must be idle of their copies)
     void      lend_begin_impl();
     void      lend_end_impl();
 
@@ -484,13 +509,15 @@ private:
     std::vector<pending_rel> pending_release_;
     // Exclusive tiers: swaps waiting for the stream sync in settle_promotions(). from: the promoted expert's RAM
     // slot (freed); to: the slot the victim's bytes are landing in, or -1 (victim empty or dropped).
-    struct pending_swap { uint32_t layer; uint32_t promoted; int32_t from; uint16_t victim; int32_t to; };
+    struct pending_swap { uint32_t layer; uint32_t promoted; int32_t from; uint16_t victim; int32_t to; int32_t ring = -1; bool issued = false; bool mapped = false; };
     std::vector<pending_swap> pending_swaps_;
+    std::vector<pending_swap> landing_;   // ring swaps already mapped whose read-back is queued: the ring entry frees (and the check runs) once the side queue is synced
     bool                      exclusive_ = false;
     bool swaps_in(const layer_pool & lp) const { return exclusive_ && !(cfg_.exclusive_lent_inclusive && lp.g_in_lent); }
     void exclusive_split(uint32_t n_expert);        // re-split the arena by what each layer's VRAM tier does not hold
-    void finish_swap(const pending_swap & sw);      // after the sync: the RAM tier's map follows the bytes
+    void finish_swap(pending_swap & sw);          // after the sync: the RAM tier's map follows the bytes
     void release_slot(layer_pool & lp, int32_t s);
+    void check_swap(const pending_swap & sw);       // QWFN_SWAP_CHECK: the landed read-back against the file
     void to_file_layout(layer_pool & lp, uint32_t s);   // a block read back from VRAM, before a CPU use
     void soa_to_file(const layer_pool & lp, uint8_t * block);   // the device layout's parts -> the file's, in place
     std::vector<uint8_t> soa_scratch_;

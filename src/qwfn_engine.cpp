@@ -530,6 +530,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
     ec_cfg.iq4_soa = getenv("QWFN_IQ4_SOA") != nullptr; // and its iq4_nl experts (ggml-sycl patch 17)
     ec_cfg.q8_soa = getenv("QWFN_Q8_SOA") != nullptr;   // and its q8_0 experts (ggml-sycl patch 31)
     ec_cfg.promote_side = getenv("QWFN_PROMOTE_SIDE") != nullptr;   // decode's promotions on a side queue (patch 33)
+    ec_cfg.promote_d2d = getenv("QWFN_PROMOTE_D2D") != nullptr;     // victim read-backs staged on device, read back on a side queue (patch 35)
     // Exclusive tiers: RAM holds what VRAM does not (swaps on promotion); QWFN_RAM_LENT_INCLUSIVE=1 keeps the
     // prefill-lent layers inclusive.
     ec_cfg.exclusive = getenv("QWFN_RAM_EXCLUSIVE") != nullptr;
@@ -3101,7 +3102,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 if (t_rscale_) { const float one = 1.0f; ggml_backend_tensor_set(t_rscale_, &one, 0, 4); }
             }
             moe_gpu_settle();                      // t_pg_ is complete past this point
-            { const auto tsp = std::chrono::steady_clock::now(); ec_.settle_promotions(); t_settle_promo += std::chrono::duration<double>(std::chrono::steady_clock::now() - tsp).count(); }   // the async H2D copies too; frees their RAM slots
+            { const auto tsp = std::chrono::steady_clock::now(); ec_.settle_promotions_layer(); t_settle_promo += std::chrono::duration<double>(std::chrono::steady_clock::now() - tsp).count(); }   // the async H2D copies too; frees their RAM slots
             static const bool nan_check = getenv("QWFN_NAN_CHECK") != nullptr;
             if (nan_check) {   // diagnostic: where does a non-finite value first appear?
                 auto bad = [&](const float * v, size_t n) { for (size_t k = 0; k < n; k++) if (!std::isfinite(v[k])) return true; return false; };

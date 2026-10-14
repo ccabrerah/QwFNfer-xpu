@@ -326,6 +326,7 @@ public:
     void graph_buffer_bytes(size_t & a_bytes, int & a_graphs, size_t & m_bytes, int & m_graphs) const;
 
     const expert_cache_stats & cache_stats() const { return ec_.stats(); }
+    void set_promote_d2d(bool on) { ec_.set_d2d(on); }   // QWFN_PROMOTE_D2D on/off at run time (the A/B alternation in qwfn-gen)
     // CPU threads for the experts served from RAM (ggml's CPU backend), changeable
     // between evals: the console's auto-tune sweeps it on a running server.
     void set_n_threads(int n);

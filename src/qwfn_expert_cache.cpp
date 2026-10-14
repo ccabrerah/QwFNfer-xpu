@@ -330,14 +330,34 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
                     fprintf(stderr, "[qwfn] expert VRAM tier: q8_0 parts as Q8_0_SOA %s\n",
                             q8_soa_ ? "(codes and scales in separate aligned arrays)" : "requested, but the backend does not support it: plain q8_0");
                 }
-                if (cfg.promote_side && cfg.vram_backend) {
+                if ((cfg.promote_side || cfg.promote_d2d) && cfg.vram_backend) {
                     // patch 33: reached through the backend registry (the SYCL backend is loaded dynamically)
                     ggml_backend_dev_t dev = ggml_backend_get_device(cfg.vram_backend);
                     ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
                     using side_fn = ggml_backend_t (*)(ggml_backend_t);
                     auto fn = reg ? (side_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_init_side_queue") : nullptr;
                     side_be_ = fn ? fn(cfg.vram_backend) : nullptr;
-                    side_on_ = side_be_ != nullptr;
+                    // D2D mode: the uploads stay on the compute queue, the side queue only carries the read-backs
+                    side_on_ = side_be_ != nullptr && !cfg.promote_d2d;
+                    if (cfg.promote_d2d) {
+                        d2d_ = reg ? (d2d_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_copy_d2d_async") : nullptr;
+                        size_t ent = 0;
+                        for (uint32_t il = 0; il < n_layer; il++) {
+                            size_t b = 0;
+                            for (int q = 0; q < EXPERT_NPARTS; q++) b += (blk_[il].g_part_bytes[q] + 255) & ~(size_t) 255;
+                            ent = std::max(ent, b);
+                        }
+                        const uint32_t ring_n = 16;
+                        if (side_be_ && d2d_ && ent) ring_buf_ = ggml_backend_buft_alloc_buffer(cfg.vram_buft, ent * ring_n + 256);
+                        if (ring_buf_) {
+                            ring_base_ = (uint8_t *) ggml_backend_buffer_get_base(ring_buf_);
+                            ring_entry_ = ent; ring_busy_.assign(ring_n, 0);
+                        } else d2d_ = nullptr;
+                        d2d_on_ = d2d_ != nullptr;
+                        fprintf(stderr, "[qwfn] expert promotions: %s\n", d2d_ ?
+                                "victim read-backs staged on device and read back on a side queue (QWFN_PROMOTE_D2D)" :
+                                "D2D requested, but the backend lacks patch 33/35 or the ring did not fit: unchanged");
+                    } else
                     fprintf(stderr, "[qwfn] expert promotions: %s\n", side_be_ ? "on a side queue (decode)" :
                             "side queue requested, but the backend has none: on the compute queue");
                 }
@@ -437,7 +457,7 @@ void expert_cache::release_slot(layer_pool & lp, int32_t s) {
     if (lp.free_slots.size() < lp.n_slots) lp.free_slots.push_back(s);   // stale entries are skipped when popped
 }
 
-void expert_cache::finish_swap(const pending_swap & sw) {
+void expert_cache::finish_swap(pending_swap & sw) {
     layer_pool & lp = blk_[sw.layer];
     auto in_vram = [&](uint32_t e) {
         const int32_t g = lp.g_expert_slot[e];
@@ -451,8 +471,10 @@ void expert_cache::finish_swap(const pending_swap & sw) {
     if (sw.to < 0) return;
     // The victim's bytes have landed in sw.to (marked in flight: slot_expert = victim, slot_valid = 0, not mapped).
     const uint16_t v = sw.victim;
-    if (lp.slot_expert[sw.to] != v || lp.slot_valid[sw.to]) { st_.swap_dropped++; return; }   // cannot happen: protected
-    if (lp.expert_slot[v] >= 0 || in_vram(v)) { st_.swap_dropped++; release_slot(lp, sw.to); return; }
+    // a dropped swap queues no read-back (QWFN_PROMOTE_D2D): its staged copy is not needed, and its RAM slot is free again
+    auto drop = [&] { if (sw.ring >= 0) { ring_busy_[sw.ring] = 0; sw.ring = -1; } };
+    if (lp.slot_expert[sw.to] != v || lp.slot_valid[sw.to]) { st_.swap_dropped++; drop(); return; }   // cannot happen: protected
+    if (lp.expert_slot[v] >= 0 || in_vram(v)) { st_.swap_dropped++; drop(); release_slot(lp, sw.to); return; }
     lp.expert_slot[v]       = sw.to;
     lp.slot_valid[sw.to]    = 1;
     lp.slot_cold[sw.to]     = 0;
@@ -461,9 +483,16 @@ void expert_cache::finish_swap(const pending_swap & sw) {
     lp.slot_freq[sw.to]     = std::max<uint32_t>(1, lp.ef[v]);
     lp.slot_used[sw.to]     = ++tick_;
     st_.swaps++;
-    // QWFN_SWAP_CHECK=1 (diagnostic): the read-back block, in the file's layout, against the file.
+    sw.mapped = true;
+}
+
+// QWFN_SWAP_CHECK=1 (diagnostic): the read-back block, in the file's layout, against the file. Run once the bytes have
+// landed (the slot is untouched between the mapping and then: nothing reads or refills a layer's pool before its next fetch).
+void expert_cache::check_swap(const pending_swap & sw) {
     static const bool check = getenv("QWFN_SWAP_CHECK") != nullptr;
-    if (check) {
+    if (check && sw.mapped) {
+        layer_pool & lp = blk_[sw.layer];
+        const uint16_t v = sw.victim;
         static std::vector<int> fds;
         static uint64_t checked = 0, bad = 0;
         const auto & paths = hot_->shard_paths();
@@ -514,6 +543,8 @@ void expert_cache::soa_to_file(const layer_pool & lp, uint8_t * slot) {
 void expert_cache::shutdown() {
     settle_promotions();   // copies still reading the arena must land before it goes
     if (side_be_) { ggml_backend_free(side_be_); side_be_ = nullptr; side_on_ = false; }
+    d2d_ = nullptr; d2d_on_ = false; landing_.clear();
+    if (ring_buf_) { ggml_backend_buffer_free(ring_buf_); ring_buf_ = nullptr; ring_base_ = nullptr; }
     if (xfer_ctx_) { ggml_free(xfer_ctx_); xfer_ctx_ = nullptr; xfer_ = nullptr; }
     if (vram_buf_) { ggml_backend_buffer_free(vram_buf_); vram_buf_ = nullptr; }
     if (vram_extra_) { ggml_backend_buffer_free(vram_extra_); vram_extra_ = nullptr; }
@@ -775,7 +806,7 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
     // marked in flight (protected, not mapped) until settle_promotions() maps it and frees this expert's.
     if (swaps_in(lp) && last_promote_async_) {
         const uint32_t layer = (uint32_t) (&lp - blk_.data());
-        int32_t to = -1;
+        int32_t to = -1, ring = -1;
         const bool cold_victim = victim_expert != SLOT_EMPTY && cfg_.swap_min_ef > 0 && lp.ef[victim_expert] < cfg_.swap_min_ef;
         if (cold_victim) st_.swap_cold++;
         if (victim_expert != SLOT_EMPTY && !cold_victim && !(lp.g_cold.size() > (size_t) victim && lp.g_cold[victim])) {
@@ -802,6 +833,18 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
                 lp.slot_speculative[to] = 0;
                 lp.slot_soa[to]    = 0;
                 uint8_t * dst = slot_ptr(lp, (uint32_t) to);
+                ring = d2d_on_ ? ring_take() : -1;
+                if (ring >= 0) {
+                    // QWFN_PROMOTE_D2D: the victim's bytes go to the staging ring, in order before the upload below
+                    // overwrites the slot; the read-back to the RAM slot is queued at the layer's settle
+                    size_t ro = (size_t) ring * ring_entry_;
+                    for (int q = 0; q < EXPERT_NPARTS; q++) {
+                        d2d_(pb, ring_base_ + ro, lp.g_part[q] + (size_t) victim * lp.g_part_bytes[q], lp.g_part_bytes[q]);
+                        ro += (lp.g_part_bytes[q] + 255) & ~(size_t) 255;
+                    }
+                    st_.d2d_swaps++;
+                } else {
+                    if (d2d_on_) st_.d2d_fallback++;
                 xfer_->buffer = lp.g_buf;
                 for (int q = 0; q < EXPERT_NPARTS; q++) {
                     xfer_->data  = lp.g_part[q] + (size_t) victim * lp.g_part_bytes[q];
@@ -812,9 +855,10 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
                     ggml_backend_tensor_get_async(pb, xfer_, dst + lp.part_off[q] + lp.part_pay[q], 0, lp.g_part_bytes[q]);
                     st_.bytes_d2h += lp.g_part_bytes[q];
                 }
+                }
             }
         }
-        pending_swaps_.push_back(pending_swap{ layer, expert_id, ram_slot, victim_expert, to });
+        { pending_swap ps{ layer, expert_id, ram_slot, victim_expert, to }; ps.ring = ring; pending_swaps_.push_back(ps); }
     }
     xfer_->buffer = lp.g_buf;
     for (int q = 0; q < EXPERT_NPARTS; q++) {
@@ -865,6 +909,7 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
     // fetch_end(), after the demand reads have been submitted, so the caller
     // can compute the experts it already has while both kinds of read land.
     // In-flight slots are never chosen as victims.
+    land_layer(layer);   // QWFN_PROMOTE_D2D: a layer's pending read-backs land before its pool is used again
     layer_pool & lp = blk_[layer];
     tick_++;
     fetch_epoch_ = tick_;
@@ -1122,6 +1167,7 @@ bool expert_cache::read_block_now(layer_pool & lp, uint32_t layer, int32_t slot,
 bool expert_cache::fetch_batch(uint32_t layer, const uint32_t * expert_ids, uint32_t n, expert_handle * out,
                                uint8_t * bounce, size_t bounce_bytes) {
     if (layer >= blk_.size()) return false;
+    land_layer(layer);
     layer_pool & lp = blk_[layer];
     if (!bounce || bounce_bytes < (size_t) n * lp.block_bytes) return false;
     std::vector<io_request> reqs; reqs.reserve((size_t) n * EXPERT_NPARTS);
@@ -1236,6 +1282,7 @@ bool expert_cache::fetch_end() {
 
 void expert_cache::prefetch(uint32_t layer, const uint32_t * expert_ids, uint32_t n) {
     if (layer >= blk_.size()) return;
+    land_layer(layer);
     layer_pool & lp = blk_[layer];
     io_request reqs[64 * EXPERT_NPARTS];
     std::vector<int32_t> claimed;
@@ -1320,15 +1367,24 @@ void expert_cache::vram_resident_parts(uint32_t layer, std::vector<vram_slice> &
     }
 }
 
+void expert_cache::land_swaps() {
+    if (side_be_ && side_used_) { ggml_backend_synchronize(side_be_); side_used_ = false; }
+    for (const pending_swap & sw : landing_) { if (sw.ring >= 0) ring_busy_[sw.ring] = 0; check_swap(sw); }
+    landing_.clear();
+}
+
 void expert_cache::settle_promotions() {
-    if (pending_release_.empty() && pending_swaps_.empty() && !side_used_) return;
+    if (pending_release_.empty() && pending_swaps_.empty() && landing_.empty() && !side_used_) return;
     const auto t0 = std::chrono::steady_clock::now();
     if (cfg_.vram_backend) ggml_backend_synchronize(cfg_.vram_backend);
-    if (side_used_) { ggml_backend_synchronize(side_be_); side_used_ = false; }
     const auto t1 = std::chrono::steady_clock::now();
-    // Exclusive tiers: the victims' bytes have landed in their RAM slots, the uploads are done.
-    for (const pending_swap & sw : pending_swaps_) finish_swap(sw);
+    // Exclusive tiers: the uploads are done; the victims' bytes land in their RAM slots (QWFN_PROMOTE_D2D: queued from
+    // the staging ring now, waited for in land_swaps()). The map follows the bytes.
+    for (pending_swap & sw : pending_swaps_) finish_swap(sw);
+    issue_readbacks();
+    for (const pending_swap & sw : pending_swaps_) { if (sw.ring >= 0) landing_.push_back(sw); else check_swap(sw); }
     pending_swaps_.clear();
+    land_swaps();
     st_.t_settle_sync   += std::chrono::duration<double>(t1 - t0).count();
     st_.t_settle_finish += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     // The RAM copy stays. With recency-based VRAM eviction a promoted expert
@@ -1338,6 +1394,61 @@ void expert_cache::settle_promotions() {
     // on its own; while it lives it is a fallback. Only the eviction
     // protection is lifted here.
     pending_release_.clear();
+}
+
+int32_t expert_cache::ring_take() {
+    for (size_t k = 0; k < ring_busy_.size(); k++) {
+        const size_t i = (ring_next_ + k) % ring_busy_.size();
+        if (!ring_busy_[i]) { ring_busy_[i] = 1; ring_next_ = (uint32_t) (i + 1); return (int32_t) i; }
+    }
+    return -1;
+}
+
+void expert_cache::issue_readbacks() {
+    if (!d2d_) return;
+    for (pending_swap & sw : pending_swaps_) {
+        if (sw.ring < 0 || sw.issued) continue;
+        layer_pool & lp = blk_[sw.layer];
+        uint8_t * dst = slot_ptr(lp, (uint32_t) sw.to);
+        size_t ro = (size_t) sw.ring * ring_entry_;
+        xfer_->buffer = ring_buf_;
+        for (int q = 0; q < EXPERT_NPARTS; q++) {
+            xfer_->data  = ring_base_ + ro;
+            xfer_->type  = GGML_TYPE_I8;   // raw device bytes; to_file_layout() before a CPU use
+            xfer_->ne[0] = lp.g_part_bytes[q];
+            xfer_->nb[0] = 1;
+            xfer_->nb[1] = xfer_->nb[2] = xfer_->nb[3] = lp.g_part_bytes[q];
+            ggml_backend_tensor_get_async(side_be_, xfer_, dst + lp.part_off[q] + lp.part_pay[q], 0, lp.g_part_bytes[q]);
+            st_.bytes_d2h += lp.g_part_bytes[q];
+            ro += (lp.g_part_bytes[q] + 255) & ~(size_t) 255;
+        }
+        sw.issued = true;
+        side_used_ = true;
+    }
+}
+
+void expert_cache::set_d2d(bool on) {
+    settle_promotions();
+    d2d_on_ = on && d2d_ != nullptr;
+}
+
+void expert_cache::settle_promotions_layer() {
+    if (!d2d_on_) { settle_promotions(); return; }
+    if (pending_release_.empty() && pending_swaps_.empty() && landing_.empty()) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    ggml_backend_synchronize(cfg_.vram_backend);   // the uploads and the staging copies have landed
+    pending_release_.clear();
+    // the read-backs queued at the previous layer's settle have had a layer to land: free their ring entries
+    if (!landing_.empty()) land_swaps();
+    const auto t1 = std::chrono::steady_clock::now();
+    // the metadata exactly as the full settle does it, now (placement is the same as without the mode): the staged
+    // bytes are not in their RAM slot yet, but nothing reads or refills this layer's pool before its next fetch
+    for (pending_swap & sw : pending_swaps_) finish_swap(sw);
+    issue_readbacks();   // queued, not waited for
+    for (const pending_swap & sw : pending_swaps_) { if (sw.ring >= 0) landing_.push_back(sw); else check_swap(sw); }
+    pending_swaps_.clear();
+    st_.t_settle_sync   += std::chrono::duration<double>(t1 - t0).count();
+    st_.t_settle_finish += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 }
 
 static bool lend_restore_on() {
@@ -1356,7 +1467,7 @@ void expert_cache::lend_begin() {
 void expert_cache::lend_end() {
     lend_end_impl();
     settle_promotions();
-    side_on_ = side_be_ != nullptr;
+    side_on_ = side_be_ != nullptr && !cfg_.promote_d2d;
 }
 
 void expert_cache::lend_begin_impl() {
@@ -1504,6 +1615,7 @@ void expert_cache::lend_restore() {
 
 void expert_cache::warm(uint32_t layer, const warm_item * items, uint32_t n, uint32_t n_vram) {
     if (layer >= blk_.size() || n == 0) return;
+    land_layer(layer);
     const auto t0 = std::chrono::steady_clock::now();
     layer_pool & lp = blk_[layer];
     live_.clear();
@@ -1688,6 +1800,7 @@ void expert_cache::prefetch_begin(const pf_set * sets, uint32_t n_sets) {
     size_t n_req = 0;
 
     for (uint32_t s = 0; s < n_sets; s++) {
+        land_layer(sets[s].layer);
         const uint32_t layer = sets[s].layer;
         if (layer >= blk_.size()) continue;
         layer_pool & lp = blk_[layer];
