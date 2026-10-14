@@ -4,11 +4,10 @@ Subject: [PATCH 31] ggml-sycl: Q8_0_SOA, a q8_0 expert layout and its one-token 
 The SOA layout of patches 09 / 17 ([codes][scales] per 2-D slice, codes 16-byte aligned) for q8_0: 32 code bytes and
 a 2-byte scale per block. The one-token MoE matvec takes 16-byte half blocks, LPR lanes per row (8 for rows of 20
 blocks: no idle lane), four sub-groups per work-group; the stock kernel runs one 16-lane work-group per row and reads
-a q8_0 expert-down at ~85 GB/s. GGML_SYCL_Q8_SOA_LPR=16|8|4 forces the lanes per row. Also: the upload / read-back
+a q8_0 expert-down at ~85 GB/s. Also: the upload / read-back
 conversions take the block size (18 or 34 bytes), a dequantize for the multi-token path, and patch 30's CPY back to
 the file's blocks for Q8_0_SOA.
 
-diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 2e066fd..39fe2cb 100644
 --- a/ggml/include/ggml.h
@@ -90,7 +89,7 @@ index 3176a21..00b480a 100644
                  (src0->type == GGML_TYPE_IQ4_NL_SOA && src1->type == GGML_TYPE_IQ4_NL)) &&
                 ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index eeba3ab..ee4efff 100644
+index e64cdbd..67f420a 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -934,41 +934,59 @@ catch (sycl::exception const &exc) {
@@ -188,7 +187,7 @@ index eeba3ab..ee4efff 100644
          SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(data, tmp, size).wait()));
          sycl::free(tmp, *stream);
          return;
-@@ -6330,7 +6348,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
+@@ -6329,7 +6347,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
          GGML_ASSERT(q2_0_soa_geometry(tensor, offset, size, bps, nslices) && "Q2_0_SOA: whole packed slices only");
          ggml_sycl_pool_alloc<uint8_t> tmp(sycl_ctx->pool(), size);
          SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tmp.get(), data, size)));
@@ -198,10 +197,10 @@ index eeba3ab..ee4efff 100644
      }
      SYCL_CHECK(CHECK_TRY_ERROR(
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
-index 69dd1ec..e83d5a0 100644
+index 75b4396..bb6cacd 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -3187,6 +3187,87 @@ static void launch_mul_mat_vec_iq4_nl_soa_moe(
+@@ -3157,6 +3157,86 @@ static void launch_mul_mat_vec_iq4_nl_soa_moe(
      else                           go(std::integral_constant<int, WARP_SIZE / 4>{});
  }
  
@@ -262,10 +261,9 @@ index 69dd1ec..e83d5a0 100644
 +    const size_t src1_row_stride, dpct::queue_ptr stream) {
 +    const int chunks = 2 * (ncols / QK8_0);
 +    constexpr int SG_PER_WG = 4;
-+    // GGML_SYCL_Q8_SOA_LPR=16|8|4 forces the lanes per row (tuning); otherwise the widest that leaves no lane idle
++    // lanes per row: the widest that leaves no lane idle
 +    // on the last step, else 16
-+    static const int lpr_env = [] { const char * e = getenv("GGML_SYCL_Q8_SOA_LPR"); return e ? atoi(e) : 0; }();
-+    const int lpr = lpr_env ? lpr_env : chunks % WARP_SIZE == 0 ? WARP_SIZE : chunks % (WARP_SIZE / 2) == 0 ? WARP_SIZE / 2
++    const int lpr = chunks % WARP_SIZE == 0 ? WARP_SIZE : chunks % (WARP_SIZE / 2) == 0 ? WARP_SIZE / 2
 +                                      : chunks % (WARP_SIZE / 4) == 0 ? WARP_SIZE / 4 : WARP_SIZE;
 +    auto go = [&](auto lpr_tag) {
 +        constexpr int LPR = decltype(lpr_tag)::value;
@@ -289,7 +287,7 @@ index 69dd1ec..e83d5a0 100644
  static bool ggml_sycl_moe_q2w_enabled() {
      static const bool v = [] { const char * e = getenv("GGML_SYCL_MOE_Q2W"); return e && atoi(e) != 0; }();
      return v;
-@@ -3315,6 +3396,12 @@ bool ggml_sycl_mul_mat_vec_q_id(
+@@ -3285,6 +3365,12 @@ bool ggml_sycl_mul_mat_vec_q_id(
                  vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                  expert_weight_stride, dst_row_stride, src1_row_stride, stream);
              return true;

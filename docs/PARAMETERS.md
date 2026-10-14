@@ -241,7 +241,6 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_MMVW=1` | 05, 22 | 1 | Wide-load bf16/f16 matvec for 1-4 tokens. |
 | `GGML_SYCL_SMALLK=1` | 05, 22 | 1 | Small-K f32 matmul without oneMKL's per-call cost. |
 | `GGML_SYCL_MOE_Q2W=1` | 07, 08, 22 | 1 | q2_0 MoE matvec, a 64-weight block per lane; with it the fused gate+up+SwiGLU. |
-| `GGML_SYCL_MOE_GLU_OFF=1` | 08 | | Disable the fused MoE GLU (A/B). |
 | `GGML_SYCL_FUSE_SPARSE_DECODE=1` | 10 | 1 | One-token sparse attention straight from the q8_0 cache. |
 | `GGML_SYCL_TOPK_DIV_OUT=0` | 12 | | The router fusion's older match (default on). |
 | `GGML_SYCL_TOPK_WG=1` | 13 | 1 | Work-group-wide top-k for the router and the predictor. |
@@ -251,7 +250,6 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_FUSE_CONV=1` | 15 | 1 | One-token DeltaNet conv as one kernel. |
 | `GGML_SYCL_FUSE_IDX=1` | 16 | 1 | Prefill indexer per-head score sum as one kernel (bit-identical). |
 | `GGML_SYCL_IQ4_SOA_LPR=16\|8\|4` | 17 | 8 | Force the IQ4_NL_SOA matvec's lanes per row. 8 on this model's 20-block expert-down rows: -17% against the default 16. |
-| `GGML_SYCL_IQ4_SOA_LUT=mode` | 17 | | IQ4_NL_SOA lookup mode (1, default: a 256-entry table in local memory). |
 | `GGML_SYCL_Q8W=1` | 18 | 1 | One-token Q8_0 matvec, a whole block per lane. |
 | `GGML_SYCL_Q8_REUSE=1` | 19 | 1 | Reuse a one-token q8_1 activation across matmuls sharing their input. |
 | `GGML_SYCL_Q8_DIRECT=1` | 20 | 1 | One-token Q8_0 MUL_MAT dispatched straight to its kernel. |
@@ -265,7 +263,7 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_TOPK_DETERMINISTIC=1` | 27 | 1 | Radix top-k emits in column order, ties to the lowest index, no atomics (the QSA indexer's block selection reproducible). With 26: bit-identical runs. |
 | `GGML_SYCL_Q8W_NCOLS=1` | 28 | 1 | 2-4-column Q8_0 matvecs (the MTP verify step) through patch 18's wide kernel, each weight block loaded once for all columns; needs `GGML_SYCL_Q8W`. A column's result equals the one-column kernel's. |
 | (no switch) | 30 | | CPY from Q2_0_SOA / IQ4_NL_SOA to the canonical blocks (used by `QWFN_PF_VRAM`). Patch 29 was tried and is not in the series. |
-| `GGML_SYCL_Q8_SOA_LPR=16\|8\|4` | 31 | (8) | Q8_0_SOA one-token MoE matvec lanes per row (default: the widest with no idle lane). Patch 31 also adds the type, its conversions, dequantize and CPY. |
+| (no switch) | 31 | | Q8_0_SOA: the type, its conversions, dequantize and CPY, and the one-token MoE matvec (8 lanes per row for the 20-block expert-down rows: the widest with no idle lane). |
 | `GGML_SYCL_Q2_LPR=16\|8\|4` | 32 | 8 | Lanes per row of the one-token q2_0 MoE kernels (gate/up + SwiGLU fused, and the wide matvec); 8 on 40-block rows: -9% against 16. |
 | (no switch) | 33 | | `ggml_backend_sycl_init_side_queue`: a backend on its own in-order queue of the device (the side queue `QWFN_PROMOTE_D2D` reads back on). |
 | (no switch) | 35 | | `ggml_backend_sycl_copy_d2d_async`: a device-to-device copy queued on a backend's stream (for `QWFN_PROMOTE_D2D`). |

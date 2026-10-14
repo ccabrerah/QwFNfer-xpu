@@ -107,3 +107,52 @@ launcher (`scripts/b70/qwfn-b70.sh`) turns on the adopted ones.
   layer graphs from ~28.0 to ~27.4 ms (~2%), with identical greedy answers and identical draft acceptance per request
   across four starts. Tok/s differences were inside the I/O spread.
 - **Why dropped:** A/B hooks of an adopted change.
+
+## ggml-sycl patches and backend switches
+
+### Patch 34, `GGML_SYCL_Q8_PROD` -- q8_1 quantization fused into the producer
+
+- **What it did:** a one-token producer (UNARY silu / sigmoid / softplus + MUL, or GLU swiglu) whose f32 output is
+  read next, as src1, by a direct-path Q8_0 matvec (patch 20) also wrote that tensor's q8_1 reorder-SoA copy into
+  patch 19's reuse cache, so the standalone `quantize_row_q8_1` launch disappeared (~96 of ~579 quantize launches
+  per token; 3,840 replaced in a 64-token traced run).
+- **Data:** bit-exact (replay NLL identical in 8 of 8 A-B-B-A arms, `test-backend-ops` 10/10 for its own cases
+  including an in-place overwrite between the two matvecs, MUL_MAT q8_0 43/43). Decode 18.73 / 18.46 / 18.12 tok/s
+  off vs 18.71 / 18.61 / 18.31 on (+0.5% +-1.5%); layer-graph GPU time 11.8-12.7 s either way. A review found a
+  stale-cache bug (buffer re-allocation while the producer declined) that a revival must keep fixed.
+- **Why it failed:** a removed kernel boundary is worth less than ~2 us here (expected ~4 us). It was step 1 of
+  "fuse more of the layer chain"; the result also capped what a full megakernel could buy: at ~1-2 us per boundary,
+  removing all ~3,400 boundaries per token is ~3-7 ms of a ~23-33 ms token (~10-20%), not the 1.4x first estimated.
+- **Related measurements (no code kept):** a persistent kernel with a grid-wide barrier keeps full bandwidth
+  (570-585 GB/s at >= 32 groups x 1024 or 128 x 256; barrier ~0.9 us vs ~1.3 us per queued kernel boundary); two
+  in-order queues, an out-of-order queue with events, and Vulkan's separate compute-only queue family all failed to
+  overlap a chain of small kernels with a big one (a fork + join costs ~6 us).
+
+### `GGML_SYCL_IQ4_SOA_LUT=0` (patch 17) -- byte-permute lookup in the IQ4_NL_SOA matvec
+
+- **What it did:** decoded IQ4_NL codes with `dpct::byte_level_permute` on the 16-entry table held in four registers
+  (the stock kernel's method) instead of patch 17's 256-entry table in local memory (code byte -> both nibbles'
+  values, built per work-group).
+- **Data** (us per matmul, 640 x 2560, 10 experts): stock IQ4_NL 83.8 (110 GB/s); SOA + byte-permute 84.9 (109 GB/s);
+  **SOA + local-memory table 30.4 (303 GB/s)**; SOA without any lookup (a ceiling, wrong results) 19.1 (483 GB/s).
+- **Why it failed:** `byte_level_permute` is written with 64-bit variable shifts that this GPU emulates: ALU-bound.
+- **Related, also measured:** the IQ4 kernel later runs at ~600 GB/s effective in decode (~15.5 us per call); its
+  sub-groups per work-group (4 / 8 / 16 / 32 -> 15.7 / 15.5 / 16.1 / 16.9 us) change nothing, so the per-work-group
+  table build is not a bottleneck. Lanes per row matter (rows of 20 blocks): `GGML_SYCL_IQ4_SOA_LPR` 16 / 8 / 4 ->
+  1.65 / 1.36 / 1.30 ms per plain step, 3.58 / 2.96 / 3.01 at one draft (8 kept, in the launcher).
+
+### `GGML_SYCL_MOE_GLU_OFF` (patch 08) -- turn off the fused q2_0 MoE GLU
+
+- **What it did:** an A/B hook that disabled patch 08's fusion (one q8_1 quantization and one kernel for the q2_0
+  experts' gate + up + SwiGLU at one token, instead of quantize, quantize, matvec, matvec, GLU).
+- **Data on the fusion it switched off:** layer graphs 30.96 / 30.95 -> 30.04 / 30.04 ms per token, decode 28.2 ->
+  28.9 tok/s; `test-backend-ops` MUL_MAT_VEC_FUSION 1265/1265, MUL_MAT_ID 913/913; replay NLL within run noise.
+- **Why dropped:** A/B hook of an adopted change; the fusion itself stays behind `GGML_SYCL_MOE_Q2W`.
+
+### `GGML_SYCL_Q8_SOA_LPR` (patch 31) -- lanes per row of the Q8_0_SOA matvec
+
+- **What it did:** forced 16 / 8 / 4 lanes per row in patch 31's one-token Q8_0_SOA MoE matvec.
+- **Data:** the default (the widest that leaves no lane idle: 8 for the 20-block expert-down rows) took the Q8_0
+  expert-down from 2.17 ms per step (stock kernel, ~85 GB/s) to 0.33 + 0.47 ms (SOA + the staged stock remainder);
+  no other value was ever better.
+- **Why dropped:** a tuning knob nobody set.
