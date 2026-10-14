@@ -156,3 +156,29 @@ launcher (`scripts/b70/qwfn-b70.sh`) turns on the adopted ones.
   expert-down from 2.17 ms per step (stock kernel, ~85 GB/s) to 0.33 + 0.47 ms (SOA + the staged stock remainder);
   no other value was ever better.
 - **Why dropped:** a tuning knob nobody set.
+
+## Notes for anyone measuring here again
+
+- **Replay NLL is not a placement-independent number.** Expert placement differs between runs (it depends on
+  timing: prefetches landing, promotions), and the NLL over a replayed text moves with it: 1.5568 vs 1.5964 for two
+  runs of one configuration, 1.57-1.91 across placements over 2,500 tokens. A per-token comparison shows ~100 of
+  2,500 tokens flipping by more than 1 nat in both directions (near-tie routing), not a systematic shift. Bit-exact
+  claims need the same placement (the A-B comparisons above that report identical NLL had it), or a check of the
+  device contents (`QWFN_TIER_CHECK`, `QWFN_SWAP_CHECK`).
+- **Compare speeds inside one GPU window, interleaved (A-B-B-A).** Between windows the layer-graph time drifts by
+  +-4%, larger than most single changes.
+- **What is still at the hardware's limit** (so new kernels there will not pay): the dense Q8_0 matvecs and the
+  IQ4_NL / Q2_0 expert kernels stream at ~560-600 GB/s of the B70's 608; host <-> GPU syncs cost 6-12 us; a layer's
+  ~71 kernels are GPU-bound (recorded SYCL graphs would save <= ~1 ms/token); CPU idle states, CPU energy preference
+  and pinning the GPU clock (it already runs 2.74-2.79 GHz in decode) change nothing; host-to-device copies run at
+  ~13 GB/s and do not overlap device-to-host ones.
+
+## Custom behaviour still without a switch
+
+- ggml-sycl patch 02 (flash attention with quantized, non-contiguous K/V): a correctness fix, not a feature.
+- New types and entry points that do nothing until a switch uses them: patches 09, 17, 30, 31 (SOA layouts), 33,
+  35 (side queue, device copy). Patch 22's multi-token kernels run only under the switches of patches 05, 07, 08.
+- Server features behind command-line flags (`--timeshare`, `--prefix-cache`, `--lookup-drafts`, `--mtp`).
+- The fork's engine diff against upstream still has always-on changes from before the fence rule (instrumentation,
+  some decode-graph shapes, QSA selection fixes already offered upstream); they are reviewed one by one during the
+  upstream merge.
