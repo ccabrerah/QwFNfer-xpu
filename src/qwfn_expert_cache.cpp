@@ -722,18 +722,10 @@ expert_cache::census expert_cache::ram_census() const {
     return c;
 }
 
-// A VRAM resident unused for this many fetches (tokens x 48 layers) is replaceable whatever its count. Default 24 tokens;
-// QWFN_STALE_TOKENS tunes it. 256 cuts promotions 18-25% and swaps 27-35% (natural text, code, a streamed prompt, MTP) with
-// replay NLL equal or better, but interleaved A-B-B-A pairs show no decode difference (-0.6%, noise): left at 24.
-static uint64_t stale_fetches() {
-    static const uint64_t v = [] { const char * e = getenv("QWFN_STALE_TOKENS"); return (uint64_t) 48 * (e ? std::max(1, atoi(e)) : 24); }();
-    return v;
-}
-
 bool expert_cache::would_promote(layer_pool & lp, uint32_t expert_id) {
     if (!vram_buf_ || lp.g_slots == 0 || lp.g_lent) return false;
     static const bool vram_lru = getenv("QWFN_VRAM_LRU") != nullptr;
-    const uint64_t STALE_FETCHES = stale_fetches();
+    constexpr uint64_t STALE_FETCHES = 48 * 24;
     static thread_local uint64_t rng = 0x2545F4914F6CDD1Dull;
     uint32_t worst = UINT32_MAX; bool any = false;
     for (uint32_t k = 0; k < 16; k++) {
@@ -773,7 +765,7 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
     // them first; otherwise the least frequent, and only by a more frequent
     // newcomer. QWFN_VRAM_LRU=1 is pure recency.
     static const bool vram_lru = getenv("QWFN_VRAM_LRU") != nullptr;
-    const uint64_t STALE_FETCHES = stale_fetches();
+    constexpr uint64_t STALE_FETCHES = 48 * 24;
     static thread_local uint64_t rng = 0x853C49E6748FEA9Bull;
     int32_t  victim = -1, stale = -1;
     uint64_t oldest = UINT64_MAX, stale_oldest = UINT64_MAX;
@@ -1705,9 +1697,8 @@ void expert_cache::lend_restore(double budget_s) {
     uint64_t n_done = 0, bytes = 0;
     bool out_of_time = false;
     // Round robin over the layers, one batch each per round, so a short budget still spreads over every lent layer.
-    // Pipelined (QWFN_LEND_RESTORE_SYNC=1 for the old one-batch-at-a-time order): while a batch's uploads run, the next
-    // layer's batch is already being read; the reads claim RAM victims that exclude the slots the uploads still read.
-    static const bool pipelined = getenv("QWFN_LEND_RESTORE_SYNC") == nullptr;
+    // Pipelined: while a batch's uploads run, the next layer's batch is already being read; the reads claim RAM victims
+    // of another layer's pool (the uploads still read this one's).
     static const uint32_t batch_cap = [] { const char * e = getenv("QWFN_LEND_RESTORE_BATCH"); const int v = e ? atoi(e) : 32; return (uint32_t) std::min(64, std::max(1, v)); }();
     std::vector<size_t> pos(blk_.size(), 0);
     size_t rr = 0;
@@ -1749,12 +1740,11 @@ void expert_cache::lend_restore(double budget_s) {
         out_of_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > budget;
         int nxt = -1;
         if (!out_of_time) {
-            nxt = pick(pipelined ? cur : -2, nxt_batch);
-            if (nxt >= 0 && pipelined) prefetch_start((uint32_t) nxt, nxt_batch.data(), (uint32_t) nxt_batch.size(), nxt_r);   // beside the uploads
+            nxt = pick(cur, nxt_batch);
+            if (nxt >= 0) prefetch_start((uint32_t) nxt, nxt_batch.data(), (uint32_t) nxt_batch.size(), nxt_r);   // beside the uploads
         }
         settle_promotions();   // the uploads land and the RAM slots they read are released
         if (nxt >= 0) {
-            if (!pipelined) prefetch_start((uint32_t) nxt, nxt_batch.data(), (uint32_t) nxt_batch.size(), nxt_r);
             prefetch_finish(nxt_r);
             cur_batch.swap(nxt_batch);
         }

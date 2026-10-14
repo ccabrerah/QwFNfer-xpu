@@ -39,3 +39,27 @@ launcher (`scripts/b70/qwfn-b70.sh`) turns on the adopted ones.
   so even this method has a ~0.5 ms/token floor. Interleaved A-B-B-A processes inside one GPU window (scripts in
   the research repo) became the standard instead, because they need no engine support.
 - **Why dropped:** measurement-only code in the product binary; the method is kept in the test scripts.
+
+### `QWFN_LEND_RESTORE_SYNC` -- the restore's old one-batch-at-a-time order
+
+- **What it did:** made `QWFN_LEND_RESTORE` (refill the lent layers' VRAM tier after a streamed prompt) read a batch
+  of experts, upload it, settle, then read the next, with nothing overlapped.
+- **Data:** the pipelined order that replaced it (the next layer's batch read while this one uploads; the reads take
+  RAM victims from another layer's pool) restored the same 2,590 experts (4.96 GB) in 2.00 s instead of 2.43-2.45 s
+  (-17%, about 0.4 s of time-to-first-token per streamed turn); batch 64 was no different from 32 in either order.
+  The reads still run at ~2.5 GB/s against the drive's ~3.3-3.5 GB/s.
+- **Why dropped:** superseded; the restore itself stays behind `QWFN_LEND_RESTORE`.
+
+### `QWFN_STALE_TOKENS` -- the VRAM tier's staleness window
+
+- **What it did:** made the engine's fixed rule "a VRAM resident unused for 24 tokens is replaceable whatever its use
+  count" (`STALE_FETCHES = 48 * 24`, upstream's constant) tunable.
+- **Data:** 256 tokens instead of 24: promotions -18% (natural text, 35.7k -> 29.3k per 2,500 tokens), -21% (code,
+  28.6k -> 22.7k per 1,500), -25% (MTP-1, 39.9k -> 30.0k); swaps -27..-35%; sweep 24/64/128/256/512 promotions
+  35.7k / 34.2k / 31.7k / 29.3k / 28.7k. Decode in within-window runs looked +4..6%, but interleaved A-B-B-A pairs
+  (twice) gave 103.2 vs 102.6 s per 2,500 tokens (-0.6%, noise). Replay NLL equal or better in every arm (it moves
+  with placement, see the note at the end). An offline simulator on routing traces had predicted <1-2 ms/token.
+- **Why it failed:** fewer promotions save PCIe traffic, but a promotion costs ~0.12 ms of upload and the saved
+  ones were mostly off the critical path; nothing else changed.
+- **Don't redo as:** a hysteresis or budget knob on promotions -- the same simulator showed the engine's sampled
+  LFU, pure LRU and full-scan LFU within 0.1% of each other, and an oracle (Belady) saving only ~1 NVMe read per token.
