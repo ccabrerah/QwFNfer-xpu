@@ -142,10 +142,6 @@ public:
         bool iq4_soa = false;
         // And the q8_0 parts (GGML_TYPE_Q8_0_SOA, ggml-sycl patch 31): a 2-byte scale and 32 code bytes per block.
         bool q8_soa = false;
-        // QWFN_PROMOTE_SIDE: decode's promotion copies (upload, swap read-back, SOA reorder) on a second in-order
-        // queue of the device (ggml-sycl patch 33), beside the layer's kernels instead of after them. Off inside a
-        // lend (prefill, image): there the compute queue reads tier slots that promotions may overwrite.
-        bool promote_side = false;
         // QWFN_PROMOTE_D2D (ggml-sycl patch 35, exclusive tiers): the victim's device bytes are copied device-to-device into
         // a staging ring on the compute queue (microseconds) before the upload overwrites the slot, and read back to the
         // RAM slot on a side queue beside the next layer's kernels, finished one layer later. The compute queue then
@@ -278,8 +274,6 @@ public:
     // this layer's promotions go to the side queue without waiting, and the previous layer's finish (they had a layer
     // to land). Same as settle_promotions() when the mode is off.
     void settle_promotions_layer();
-    // The mode switch (diagnostic alternation): a full settle, then on/off. No effect without the capability.
-    void set_d2d(bool on);
     bool arena_pinned() const { return arena_pinned_; }
     // Every valid, hot block of `layer` in the RAM tier, with its payload pointers.
     // Main thread only; the pointers hold while nothing admits into that layer.
@@ -435,16 +429,13 @@ private:
     bool      q2_soa_ = false;
     bool      iq4_soa_ = false;
     bool      q8_soa_ = false;
-    // QWFN_PROMOTE_SIDE (patch 33): the side backend, whether promotions use it now (decode, outside lends), and
-    // whether copies were queued on it since the last settle.
+    // QWFN_PROMOTE_D2D (patch 33): the side backend the staged read-backs go to, and whether read-backs were queued
+    // on it since its last sync.
     ggml_backend_t side_be_   = nullptr;
-    bool           side_on_   = false;
     bool           side_used_ = false;
-    ggml_backend_t promo_backend() { if (side_on_) { side_used_ = true; return side_be_; } return cfg_.vram_backend; }
     // QWFN_PROMOTE_D2D (patch 35): the staging ring (device), its entries' state, and the copy entry point.
     using d2d_fn = void (*)(ggml_backend_t, void *, const void *, size_t);
     d2d_fn                 d2d_ = nullptr;
-    bool                   d2d_on_ = false;     // d2d_ is the capability, this the switch (set_d2d(): the A/B alternation)
     ggml_backend_buffer_t  ring_buf_ = nullptr;
     uint8_t *              ring_base_ = nullptr;
     size_t                 ring_entry_ = 0;

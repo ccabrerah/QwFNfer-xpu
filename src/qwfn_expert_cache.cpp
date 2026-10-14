@@ -330,16 +330,15 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
                     fprintf(stderr, "[qwfn] expert VRAM tier: q8_0 parts as Q8_0_SOA %s\n",
                             q8_soa_ ? "(codes and scales in separate aligned arrays)" : "requested, but the backend does not support it: plain q8_0");
                 }
-                if ((cfg.promote_side || cfg.promote_d2d) && cfg.vram_backend) {
+                if (cfg.promote_d2d && cfg.vram_backend) {
                     // patch 33: reached through the backend registry (the SYCL backend is loaded dynamically)
                     ggml_backend_dev_t dev = ggml_backend_get_device(cfg.vram_backend);
                     ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
                     using side_fn = ggml_backend_t (*)(ggml_backend_t);
                     auto fn = reg ? (side_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_init_side_queue") : nullptr;
                     side_be_ = fn ? fn(cfg.vram_backend) : nullptr;
-                    // D2D mode: the uploads stay on the compute queue, the side queue only carries the read-backs
-                    side_on_ = side_be_ != nullptr && !cfg.promote_d2d;
-                    if (cfg.promote_d2d) {
+                    // the uploads stay on the compute queue, the side queue only carries the read-backs
+                    {
                         d2d_ = reg ? (d2d_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_copy_d2d_async") : nullptr;
                         size_t ent = 0;
                         for (uint32_t il = 0; il < n_layer; il++) {
@@ -353,13 +352,10 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
                             ring_base_ = (uint8_t *) ggml_backend_buffer_get_base(ring_buf_);
                             ring_entry_ = ent; ring_busy_.assign(ring_n, 0);
                         } else d2d_ = nullptr;
-                        d2d_on_ = d2d_ != nullptr;
                         fprintf(stderr, "[qwfn] expert promotions: %s\n", d2d_ ?
                                 "victim read-backs staged on device and read back on a side queue (QWFN_PROMOTE_D2D)" :
                                 "D2D requested, but the backend lacks patch 33/35 or the ring did not fit: unchanged");
-                    } else
-                    fprintf(stderr, "[qwfn] expert promotions: %s\n", side_be_ ? "on a side queue (decode)" :
-                            "side queue requested, but the backend has none: on the compute queue");
+                    }
                 }
                 fprintf(stderr, "[qwfn] expert VRAM tier: %.2f GB, %zu blocks (%.1f%%)%s\n",
                         (perm_bytes + ext_bytes) / 1e9, total_gslots_,
@@ -544,8 +540,8 @@ void expert_cache::shutdown() {
     warm_counts_save();
     if (getenv("QWFN_TIER_CHECK")) tier_check("at shutdown");
     settle_promotions();   // copies still reading the arena must land before it goes
-    if (side_be_) { ggml_backend_free(side_be_); side_be_ = nullptr; side_on_ = false; }
-    d2d_ = nullptr; d2d_on_ = false; landing_.clear();
+    if (side_be_) { ggml_backend_free(side_be_); side_be_ = nullptr; }
+    d2d_ = nullptr; landing_.clear();
     if (ring_buf_) { ggml_backend_buffer_free(ring_buf_); ring_buf_ = nullptr; ring_base_ = nullptr; }
     if (xfer_ctx_) { ggml_free(xfer_ctx_); xfer_ctx_ = nullptr; xfer_ = nullptr; }
     if (vram_buf_) { ggml_backend_buffer_free(vram_buf_); vram_buf_ = nullptr; }
@@ -809,8 +805,6 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
     // refilled by a disk read while the copy still read it -- is closed by
     // deferring the release to settle_promotions(), after a stream sync.
     last_promote_async_ = cfg_.async_promote && cfg_.vram_backend && arena_pinned_;
-    // QWFN_PROMOTE_SIDE: both copies on one queue (side or compute), so the read-back still lands before the upload
-    ggml_backend_t pb = last_promote_async_ ? promo_backend() : cfg_.vram_backend;
     // Exclusive tiers: the victim's device bytes are read into a free RAM slot (else the coldest resident's) on
     // the same in-order stream as the upload below, so the read lands before they are overwritten; the slot is
     // marked in flight (protected, not mapped) until settle_promotions() maps it and frees this expert's.
@@ -843,18 +837,18 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
                 lp.slot_speculative[to] = 0;
                 lp.slot_soa[to]    = 0;
                 uint8_t * dst = slot_ptr(lp, (uint32_t) to);
-                ring = d2d_on_ ? ring_take() : -1;
+                ring = d2d_ ? ring_take() : -1;
                 if (ring >= 0) {
                     // QWFN_PROMOTE_D2D: the victim's bytes go to the staging ring, in order before the upload below
                     // overwrites the slot; the read-back to the RAM slot is queued at the layer's settle
                     size_t ro = (size_t) ring * ring_entry_;
                     for (int q = 0; q < EXPERT_NPARTS; q++) {
-                        d2d_(pb, ring_base_ + ro, lp.g_part[q] + (size_t) victim * lp.g_part_bytes[q], lp.g_part_bytes[q]);
+                        d2d_(cfg_.vram_backend, ring_base_ + ro, lp.g_part[q] + (size_t) victim * lp.g_part_bytes[q], lp.g_part_bytes[q]);
                         ro += (lp.g_part_bytes[q] + 255) & ~(size_t) 255;
                     }
                     st_.d2d_swaps++;
                 } else {
-                    if (d2d_on_) st_.d2d_fallback++;
+                    if (d2d_) st_.d2d_fallback++;
                 xfer_->buffer = lp.g_buf;
                 for (int q = 0; q < EXPERT_NPARTS; q++) {
                     xfer_->data  = lp.g_part[q] + (size_t) victim * lp.g_part_bytes[q];
@@ -862,7 +856,7 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
                     xfer_->ne[0] = lp.g_part_bytes[q];
                     xfer_->nb[0] = 1;
                     xfer_->nb[1] = xfer_->nb[2] = xfer_->nb[3] = lp.g_part_bytes[q];
-                    ggml_backend_tensor_get_async(pb, xfer_, dst + lp.part_off[q] + lp.part_pay[q], 0, lp.g_part_bytes[q]);
+                    ggml_backend_tensor_get_async(cfg_.vram_backend, xfer_, dst + lp.part_off[q] + lp.part_pay[q], 0, lp.g_part_bytes[q]);
                     st_.bytes_d2h += lp.g_part_bytes[q];
                 }
                 }
@@ -887,7 +881,7 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
         }
         xfer_->nb[1] = xfer_->nb[2] = xfer_->nb[3] = lp.g_part_bytes[q];
         const uint8_t * src = host_block + lp.part_off[q] + lp.part_pay[q];
-        if (last_promote_async_) ggml_backend_tensor_set_async(pb, xfer_, src, 0, lp.g_part_bytes[q]);
+        if (last_promote_async_) ggml_backend_tensor_set_async(cfg_.vram_backend, xfer_, src, 0, lp.g_part_bytes[q]);
         else                     ggml_backend_tensor_set(xfer_, src, 0, lp.g_part_bytes[q]);
         st_.bytes_h2d += lp.g_part_bytes[q];
     }
@@ -1453,13 +1447,8 @@ void expert_cache::issue_readbacks() {
     }
 }
 
-void expert_cache::set_d2d(bool on) {
-    settle_promotions();
-    d2d_on_ = on && d2d_ != nullptr;
-}
-
 void expert_cache::settle_promotions_layer() {
-    if (!d2d_on_) { settle_promotions(); return; }
+    if (!d2d_) { settle_promotions(); return; }
     if (pending_release_.empty() && pending_swaps_.empty() && landing_.empty()) return;
     const auto t0 = std::chrono::steady_clock::now();
     ggml_backend_synchronize(cfg_.vram_backend);   // the uploads and the staging copies have landed
@@ -1601,18 +1590,14 @@ static bool lend_restore_on() {
     return on;
 }
 
-// QWFN_PROMOTE_SIDE: off for the whole lend (its prefill reads tier slots on the compute queue -- QWFN_PF_VRAM's
-// copies, the MoE -- while warm-ups promote into them), back on once lend_end()'s refill has landed.
 void expert_cache::lend_begin() {
     settle_promotions();
-    side_on_ = false;
     lend_begin_impl();
 }
 
 void expert_cache::lend_end() {
     lend_end_impl();
     settle_promotions();
-    side_on_ = side_be_ != nullptr && !cfg_.promote_d2d;
 }
 
 void expert_cache::lend_begin_impl() {

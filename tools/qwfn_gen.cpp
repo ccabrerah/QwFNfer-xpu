@@ -323,10 +323,6 @@ int main(int argc, char ** argv) {
                 100.0 * hh / std::max<uint64_t>(1, lk), (s.bytes_from_disk - seg_st.bytes_from_disk) / 1e9);
         seg_t = now; seg_st = s; seg_next += seg_n;
     };
-    // QWFN_PROMOTE_D2D_ALT=N (with QWFN_PROMOTE_D2D=1): alternate the mode every N decode tokens in one process and total the
-    // decode time per mode from token 500 on, so the two share the GPU's state (drift between processes is larger than the effect)
-    const int d2d_alt = getenv("QWFN_PROMOTE_D2D_ALT") ? atoi(getenv("QWFN_PROMOTE_D2D_ALT")) : 0;
-    double alt_t[2] = {0, 0}; int alt_n[2] = {0, 0};
     if (!use_mtp && !pair_test && !rollback_test) {
         for (int i = 0; i < n_gen; i++) {
             int best = 0;
@@ -336,16 +332,9 @@ int main(int argc, char ** argv) {
             fflush(stdout);
             hist.push_back(best);
             segment(i + 1);
-            int mode = 1;
-            if (d2d_alt > 0) { mode = (i / d2d_alt) & 1; if (i % d2d_alt == 0) eng.set_promote_d2d(mode == 1); }
-            const auto ta = std::chrono::steady_clock::now();
             lg = eng.eval(hist.data(), (int32_t) hist.size(), 1, err);
-            if (d2d_alt > 0 && i >= 500) { alt_t[mode] += std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count(); alt_n[mode]++; }
             if (!lg) { fprintf(stderr, "\ndecode failed: %s\n", err.c_str()); return 1; }
         }
-        if (d2d_alt > 0)
-            fprintf(stderr, "[alt] D2D off: %d tokens, %.2f ms/token | D2D on: %d tokens, %.2f ms/token (from token 500; phases of %d)\n",
-                    alt_n[0], 1e3 * alt_t[0] / std::max(1, alt_n[0]), alt_n[1], 1e3 * alt_t[1] / std::max(1, alt_n[1]), d2d_alt);
     } else {
         // Speculative loop. `next` is the token to feed; the head's draft for the
         // token after it (or, in the tests, the replay's own next token / a wrong
@@ -389,18 +378,7 @@ int main(int argc, char ** argv) {
         // position decides how many drafts stand, the rest is rolled back.
         std::vector<int32_t> drafts; drafts.reserve(engine::MTP_MAX_DRAFTS);
         const int rb_at = getenv("QWFN_RB_AT") ? atoi(getenv("QWFN_RB_AT")) : 1;   // --rollback-test: the draft that is wrong (1-based)
-        int alt_mode = -1, alt_prev = 0; auto alt_stamp = std::chrono::steady_clock::now();
-        auto alt_close = [&]() {   // the iteration since the last stamp, under its mode
-            if (d2d_alt <= 0 || alt_mode < 0) return;
-            if (alt_prev >= 500) { alt_t[alt_mode] += std::chrono::duration<double>(std::chrono::steady_clock::now() - alt_stamp).count(); alt_n[alt_mode] += produced - alt_prev; }
-        };
         while (produced < n_gen) {
-            if (d2d_alt > 0) {
-                alt_close();
-                const int m = (produced / d2d_alt) & 1;
-                if (m != alt_mode) { eng.set_promote_d2d(m == 1); alt_mode = m; }
-                alt_prev = produced; alt_stamp = std::chrono::steady_clock::now();
-            }
             drafts.clear();
             int K = 0;
             if (pair_test || rollback_test) {
@@ -469,10 +447,6 @@ int main(int argc, char ** argv) {
             if (use_mtp && !eng.mtp_step(fed.data(), (int) fed.size(), err)) { fprintf(stderr, "\nmtp: %s\n", err.c_str()); return 1; }
             next = y;
         }
-        alt_close();
-        if (d2d_alt > 0)
-            fprintf(stderr, "[alt] D2D off: %d tokens, %.2f ms/token | D2D on: %d tokens, %.2f ms/token (from token 500; phases of %d)\n",
-                    alt_n[0], 1e3 * alt_t[0] / std::max(1, alt_n[0]), alt_n[1], 1e3 * alt_t[1] / std::max(1, alt_n[1]), d2d_alt);
         n_gen = produced;
         if (draft2_test && d2_n1)
             printf("\ndraft-2 probe: first draft right %llu of %llu (%.1f%%); second draft right %llu of %llu when the first was (%.1f%%)\n",

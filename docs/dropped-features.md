@@ -1,0 +1,41 @@
+# Dropped features
+
+Switches, code paths and ggml-sycl patches that were built, measured and then removed to keep the fork's custom
+surface small. Every one of them is still in the tree at tag **`v0.4.0`** (2026-10-14); revive from there.
+
+Read this before building something new on the decode or prefill path: if an idea matches an entry here, start
+from its numbers instead of measuring it again under another name. All measurements are on an Arc Pro B70 (32 GB,
+160 W unless noted), Ryzen 7 5700, 32 GB DDR4, one PCIe NVMe, Qwen3.8-Flash-Next with exclusive expert tiers
+(`--vram 23 --ram 11` unless noted); the B70 registry (`B70-registry.md`) has the surrounding context.
+
+What stays is listed in `PARAMETERS.md`. Every custom feature that stays is behind a switch, default off, and the
+launcher (`scripts/b70/qwfn-b70.sh`) turns on the adopted ones.
+
+## Engine switches
+
+### `QWFN_PROMOTE_SIDE` -- decode's expert promotions on a second queue
+
+- **What it did:** put a promotion's copies (the upload of the promoted expert, the swap read-back of the victim, the
+  SOA reorder) on a second in-order SYCL queue (ggml-sycl patch 33, `ggml_backend_sycl_init_side_queue`), so they
+  would run beside the layer's kernels instead of after them. Off inside lends (prefill, image).
+- **Data:** output identical (replay NLL equal), stress test passed; promotion settle unchanged at ~3.0 ms per step;
+  short decode 38.0 vs 37.8 tok/s (noise).
+- **Why it failed:** the promoted expert is folded into the very next graph, so the upload is on the critical path
+  whichever queue carries it. A copy probe later confirmed the hardware does overlap a copy on a second queue with
+  a kernel, but host-to-device and device-to-host copies do not overlap each other, and the upload has nothing to
+  hide under.
+- **What replaced it:** `QWFN_PROMOTE_D2D` (kept): only the read-back leaves the critical path (victim copied aside
+  on the device, read back on the side queue a layer later): settle 2.8 -> 1.7 ms/token, decode ~1.5%.
+  Patch 33 stays because D2D uses its side queue.
+
+### `QWFN_PROMOTE_D2D_ALT` -- in-process A/B of D2D (qwfn-gen)
+
+- **What it did:** in `qwfn-gen`, switched `QWFN_PROMOTE_D2D` on and off every N decode tokens inside one process
+  (a full settle at each switch) and reported ms/token per mode from token 500 on; also the engine's
+  `set_promote_d2d()` / the cache's `set_d2d()`.
+- **Data / lesson:** separate processes on this box drift by +-4% (layer-graph time moved 55-70 s per 2,500
+  tokens between runs of one config), more than most single optimizations. In-process alternation gave plain decode
+  -0.33 / -0.84 / -0.51 ms/token for D2D, MTP-1 -0.80 / -0.57, MTP-2 +0.08 / +0.05, and A/A controls +0.18 / -0.80:
+  so even this method has a ~0.5 ms/token floor. Interleaved A-B-B-A processes inside one GPU window (scripts in
+  the research repo) became the standard instead, because they need no engine support.
+- **Why dropped:** measurement-only code in the product binary; the method is kept in the test scripts.

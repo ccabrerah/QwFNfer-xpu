@@ -529,7 +529,6 @@ bool engine::init(const model_index * hot, const model_index * cold,
     ec_cfg.q2_soa = getenv("QWFN_Q2_SOA") != nullptr;   // the VRAM tier's q2_0 experts in the SOA layout (SYCL)
     ec_cfg.iq4_soa = getenv("QWFN_IQ4_SOA") != nullptr; // and its iq4_nl experts (ggml-sycl patch 17)
     ec_cfg.q8_soa = getenv("QWFN_Q8_SOA") != nullptr;   // and its q8_0 experts (ggml-sycl patch 31)
-    ec_cfg.promote_side = getenv("QWFN_PROMOTE_SIDE") != nullptr;   // decode's promotions on a side queue (patch 33)
     ec_cfg.promote_d2d = getenv("QWFN_PROMOTE_D2D") != nullptr;     // victim read-backs staged on device, read back on a side queue (patch 35)
     // Exclusive tiers: RAM holds what VRAM does not (swaps on promotion); QWFN_RAM_LENT_INCLUSIVE=1 keeps the
     // prefill-lent layers inclusive.
