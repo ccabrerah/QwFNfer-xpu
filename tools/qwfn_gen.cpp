@@ -542,6 +542,11 @@ int main(int argc, char ** argv) {
     printf("              promotion settle %.2f s (sync %.2f s, finish %.2f s) | host work between graphs: readback %.2f s, prefetch %.2f s, uploads %.2f s | read-backs staged on device %llu, in place (ring busy) %llu\n",
            eng.t_settle_promo, s.t_settle_sync, s.t_settle_finish, eng.t_readback, eng.t_prefetch, eng.t_uploads,
            (unsigned long long) s.d2d_swaps, (unsigned long long) s.d2d_fallback);
+    {
+        const double known = eng.t_layerA + eng.t_moe_gpu + eng.t_moe_cpu + eng.t_io + eng.t_readback + eng.t_prefetch + eng.t_settle_promo + eng.t_uploads + eng.t_head;
+        printf("              head %.2f s | inside eval (t_decode) %.2f s, of it accounted %.2f s, rest %.2f s (%.2f ms/token) | outside eval %.2f s\n",
+               eng.t_head, eng.t_decode, known, eng.t_decode - known, 1e3 * (eng.t_decode - known) / std::max(1, n_gen), dt - eng.t_decode);
+    }
     if (eng.n_exp_cpu && eng.n_exp_gpu)
         printf("              per expert: gpu %.0f us, cpu %.0f us  (%.1fx)\n",
                eng.t_moe_gpu / eng.n_exp_gpu * 1e6, eng.t_moe_cpu / eng.n_exp_cpu * 1e6,

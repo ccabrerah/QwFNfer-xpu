@@ -299,6 +299,15 @@ public:
     // eval, so a prompt split into several passes restores once, after its last pass).
     void lend_restore_if_pending() { if (lend_restore_pending_ && vram_extra_) { lend_restore_pending_ = false; lend_restore(); } }
     uint64_t  tier_epoch() const { return tier_epoch_; }
+    // QWFN_WARM_COUNTS=FILE (warm start): the per-expert use counts are saved there (at shutdown and every few minutes) and,
+    // at the next start, loaded back; warm_start() then reads each layer's hottest experts into the tiers (VRAM first, then
+    // RAM) before the first request, so the first thousand tokens do not pay a cold tier's misses. A missing or mismatched
+    // file is ignored.
+    bool      warm_counts_load(const std::string & path);
+    void      warm_counts_save();
+    void      warm_start(double budget_s);
+    // QWFN_TIER_CHECK=1 (diagnostic): every VRAM-resident expert read back and compared with the file (device layout -> file layout).
+    void      tier_check(const char * when);
     void      lend_begin();
     void      lend_end();
 
@@ -531,7 +540,15 @@ private:
     // lend_end() reads them back into the tier (time budget QWFN_LEND_RESTORE_MS, default 3000).
     std::vector<std::vector<uint16_t>> lend_saved_;
     bool lend_restore_pending_ = false;
-    void lend_restore();
+    void lend_restore(double budget_s = -1);
+    // A batched read into RAM victims in two halves (prefetch() is both): start claims the slots and submits, finish
+    // submits the rest, reaps and marks the slots valid. The restore overlaps the next batch's reads with this one's uploads.
+    struct sync_read { uint32_t layer = 0; std::vector<int32_t> claimed; std::vector<io_request> reqs; size_t sub = 0; bool failed = false; };
+    void prefetch_start(uint32_t layer, const uint32_t * expert_ids, uint32_t n, sync_read & r);
+    void prefetch_finish(sync_read & r);
+    std::string  warm_path_;
+    std::chrono::steady_clock::time_point warm_saved_ = std::chrono::steady_clock::now();
+    std::vector<std::vector<uint16_t>> warm_lists_;   // per layer: experts by saved count, hottest first
     uint64_t               tier_epoch_ = 0;
     ggml_context *         xfer_ctx_ = nullptr;
     ggml_tensor *          xfer_     = nullptr;   // scratch handle for H2D copies

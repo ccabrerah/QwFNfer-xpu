@@ -604,6 +604,12 @@ bool engine::init(const model_index * hot, const model_index * cold,
     // Before the tier sizes itself from the free VRAM: the heads' 123 MB must come out of the tier, not the decode reserve.
     if (!cfg.predictor_path.empty() && !load_predictor(cfg.predictor_path, err)) return false;
     if (!ec_.init(hot, cold, ec_cfg, err)) return false;
+    // QWFN_WARM_COUNTS=FILE: warm start. The expert use counts persist in FILE; with a valid one the tiers are filled with
+    // each layer's hottest experts now (QWFN_WARM_START_S bounds the fill, default 25 s) instead of by the first requests' misses.
+    if (const char * wp = getenv("QWFN_WARM_COUNTS")) {
+        if (ec_.warm_counts_load(wp)) ec_.warm_start(getenv("QWFN_WARM_START_S") ? atof(getenv("QWFN_WARM_START_S")) : 25.0);
+        else fprintf(stderr, "[qwfn] warm start: no usable counts in %s yet (they are written during this run)\n", wp);
+    }
     tier_epoch_seen_ = ec_.tier_epoch();
     if (moe_in_graph_) {
         ggml_init_params vp{}; vp.mem_size = ggml_tensor_overhead() * 2 * hp_.n_layer + 1024; vp.no_alloc = true;

@@ -541,6 +541,8 @@ void expert_cache::soa_to_file(const layer_pool & lp, uint8_t * slot) {
 }
 
 void expert_cache::shutdown() {
+    warm_counts_save();
+    if (getenv("QWFN_TIER_CHECK")) tier_check("at shutdown");
     settle_promotions();   // copies still reading the arena must land before it goes
     if (side_be_) { ggml_backend_free(side_be_); side_be_ = nullptr; side_on_ = false; }
     d2d_ = nullptr; d2d_on_ = false; landing_.clear();
@@ -724,10 +726,18 @@ expert_cache::census expert_cache::ram_census() const {
     return c;
 }
 
+// A VRAM resident unused for this many fetches (tokens x 48 layers) is replaceable whatever its count. Default 24 tokens;
+// QWFN_STALE_TOKENS tunes it. 256 cuts promotions 18-25% and swaps 27-35% (natural text, code, a streamed prompt, MTP) with
+// replay NLL equal or better, but interleaved A-B-B-A pairs show no decode difference (-0.6%, noise): left at 24.
+static uint64_t stale_fetches() {
+    static const uint64_t v = [] { const char * e = getenv("QWFN_STALE_TOKENS"); return (uint64_t) 48 * (e ? std::max(1, atoi(e)) : 24); }();
+    return v;
+}
+
 bool expert_cache::would_promote(layer_pool & lp, uint32_t expert_id) {
     if (!vram_buf_ || lp.g_slots == 0 || lp.g_lent) return false;
     static const bool vram_lru = getenv("QWFN_VRAM_LRU") != nullptr;
-    constexpr uint64_t STALE_FETCHES = 48 * 24;
+    const uint64_t STALE_FETCHES = stale_fetches();
     static thread_local uint64_t rng = 0x2545F4914F6CDD1Dull;
     uint32_t worst = UINT32_MAX; bool any = false;
     for (uint32_t k = 0; k < 16; k++) {
@@ -767,7 +777,7 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
     // them first; otherwise the least frequent, and only by a more frequent
     // newcomer. QWFN_VRAM_LRU=1 is pure recency.
     static const bool vram_lru = getenv("QWFN_VRAM_LRU") != nullptr;
-    constexpr uint64_t STALE_FETCHES = 48 * 24;
+    const uint64_t STALE_FETCHES = stale_fetches();
     static thread_local uint64_t rng = 0x853C49E6748FEA9Bull;
     int32_t  victim = -1, stale = -1;
     uint64_t oldest = UINT64_MAX, stale_oldest = UINT64_MAX;
@@ -910,6 +920,7 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
     // can compute the experts it already has while both kinds of read land.
     // In-flight slots are never chosen as victims.
     land_layer(layer);   // QWFN_PROMOTE_D2D: a layer's pending read-backs land before its pool is used again
+    if (!warm_path_.empty() && (fetch_count_ & 0xFFFF) == 0xFFFF) warm_counts_save();
     layer_pool & lp = blk_[layer];
     tick_++;
     fetch_epoch_ = tick_;
@@ -1281,20 +1292,27 @@ bool expert_cache::fetch_end() {
 }
 
 void expert_cache::prefetch(uint32_t layer, const uint32_t * expert_ids, uint32_t n) {
+    sync_read r;
+    prefetch_start(layer, expert_ids, n, r);
+    prefetch_finish(r);
+}
+
+void expert_cache::prefetch_start(uint32_t layer, const uint32_t * expert_ids, uint32_t n, sync_read & r) {
+    r = sync_read();
     if (layer >= blk_.size()) return;
     land_layer(layer);
     layer_pool & lp = blk_[layer];
-    io_request reqs[64 * EXPERT_NPARTS];
-    std::vector<int32_t> claimed;
-    size_t n_req = 0;
-    for (uint32_t i = 0; i < n && n_req + EXPERT_NPARTS <= sizeof(reqs) / sizeof(reqs[0]); i++) {
+    r.layer = layer;
+    r.reqs.reserve(64 * EXPERT_NPARTS);
+    const size_t cap = 64 * EXPERT_NPARTS;
+    for (uint32_t i = 0; i < n && r.reqs.size() + EXPERT_NPARTS <= cap; i++) {
         const uint32_t e = expert_ids[i];
-        claimed.push_back(-1);
+        r.claimed.push_back(-1);
         if (find_slot(lp, e) >= 0) continue;
         const int32_t v = choose_victim(lp);
         if (v < 0) continue;
         if (lp.slot_expert[v] != SLOT_EMPTY) lp.expert_slot[lp.slot_expert[v]] = -1;
-        claimed.back() = v;
+        r.claimed.back() = v;
         lp.slot_expert[v] = (uint16_t) e;
         lp.slot_valid[v]  = 0;   // becomes valid only once the read is reaped
         lp.slot_freq[v]   = 1;
@@ -1303,31 +1321,39 @@ void expert_cache::prefetch(uint32_t layer, const uint32_t * expert_ids, uint32_
         for (int q = 0; q < EXPERT_NPARTS; q++) {   // prefetches always take full precision
             const byte_range br = hot_->expert_range(layer, e, (expert_part) q);
             if (!br.valid()) continue;
-            reqs[n_req++] = io_request{ br.shard, br.offset, br.nbytes, base + lp.part_off[q], 0 };
+            r.reqs.push_back(io_request{ br.shard, br.offset, br.nbytes, base + lp.part_off[q], 0 });
         }
     }
-    if (!n_req) return;
-
-    // Submit and reap here. True fire-and-forget prefetch needs a persistent
-    // in-flight table so a later fetch() can wait on a specific block; until
-    // that exists, marking a slot resident before its read lands would be the
-    // same aliasing hazard choose_victim guards against.
-    io_engine * eng = &io_hot_;
-    size_t sub = 0;
+    // Submit what the queue takes now; prefetch_finish() submits the rest and reaps. True fire-and-forget prefetch needs a
+    // persistent in-flight table so a later fetch() can wait on a specific block; until that exists, a slot is marked
+    // resident only once its read has landed (the same aliasing hazard choose_victim guards against).
     uint64_t tags[256];
-    while (sub < n_req) {
-        const size_t k = eng->submit(reqs + sub, n_req - sub);
-        if (k == 0) { if (eng->reap(tags, 256, 1) == 0) return; continue; }
-        sub += k;
+    while (r.sub < r.reqs.size()) {
+        const size_t k = io_hot_.submit(r.reqs.data() + r.sub, r.reqs.size() - r.sub);
+        if (k == 0) break;   // queue full: finish() reaps and goes on
+        r.sub += k;
     }
-    size_t done = 0;
-    while (done < n_req) {
-        const size_t got = eng->reap(tags, 256, n_req - done);
+    (void) tags;
+}
+
+void expert_cache::prefetch_finish(sync_read & r) {
+    if (r.reqs.empty()) return;
+    layer_pool & lp = blk_[r.layer];
+    io_engine * eng = &io_hot_;
+    uint64_t tags[256];
+    size_t reaped = 0;
+    while (r.sub < r.reqs.size()) {
+        const size_t k = eng->submit(r.reqs.data() + r.sub, r.reqs.size() - r.sub);
+        if (k == 0) { const size_t got = eng->reap(tags, 256, 1); if (got == 0) return; reaped += got; continue; }
+        r.sub += k;
+    }
+    while (reaped < r.reqs.size()) {
+        const size_t got = eng->reap(tags, 256, r.reqs.size() - reaped);
         if (got == 0) return;
-        done += got;
+        reaped += got;
     }
-    for (uint32_t i = 0; i < n && i < claimed.size(); i++) {
-        const int32_t v = claimed[i];
+    for (uint32_t i = 0; i < r.claimed.size(); i++) {
+        const int32_t v = r.claimed[i];
         if (v >= 0) lp.slot_valid[v] = 1;
     }
 }
@@ -1451,6 +1477,125 @@ void expert_cache::settle_promotions_layer() {
     st_.t_settle_finish += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 }
 
+// ---- warm start (QWFN_WARM_COUNTS) ----
+namespace {
+struct warm_hdr { char magic[8]; uint32_t n_layer, n_expert; };
+const char WARM_MAGIC[8] = { 'Q', 'W', 'F', 'N', 'E', 'F', '0', '1' };
+}
+
+bool expert_cache::warm_counts_load(const std::string & path) {
+    warm_path_ = path;
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    warm_hdr h{};
+    const uint32_t n_expert = blk_.empty() ? 0 : (uint32_t) blk_[0].ef.size();
+    bool ok = fread(&h, sizeof h, 1, f) == 1 && memcmp(h.magic, WARM_MAGIC, 8) == 0 && h.n_layer == blk_.size() && h.n_expert == n_expert;
+    std::vector<uint32_t> buf((size_t) blk_.size() * n_expert);
+    ok = ok && fread(buf.data(), 4, buf.size(), f) == buf.size();
+    fclose(f);
+    if (!ok) { fprintf(stderr, "[qwfn] warm counts: %s does not match this model: ignored\n", path.c_str()); return false; }
+    warm_lists_.assign(blk_.size(), {});
+    for (uint32_t il = 0; il < blk_.size(); il++) {
+        layer_pool & lp = blk_[il];
+        memcpy(lp.ef.data(), buf.data() + (size_t) il * n_expert, (size_t) n_expert * 4);
+        std::vector<uint16_t> ord;
+        for (uint32_t e = 0; e < n_expert; e++) if (lp.ef[e]) ord.push_back((uint16_t) e);
+        std::stable_sort(ord.begin(), ord.end(), [&](uint16_t a, uint16_t b) { return lp.ef[a] > lp.ef[b]; });
+        warm_lists_[il] = std::move(ord);
+    }
+    return true;
+}
+
+// atomically: a temp file, renamed over the old one (a killed server leaves the previous good file)
+void expert_cache::warm_counts_save() {
+    if (warm_path_.empty() || blk_.empty()) return;
+    warm_saved_ = std::chrono::steady_clock::now();
+    const std::string tmp = warm_path_ + ".tmp";
+    FILE * f = fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    warm_hdr h{}; memcpy(h.magic, WARM_MAGIC, 8); h.n_layer = (uint32_t) blk_.size(); h.n_expert = (uint32_t) blk_[0].ef.size();
+    bool ok = fwrite(&h, sizeof h, 1, f) == 1;
+    for (const layer_pool & lp : blk_) ok = ok && fwrite(lp.ef.data(), 4, lp.ef.size(), f) == lp.ef.size();
+    ok = (fclose(f) == 0) && ok;
+    if (ok) rename(tmp.c_str(), warm_path_.c_str()); else unlink(tmp.c_str());
+}
+
+void expert_cache::tier_check(const char * when) {
+    if (!vram_buf_) return;
+    settle_promotions();
+    uint64_t n = 0, bad = 0;
+    std::vector<int> fds;
+    for (const auto & path : hot_->shard_paths()) fds.push_back(::open(path.c_str(), O_RDONLY));
+    std::vector<uint8_t> file;
+    for (uint32_t il = 0; il < blk_.size(); il++) {
+        layer_pool & lp = blk_[il];
+        if (lp.g_lent || lp.g_slots == 0) continue;
+        std::vector<uint8_t> blk(lp.block_bytes);
+        for (uint32_t g = 0; g < lp.g_slots; g++) {
+            const uint16_t e = lp.g_slot_expert[g];
+            if (e == SLOT_EMPTY || !lp.g_valid[g] || (lp.g_cold.size() > g && lp.g_cold[g]) || lp.g_expert_slot[e] != (int32_t) g) continue;
+            for (int q = 0; q < EXPERT_NPARTS; q++) {
+                xfer_->buffer = lp.g_buf;
+                xfer_->data  = lp.g_part[q] + (size_t) g * lp.g_part_bytes[q];
+                xfer_->type  = GGML_TYPE_I8; xfer_->ne[0] = lp.g_part_bytes[q]; xfer_->nb[0] = 1;
+                xfer_->nb[1] = xfer_->nb[2] = xfer_->nb[3] = lp.g_part_bytes[q];
+                ggml_backend_tensor_get(xfer_, blk.data() + lp.part_off[q] + lp.part_pay[q], 0, lp.g_part_bytes[q]);
+            }
+            soa_to_file(lp, blk.data());
+            bool ok = true;
+            for (int q = 0; q < EXPERT_NPARTS && ok; q++) {
+                const byte_range br = hot_->expert_range(il, e, (expert_part) q);
+                file.resize(br.nbytes);
+                ok = br.valid() && pread(fds[br.shard], file.data(), br.nbytes, (off_t) br.offset) == (ssize_t) br.nbytes &&
+                     memcmp(file.data(), blk.data() + lp.part_off[q] + lp.part_pay[q], br.nbytes) == 0;
+            }
+            n++; if (!ok) bad++;
+        }
+    }
+    for (int fd : fds) ::close(fd);
+    fprintf(stderr, "[qwfn] tier check (%s): %llu VRAM experts compared with the file, %llu WRONG\n", when, (unsigned long long) n, (unsigned long long) bad);
+}
+
+// Fill the tiers from the loaded counts: VRAM through the restore machinery (batched reads into RAM victims, uploads,
+// settle), then each layer's next-hottest experts into the RAM tier. Bounded by budget_s.
+void expert_cache::warm_start(double budget_s) {
+    if (warm_lists_.empty()) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto left = [&] { return budget_s - std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
+    lend_saved_ = warm_lists_;
+    lend_restore(budget_s);
+    uint64_t n_vram = st_.lend_restored; st_.lend_restored = 0; st_.lend_restore_bytes = 0; st_.t_lend_restore = 0;
+    uint64_t n_ram = 0;
+    std::vector<size_t> pos(blk_.size(), 0);
+    for (uint32_t il = 0; il < blk_.size(); il++) {   // skip what VRAM holds
+        const layer_pool & lp = blk_[il];
+        while (pos[il] < warm_lists_[il].size() && lp.g_expert_slot[warm_lists_[il][pos[il]]] >= 0) pos[il]++;
+    }
+    for (bool any = true; any && left() > 0; ) {
+        any = false;
+        for (uint32_t il = 0; il < blk_.size() && left() > 0; il++) {
+            layer_pool & lp = blk_[il];
+            uint32_t have = 0;
+            for (uint32_t s = 0; s < lp.n_slots; s++) have += lp.slot_expert[s] != SLOT_EMPTY;
+            if (have >= lp.n_slots) continue;
+            std::vector<uint32_t> batch;
+            while (pos[il] < warm_lists_[il].size() && batch.size() < 32 && have + batch.size() < lp.n_slots) {
+                const uint32_t e = warm_lists_[il][pos[il]++];
+                if (lp.g_expert_slot[e] < 0 && lp.expert_slot[e] < 0) batch.push_back(e);
+            }
+            if (batch.empty()) continue;
+            any = true;
+            prefetch(il, batch.data(), (uint32_t) batch.size());
+            n_ram += batch.size();
+        }
+    }
+    prefetch_settle();
+    settle_promotions();
+    if (getenv("QWFN_TIER_CHECK")) tier_check("after warm start");
+    fprintf(stderr, "[qwfn] warm start: %llu experts into VRAM, %llu into RAM in %.2f s\n", (unsigned long long) n_vram,
+            (unsigned long long) n_ram, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+}
+
 static bool lend_restore_on() {
     static const bool on = [] { const char * e = getenv("QWFN_LEND_RESTORE"); return e && atoi(e) != 0; }();
     return on;
@@ -1563,8 +1708,9 @@ void expert_cache::lend_end_impl() {
 // batches: a batched read into RAM slots (prefetch: the io queue keeps ~100 reads in flight), uploads, then a
 // settle, which frees the RAM slots again (exclusive tiers) before the next batch claims victims. Bounded by
 // QWFN_LEND_RESTORE_MS. Experts the RAM refill above already promoted are skipped.
-void expert_cache::lend_restore() {
-    static const double budget = [] { const char * e = getenv("QWFN_LEND_RESTORE_MS"); return (e ? atof(e) : 3000.0) / 1e3; }();
+void expert_cache::lend_restore(double budget_s) {
+    static const double budget_env = [] { const char * e = getenv("QWFN_LEND_RESTORE_MS"); return (e ? atof(e) : 3000.0) / 1e3; }();
+    const double budget = budget_s >= 0 ? budget_s : budget_env;
     const auto t0 = std::chrono::steady_clock::now();
     settle_promotions();   // the refill's uploads land and its RAM slots are released first
     auto in_vram = [](const layer_pool & lp, uint32_t e) {
@@ -1574,42 +1720,66 @@ void expert_cache::lend_restore() {
     uint64_t n_done = 0, bytes = 0;
     bool out_of_time = false;
     // Round robin over the layers, one batch each per round, so a short budget still spreads over every lent layer.
+    // Pipelined (QWFN_LEND_RESTORE_SYNC=1 for the old one-batch-at-a-time order): while a batch's uploads run, the next
+    // layer's batch is already being read; the reads claim RAM victims that exclude the slots the uploads still read.
+    static const bool pipelined = getenv("QWFN_LEND_RESTORE_SYNC") == nullptr;
+    static const uint32_t batch_cap = [] { const char * e = getenv("QWFN_LEND_RESTORE_BATCH"); const int v = e ? atoi(e) : 32; return (uint32_t) std::min(64, std::max(1, v)); }();
     std::vector<size_t> pos(blk_.size(), 0);
-    for (bool any = true; any && !out_of_time; ) {
-        any = false;
-        for (uint32_t il = 0; il < blk_.size() && !out_of_time; il++) {
+    size_t rr = 0;
+    auto pick = [&](int excl, std::vector<uint32_t> & batch) -> int {   // the next layer (not excl) with a batch to read
+        for (size_t k = 0; k < blk_.size(); k++) {
+            const uint32_t il = (uint32_t) ((rr + k) % blk_.size());
+            if ((int) il == excl) continue;
             if (il >= lend_saved_.size() || pos[il] >= lend_saved_[il].size()) continue;
             layer_pool & lp = blk_[il];
             if (lp.g_lent || lp.g_slots == 0) { pos[il] = lend_saved_[il].size(); continue; }
             uint32_t resident = 0;
             for (uint32_t g = 0; g < lp.g_slots; g++) resident += lp.g_slot_expert[g] != SLOT_EMPTY;
-            static const uint32_t batch_cap = [] { const char * e = getenv("QWFN_LEND_RESTORE_BATCH"); const int v = e ? atoi(e) : 32; return (uint32_t) std::min(64, std::max(1, v)); }();
             const uint32_t batch_max = std::max<uint32_t>(1, std::min<uint32_t>(batch_cap, lp.n_slots / 2));   // prefetch() takes <= 64
-            std::vector<uint32_t> batch;
+            batch.clear();
             while (pos[il] < lend_saved_[il].size() && batch.size() < batch_max && resident + batch.size() < lp.g_slots) {
                 const uint32_t e = lend_saved_[il][pos[il]++];
                 if (!in_vram(lp, e)) batch.push_back(e);
             }
             if (resident + batch.size() >= lp.g_slots) pos[il] = lend_saved_[il].size();   // tier full: done here
             if (batch.empty()) continue;
-            any = true;
-            prefetch(il, batch.data(), (uint32_t) batch.size());   // synchronous batched read into RAM victims
-            for (uint32_t e : batch) {
-                const int32_t s = lp.expert_slot[e];
-                if (s < 0 || !lp.slot_valid[s] || lp.slot_cold[s] || lp.slot_expert[s] != (uint16_t) e) continue;
-                if (!promote(lp, e, s)) continue;
-                if (last_promote_async_) pending_release_.push_back(pending_rel{ il, e, s });
-                n_done++; bytes += lp.block_bytes;
-            }
-            settle_promotions();
-            out_of_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > budget;
+            rr = il + 1;
+            return (int) il;
         }
+        return -1;
+    };
+    std::vector<uint32_t> cur_batch, nxt_batch;
+    sync_read cur_r, nxt_r;
+    int cur = pick(-1, cur_batch);
+    if (cur >= 0) { prefetch_start((uint32_t) cur, cur_batch.data(), (uint32_t) cur_batch.size(), cur_r); prefetch_finish(cur_r); }
+    while (cur >= 0) {
+        layer_pool & lp = blk_[cur];
+        for (uint32_t e : cur_batch) {
+            const int32_t s = lp.expert_slot[e];
+            if (s < 0 || !lp.slot_valid[s] || lp.slot_cold[s] || lp.slot_expert[s] != (uint16_t) e) continue;
+            if (!promote(lp, e, s)) continue;
+            if (last_promote_async_) pending_release_.push_back(pending_rel{ (uint32_t) cur, e, s });
+            n_done++; bytes += lp.block_bytes;
+        }
+        out_of_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > budget;
+        int nxt = -1;
+        if (!out_of_time) {
+            nxt = pick(pipelined ? cur : -2, nxt_batch);
+            if (nxt >= 0 && pipelined) prefetch_start((uint32_t) nxt, nxt_batch.data(), (uint32_t) nxt_batch.size(), nxt_r);   // beside the uploads
+        }
+        settle_promotions();   // the uploads land and the RAM slots they read are released
+        if (nxt >= 0) {
+            if (!pipelined) prefetch_start((uint32_t) nxt, nxt_batch.data(), (uint32_t) nxt_batch.size(), nxt_r);
+            prefetch_finish(nxt_r);
+            cur_batch.swap(nxt_batch);
+        }
+        cur = nxt;
     }
     lend_saved_.clear();
     const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     st_.lend_restored += n_done; st_.lend_restore_bytes += bytes; st_.t_lend_restore += dt;
     static const bool quiet = getenv("QWFN_LEND_RESTORE_QUIET") != nullptr;
-    if (!quiet) fprintf(stderr, "[qwfn] VRAM restore after the prefill: %llu experts, %.2f GB in %.2f s%s\n",
+    if (!quiet && budget_s < 0) fprintf(stderr, "[qwfn] VRAM restore after the prefill: %llu experts, %.2f GB in %.2f s%s\n",
                         (unsigned long long) n_done, bytes / 1e9, dt, out_of_time ? " (time budget reached)" : "");
 }
 
