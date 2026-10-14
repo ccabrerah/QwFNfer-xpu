@@ -245,7 +245,6 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_SMALLK=1` | 05, 22 | 1 | Small-K f32 matmul without oneMKL's per-call cost. |
 | `GGML_SYCL_MOE_Q2W=1` | 07, 08, 22 | 1 | q2_0 MoE matvec, a 64-weight block per lane; with it the fused gate+up+SwiGLU. |
 | `GGML_SYCL_FUSE_SPARSE_DECODE=1` | 10 | 1 | One-token sparse attention straight from the q8_0 cache. |
-| `GGML_SYCL_TOPK_DIV_OUT=0` | 12 | | The router fusion's older match (default on). |
 | `GGML_SYCL_TOPK_WG=1` | 13 | 1 | Work-group-wide top-k for the router and the predictor. |
 | `GGML_SYCL_FUSE_HC_MIX=1` | 14 | 1 | Hyper-connection mixer fusions. |
 | `GGML_SYCL_FUSE_ADDCHAIN=1` | 15 | 1 | Chains of 2-4 ADDs as one kernel. |
