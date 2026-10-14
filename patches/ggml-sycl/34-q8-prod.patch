@@ -1,0 +1,312 @@
+--- a/ggml/src/ggml-sycl/quantize.hpp
++++ b/ggml/src/ggml-sycl/quantize.hpp
+@@ -23,18 +23,11 @@
+ 
+ #include "ggml-sycl/dpct/helper.hpp"
+ 
++// The values of one 32-value block spread over a sub-group (ElementsPerWI per lane), quantized.
+ template <int ElementsPerWI>
+-__dpct_inline__ static void quantize_q8_1_impl(const float * __restrict__ x,
++__dpct_inline__ static void quantize_q8_1_vals(const sycl::vec<float, ElementsPerWI> & wi_f32_vals,
+                                                sycl::vec<int8_t, ElementsPerWI> & quantized_values, float & d,
+                                                float & sum, const sycl::nd_item<1> & it) {
+-    auto subgroup_id = it.get_group(0);
+-    auto wi_id       = it.get_local_id(0);
+-
+-    sycl::vec<float, ElementsPerWI> wi_f32_vals;
+-
+-    auto float_ptr_offset = subgroup_id * QK8_1 + ElementsPerWI * wi_id;
+-    wi_f32_vals           = *reinterpret_cast<const sycl::vec<float, ElementsPerWI> *>(x + float_ptr_offset);
+-
+     float amax = 0.0f;
+ 
+ #pragma unroll(ElementsPerWI)
+@@ -55,6 +48,40 @@
+     d = amax == 0 ? 0 : d;
+ }
+ 
++template <int ElementsPerWI>
++__dpct_inline__ static void quantize_q8_1_impl(const float * __restrict__ x,
++                                               sycl::vec<int8_t, ElementsPerWI> & quantized_values, float & d,
++                                               float & sum, const sycl::nd_item<1> & it) {
++    auto subgroup_id = it.get_group(0);
++    auto wi_id       = it.get_local_id(0);
++
++    sycl::vec<float, ElementsPerWI> wi_f32_vals;
++
++    auto float_ptr_offset = subgroup_id * QK8_1 + ElementsPerWI * wi_id;
++    wi_f32_vals           = *reinterpret_cast<const sycl::vec<float, ElementsPerWI> *>(x + float_ptr_offset);
++
++    quantize_q8_1_vals<ElementsPerWI>(wi_f32_vals, quantized_values, d, sum, it);
++}
++
++// GGML_SYCL_Q8_PROD: one block (the sub-group's group id) of a ONE-ROW reorder-SoA q8_1 tensor, from values a producer
++// kernel holds in registers; what quantize_and_reorder_q8_1_soa writes for row 0, block `group id`.
++template <int ElementsPerWI>
++__dpct_inline__ static void q8_1_soa_store_block(const sycl::vec<float, ElementsPerWI> & vals, void * reordered_q8_tensor,
++                                                 const int kx, const sycl::nd_item<1> & it) {
++    auto col   = it.get_group(0);
++    auto wi_id = it.get_local_id(0);
++    sycl::vec<int8_t, ElementsPerWI> quantized_values;
++    float                            d   = 0.0f;
++    float                            sum = 0.0f;
++    quantize_q8_1_vals<ElementsPerWI>(vals, quantized_values, d, sum, it);
++    auto quant_ptr = (int8_t *) ((char *) reordered_q8_tensor + QK8_1 * col + wi_id * ElementsPerWI);
++    *reinterpret_cast<sycl::vec<int8_t, ElementsPerWI> *>(quant_ptr) = quantized_values;
++    auto ds_ptr = (sycl::half2 *) ((char *) reordered_q8_tensor + kx + col * sizeof(sycl::half2));
++    if (wi_id == 0) {
++        *ds_ptr = sycl::half2(sycl::half(d), sycl::half(sum));
++    }
++}
++
+ // No op to control codepath in ggml_sycl_op_mul_mat
+ template <int ElementsPerWI> struct no_quantize_q8_1 {
+     void operator()(const float *, void *, int, int, const sycl::nd_item<1> &) const {}
+--- a/ggml/src/ggml-sycl/element_wise.cpp
++++ b/ggml/src/ggml-sycl/element_wise.cpp
+@@ -2,6 +2,7 @@
+ #include "ggml-sycl/presets.hpp"
+ #include "ggml.h"
+ #include "element_wise.hpp"
++#include "quantize.hpp"
+ 
+ #define SYCL_GLOBAL_ID_LOOP(K, ITEM) \
+     for (auto i = ITEM.get_global_id(0); i < (size_t)K; i += ITEM.get_global_range(0))
+@@ -1430,3 +1431,72 @@
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
+     ggml_sycl_op_trunc(ctx, dst);
+ }
++
++// ---- GGML_SYCL_Q8_PROD (see apply_q8p.py): one-token producers that also write the q8_1 reorder-SoA copy of their output.
++// One sub-group per 32 values, QK8_1/WARP_SIZE values per lane: the same blocks, lane order and reductions as
++// quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>, so the copy is bit-identical to the standalone launch's.
++template <typename F>
++static void unary_mul_q8_t1(const float * x, const float * g, float * dst, char * q8, const int k, queue_ptr stream, F op) {
++    constexpr int E = QK8_1 / WARP_SIZE;
++    stream->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (k / QK8_1) * WARP_SIZE), sycl::range<1>(WARP_SIZE)),
++                         [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                             const size_t off = it.get_group(0) * QK8_1 + E * it.get_local_id(0);
++                             const sycl::vec<float, E> xv = *reinterpret_cast<const sycl::vec<float, E> *>(x + off);
++                             const sycl::vec<float, E> gv = *reinterpret_cast<const sycl::vec<float, E> *>(g + off);
++                             sycl::vec<float, E> v;
++#pragma unroll
++                             for (int i = 0; i < E; i++) {
++                                 v[i] = op(xv[i]) * gv[i];
++                             }
++                             *reinterpret_cast<sycl::vec<float, E> *>(dst + off) = v;
++                             q8_1_soa_store_block<E>(v, q8, k, it);
++                         });
++}
++
++static bool q8p_ptr_ok(const void * p) { return p && ((uintptr_t) p & 7) == 0; }
++
++bool ggml_sycl_q8p_unary_mul(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node, char * q8) {
++    const ggml_tensor * x = unary_node->src[0];
++    const ggml_tensor * g = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
++    if (g == unary_node || x->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 || mul_node->type != GGML_TYPE_F32 ||
++        ggml_nelements(mul_node) != mul_node->ne[0] || mul_node->ne[0] % QK8_1 != 0 || !ggml_is_contiguous(mul_node) ||
++        !ggml_are_same_shape(x, g) || !ggml_are_same_shape(x, mul_node) || x->nb[0] != sizeof(float) ||
++        g->nb[0] != sizeof(float) || !q8p_ptr_ok(x->data) || !q8p_ptr_ok(g->data) || !q8p_ptr_ok(mul_node->data) ||
++        !q8p_ptr_ok(q8)) {
++        return false;
++    }
++    scope_op_debug_print scope_dbg_print(__func__, mul_node, /*num_src=*/2);
++    queue_ptr stream = ctx.stream();
++    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
++    const int k = (int) mul_node->ne[0];
++    const float * xp = (const float *) x->data; const float * gp = (const float *) g->data; float * dp = (float *) mul_node->data;
++    switch (ggml_get_unary_op(unary_node)) {
++        case GGML_UNARY_OP_SILU:     unary_mul_q8_t1(xp, gp, dp, q8, k, stream, [](float v) { return op_silu(v); });     return true;
++        case GGML_UNARY_OP_SIGMOID:  unary_mul_q8_t1(xp, gp, dp, q8, k, stream, [](float v) { return op_sigmoid(v); });  return true;
++        case GGML_UNARY_OP_SOFTPLUS: unary_mul_q8_t1(xp, gp, dp, q8, k, stream, [](float v) { return op_softplus(v); }); return true;
++        default: return false;
++    }
++}
++
++bool ggml_sycl_q8p_swiglu(ggml_backend_sycl_context & ctx, ggml_tensor * dst, char * q8) {
++    if (dst->op != GGML_OP_GLU || ggml_get_glu_op(dst) != GGML_GLU_OP_SWIGLU) return false;
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    if (!src0 || src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || (src1 && src1->type != GGML_TYPE_F32)) return false;
++    const int64_t nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
++    if (dst->ne[0] != nc || ggml_nelements(dst) != nc || nc % QK8_1 != 0 || !ggml_is_contiguous(dst) ||
++        src0->ne[1] != 1 || src0->ne[2] != 1 || src0->ne[3] != 1 || src0->nb[0] != sizeof(float) ||
++        (src1 && (src1->ne[0] != nc || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src1->nb[0] != sizeof(float)))) {
++        return false;
++    }
++    const int32_t swapped = ((const int32_t *) dst->op_params)[1];
++    const float * xp = (const float *) src0->data;
++    const float * gp = src1 ? (const float *) src1->data : xp;
++    if (!src1) { xp += swapped ? nc : 0; gp += swapped ? 0 : nc; }
++    if (!q8p_ptr_ok(xp) || !q8p_ptr_ok(gp) || !q8p_ptr_ok(dst->data) || !q8p_ptr_ok(q8)) return false;
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
++    queue_ptr stream = ctx.stream();
++    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
++    unary_mul_q8_t1(xp, gp, (float *) dst->data, q8, (int) nc, stream, [](float v) { return op_silu(v); });
++    return true;
++}
+--- a/ggml/src/ggml-sycl/element_wise.hpp
++++ b/ggml/src/ggml-sycl/element_wise.hpp
+@@ -132,4 +132,9 @@
+ // fused UNARY(silu|sigmoid|softplus) + MUL; see ggml_sycl_can_fuse() for the accepted shapes
+ void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
+ 
++// GGML_SYCL_Q8_PROD: the one-token producers above that also write the q8_1 reorder-SoA copy of their output into q8
++// (the buffer the reuse cache serves); false (nothing launched) when the shape is not exactly the supported one
++bool ggml_sycl_q8p_unary_mul(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node, char * q8);
++bool ggml_sycl_q8p_swiglu(ggml_backend_sycl_context & ctx, ggml_tensor * dst, char * q8);
++
+ #endif // GGML_SYCL_ELEMENTWISE_HPP
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -6504,6 +6504,56 @@
+     return skip;
+ }
+ 
++// GGML_SYCL_Q8_PROD: a producer's one-token f32 output `out` (written by the node before `from`) is read next, as src1,
++// by a direct-path Q8_0 MUL_MAT -- the first node that is not a view. Returns that MUL_MAT, else nullptr.
++static bool ggml_sycl_q8_prod_on() {
++    static const bool on = [] { const char * e = getenv("GGML_SYCL_Q8_PROD"); return e && atoi(e) != 0; }();
++    return on;
++}
++
++static ggml_tensor * ggml_sycl_q8p_consumer(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int from, const ggml_tensor * out) {
++    if (!ggml_sycl_q8_prod_on() || !ggml_sycl_q8_reuse_on() || !ggml_sycl_q8_direct_on() || (out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return nullptr;
++    }
++    for (int j = from; j < cgraph->n_nodes; j++) {
++        ggml_tensor * c = cgraph->nodes[j];
++        if (ggml_sycl_is_view_or_noop(c)) {
++            continue;
++        }
++        const ggml_tensor * s1 = c->src[1];
++        if (c->op != GGML_OP_MUL_MAT || !s1 || s1->data != out->data || ggml_nelements(s1) != ggml_nelements(out) ||
++            s1->ne[0] != ggml_nelements(out) || !ggml_is_contiguous(s1) || s1->ne[0] % QK8_1 != 0 ||
++            !ggml_sycl_q8_direct_eligible(ctx, c->src[0], s1, c)) {
++            return nullptr;
++        }
++        return c;
++    }
++    return nullptr;
++}
++
++// the q8r buffer sized for `src1`, as ggml_sycl_q8_direct_prepare sizes it
++static char * ggml_sycl_q8p_buffer(ggml_backend_sycl_context & ctx, const ggml_tensor * src1) {
++    ggml_sycl_set_device(ctx.device);
++    queue_ptr     stream = ctx.stream();
++    const int64_t padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
++    const size_t  bytes  = (size_t) padded * sizeof(block_q8_1) / QK8_1;
++    if (ctx.q8r_cap < bytes) {
++        if (ctx.q8r_buf) {
++            stream->wait();   // the in-order queue may still read the old copy
++            sycl::free(ctx.q8r_buf, *stream);
++        }
++        ctx.q8r_cap = std::max<size_t>(bytes, 128 * 1024);
++        ctx.q8r_buf = (char *) sycl::malloc_device(ctx.q8r_cap, *stream);
++        ctx.q8r_src1 = nullptr;   // the old copy is gone with the old buffer, whether or not the producer then declines
++    }
++    return ctx.q8r_buf;
++}
++
++// the buffer now holds src1's copy (kind 1: reorder SoA), exactly as ggml_sycl_q8_direct_prepare would leave it
++static void ggml_sycl_q8p_publish(ggml_backend_sycl_context & ctx, const ggml_tensor * src1) {
++    ctx.q8r_src1 = src1; ctx.q8r_data = src1->data; ctx.q8r_nbytes = ggml_nbytes(src1); ctx.q8r_ne10 = src1->ne[0]; ctx.q8r_kind = 1;
++}
++
+ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+     ggml_sycl_set_main_device(sycl_ctx->device);
+     g_moesum_n = 0;   // apply_fuse3.py: no CONT skip survives a graph
+@@ -6745,11 +6795,29 @@
+         }
+         if (node->op == GGML_OP_UNARY &&
+             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { ggml_get_unary_op(node) })) {
++            if (ggml_tensor * c = ggml_sycl_q8p_consumer(*sycl_ctx, cgraph, i + 2, cgraph->nodes[i + 1])) {
++                if (ggml_sycl_q8p_unary_mul(*sycl_ctx, node, cgraph->nodes[i + 1], ggml_sycl_q8p_buffer(*sycl_ctx, c->src[1]))) {
++                    ggml_sycl_q8p_publish(*sycl_ctx, c->src[1]);
++                    i++;
++                    q8r_from = i + 1;   // the folded MUL wrote the tensor before the copy was made
++                    continue;
++                }
++            }
+             ggml_sycl_op_unary_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+             i++;
+             continue;
+         }
+ 
++        // GGML_SYCL_Q8_PROD: a one-token SWIGLU read next by a direct-path Q8_0 MUL_MAT also writes its q8_1 copy
++        if (node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU) {
++            if (ggml_tensor * c = ggml_sycl_q8p_consumer(*sycl_ctx, cgraph, i + 1, node)) {
++                if (ggml_sycl_q8p_swiglu(*sycl_ctx, node, ggml_sycl_q8p_buffer(*sycl_ctx, c->src[1]))) {
++                    ggml_sycl_q8p_publish(*sycl_ctx, c->src[1]);
++                    continue;
++                }
++            }
++        }
++
+         // Batch consecutive independent same-shape F32 L2_NORM siblings (the GDN q/k
+         // norms) into one launch; sources are strided views of the fused qkv buffer, so
+         // the scan skips the interleaved view nodes instead of breaking on them.
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6511,6 +6511,49 @@
+     }
+ };
+ 
++
++// GGML_SYCL_Q8_PROD: a one-token producer (UNARY+MUL, or SWIGLU) read by two Q8_0 matvecs (the second hits the cache);
++// optionally a view between them, and a producer whose reader is not a matvec (must keep the old path).
++struct test_q8_prod : public test_case {
++    const int64_t m, k;
++    const int     kind;   // 0 silu*g, 1 swiglu on one fused [gate|up] tensor, 2 swiglu on two tensors, 3 silu*g read by a non-matvec between the matvecs, 4 silu*g overwritten in place between them
++
++    std::string vars() override { return VARS_TO_STR3(m, k, kind); }
++    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "Q8_PROD"; }
++    bool run_whole_graph() override { return true; }
++    double max_nmse_err() override { return 5e-4; }
++
++    test_q8_prod(int64_t m = 512, int64_t k = 2560, int kind = 0) : m(m), k(k), kind(kind) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a1 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m);
++        ggml_tensor * a2 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m);
++        ggml_tensor * p;
++        if (kind == 0 || kind == 3 || kind == 4) {
++            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
++            ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
++            p = ggml_mul(ctx, ggml_silu(ctx, x), g);
++        } else if (kind == 1) {
++            ggml_tensor * xg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * k, 1);
++            p = ggml_swiglu(ctx, xg);
++        } else {
++            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
++            ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
++            p = ggml_swiglu_split(ctx, x, g);
++        }
++        ggml_tensor * out = ggml_mul_mat(ctx, a1, p);
++        if (kind == 3) {
++            out = ggml_add(ctx, out, ggml_sum_rows(ctx, ggml_scale(ctx, p, 2.0f)));   // a non-matvec reader after the first matvec
++        }
++        if (kind == 4) {
++            p = ggml_scale_inplace(ctx, p, 3.0f);   // overwrites the producer's tensor: the cached q8_1 copy must not serve it
++        }
++        out = ggml_add(ctx, out, ggml_mul_mat(ctx, a2, p));
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_TOP_K
+ struct test_top_k : public test_case {
+     const ggml_type type;
+@@ -10423,6 +10466,11 @@
+         }
+     }
+ 
++    for (int kind : {0, 1, 2, 3, 4}) {
++        test_cases.emplace_back(new test_q8_prod(512, 2560, kind));
++        test_cases.emplace_back(new test_q8_prod(6144, 2048, kind));
++    }
++
+     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
+         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
+             test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i-1, 1, 1, 1}));

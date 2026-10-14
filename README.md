@@ -253,6 +253,19 @@ Qwen3.8-Flash-Next ships the Qwen4-generation design, `qwen4exp` in the GGUF, an
 
 **What this means for the next Qwen releases.** Every hyper-parameter the engine uses is read from the GGUF metadata (layer count and interval, expert count and top-k, indexer geometry, DeltaNet sizes, PLE geometry, context and rope). Nothing is hard-coded to this checkpoint. A future checkpoint built from the same blocks at a different size (more experts, more layers, a bigger PLE, a longer context) is a metadata change; a new block is a graph change, validated against the reference the same way. What the engine needs from the hardware is set by the *active* path per token and by the tiers you can afford, not by the file size: the dense core and the KV/indexer state must fit in VRAM, and everything else streams through cache tiers sized to the GPU and RAM present. The console's cost model does that sizing for whatever machine it finds. Two things are still on the list: the checkpoint's multi-token-prediction head (the *Draft head* setting: the trunk verifies every draft, so the output is its own) pays in chat and in agentic coding but not yet on a 155K-token document, and the tiers have only been measured on the 16 GB / 30 GB reference machine; the console's auto-tune is what carries the sizing to other machines.
 
+## Vision
+
+A `--mmproj` file enables the Qwen3-VL vision tower: a 449M-parameter ViT (27
+blocks, 1152 wide, gelu FFN, 16 heads, 16px patches, 2x2 spatial-merge
+`qwen3vl_merger`) feeding 2560-wide embeddings into the LLM. Images ride the
+OpenAI `content` parts (`image_url` with a `data:` base64 URL) and the
+Anthropic `input_image` blocks; the tower encodes each to `grid*w/16 * grid*h/4`
+tokens inserted at the image's position. The tower runs on the CPU by default
+(`--vision-threads`, defaults to physical cores), keeping its 0.9 GB out of the
+VRAM reserved for the expert tier; `--vision-gpu` moves it to the GPU backend
+(~18x faster encodes, measured 1.7 s vs 31.3 s for a 1400x1000 image) at the
+cost of ~1 GB VRAM - pair it with `--vram` one notch lower.
+
 ## Acknowledgment
 
 Built on [ggml](https://github.com/ggml-org/ggml) (quantized kernels, CUDA backend) and [llama.cpp](https://github.com/ggml-org/llama.cpp) (tokenizer, and the bit-exact reference the forward pass is validated against). Model: Qwen3.8-Flash-Next by the [Qwen](https://huggingface.co/Qwen) team; quantized GGUFs by [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), whose Studio served as the harness for testing. The MTP recipe (rows marked *(Strata)*) follows
@@ -265,3 +278,5 @@ by ISTA-DASLab. The SYCL backend is ggml's, built with Intel oneAPI and oneDNN.
 ## License
 
 [Apache License 2.0](LICENSE).
+
+Last updated: 2026-10-07
