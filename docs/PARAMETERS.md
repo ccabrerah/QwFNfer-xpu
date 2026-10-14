@@ -124,12 +124,10 @@ Extra arguments are appended to the server's command line (later values win).
 | `QWFN_Q8_SOA` | 1 | 1 | VRAM tier's q8_0 experts in the SOA layout, read by patch 31's one-token MoE matvec (overlay v4's five Q8_0 expert-down layers: 2.15 -> 0.77 ms per verify step). |
 | `QWFN_PREDICT_CUR2` | 1 | 1 | Predict layer L+1's routing from this layer's FFN-mix input through L+1's router (cheaper, as accurate). |
 | `QWFN_RAM_EXCLUSIVE` | 1 | set by the deployment | Exclusive expert tiers: RAM holds what VRAM does not; a promotion reads the VRAM victim back into RAM. |
-| `QWFN_RAM_LENT_INCLUSIVE` | 1 | | With exclusive tiers, keep the layers lent to the prefill inclusive. |
 | `QWFN_LEND_RESTORE` | 1 | 1 | After a streamed prompt (or an image's projector staging), read back the VRAM experts of the layers the prefill borrowed, hottest first, before the next decode. Without it, exclusive tiers leave those experts on disk and the reply refills them through misses. |
 | `QWFN_LEND_RESTORE_MS` | ms | 3000 | The restore's time budget. |
 | `QWFN_LEND_RESTORE_BATCH` | 1-64 | 32 | Experts per batched read in the restore. |
 | `QWFN_PF_VRAM` | 1 | 1 | A streamed prefill takes the experts the VRAM tier holds from the tier (a device copy; ggml-sycl patch 30 converts the SOA layouts back) instead of reading them from disk and uploading them. Exact; device staging only. |
-| `QWFN_SWAP_MIN_EF` | N | | Exclusive tiers: do not read back victims used fewer than N times (measured slower; off). |
 | `QWFN_PROMOTE_D2D` | 1 | on | Exclusive tiers: a promotion's victim is copied device-to-device into a 16-entry staging ring on the compute queue (before the upload overwrites its slot) and read back to its RAM slot on a side queue (patches 33 + 35), landing one layer later; placement is identical to off. The settle falls from ~2.8 to ~1.7 ms per token; wall clock ~1.5% at best. |
 | `QWFN_WARM_COUNTS` | FILE | on | Warm start: the per-expert use counts are saved to FILE at shutdown and every ~65K fetches (atomic rename) and, at the next start, loaded; the engine then reads each layer's hottest experts into the VRAM tier and the RAM tier before the first request (bounded by `QWFN_WARM_START_S`, default 25 s; ~9 s). A missing or mismatched file is ignored. The launcher keeps one file per model under `~/.cache/qwfnfer/`. First 500 tokens after a start: 16 -> 27 tok/s. |
 | `QWFN_TIER_CHECK` | 1 | | Diagnostic: every VRAM-resident expert read back and compared with the file (after the warm start and at shutdown). |

@@ -59,7 +59,28 @@ launcher (`scripts/b70/qwfn-b70.sh`) turns on the adopted ones.
   35.7k / 34.2k / 31.7k / 29.3k / 28.7k. Decode in within-window runs looked +4..6%, but interleaved A-B-B-A pairs
   (twice) gave 103.2 vs 102.6 s per 2,500 tokens (-0.6%, noise). Replay NLL equal or better in every arm (it moves
   with placement, see the note at the end). An offline simulator on routing traces had predicted <1-2 ms/token.
-- **Why it failed:** fewer promotions save PCIe traffic, but a promotion costs ~0.12 ms of upload and the saved
-  ones were mostly off the critical path; nothing else changed.
+- **Why it failed:** not established. Fewer promotions mean less PCIe traffic (a promotion's upload is ~0.12 ms),
+  but the decode time did not move; a likely reason is that the experts not promoted are then computed on the CPU
+  or read again later, which costs about what the promotion saved.
 - **Don't redo as:** a hysteresis or budget knob on promotions -- the same simulator showed the engine's sampled
   LFU, pure LRU and full-scan LFU within 0.1% of each other, and an oracle (Belady) saving only ~1 NVMe read per token.
+
+### `QWFN_SWAP_MIN_EF` -- exclusive tiers: don't read back cold victims
+
+- **What it did:** with exclusive tiers (`QWFN_RAM_EXCLUSIVE`), a VRAM victim used fewer than N times (the decayed
+  per-expert count) was dropped instead of read back into RAM, saving device-to-host traffic.
+- **Data** (tok/s, essay / code / temperature 0.7, `--ram 9`, 120 W, an older stack): read every victim back
+  40.9 / 42.2 / 40.7; N=2 38.9 / 41.7 / 40.1; N=4 34.2 / 39.1 / 42.0; N=8 39.1 / 41.5 / 37.7. Read-back traffic fell
+  (down per step 15.4 MB -> 8.8 / 5.0 / 1.5 on code), expert I/O rose (0.6 -> 1.5 / 5.3 / 2.5 ms per step on code).
+- **Why it failed:** every dropped victim that comes back is an NVMe read (~0.5-1 ms exposed) instead of a ~0.12 ms
+  read-back; the trade loses at every threshold.
+
+### `QWFN_RAM_LENT_INCLUSIVE` -- keep the prefill-lent layers inclusive
+
+- **What it did:** with exclusive tiers, the layers whose VRAM tier a streamed prefill borrows kept an inclusive RAM
+  tier (sized as if they had no VRAM tier), so a prefill would not drop their VRAM experts to disk.
+- **Data:** `--ram 11`: short prompts 40.8 / 45.9 / 38.8 tok/s against 47.7 / 47.9 / 46.2 fully exclusive (less
+  coverage), after a 20K prompt 22.1 vs 20.8. Agent turns at ~55K context: 23-26 tok/s against 20-23, short decode
+  -3%, still 11-20 experts per step not in VRAM after a turn.
+- **Why it failed:** `QWFN_LEND_RESTORE` (kept) solves the same problem better: after the prefill it reads the lent
+  layers' former VRAM residents back (hottest first, a ~3 s budget, now pipelined), without costing short prompts.

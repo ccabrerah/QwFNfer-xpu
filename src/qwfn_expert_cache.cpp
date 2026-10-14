@@ -435,9 +435,8 @@ void expert_cache::exclusive_split(uint32_t n_expert) {
         total_slots_ += lp.n_slots;
         covered += std::min<size_t>(n_expert, (size_t) lp.n_slots + lp.g_slots);
     }
-    fprintf(stderr, "[qwfn] exclusive expert tiers%s: RAM slots split by what VRAM does not hold -- %zu RAM + %zu VRAM "
+    fprintf(stderr, "[qwfn] exclusive expert tiers: RAM slots split by what VRAM does not hold -- %zu RAM + %zu VRAM "
                     "slots cover %zu of %u experts (%.1f%%; %.2f GB of RAM needed for all)\n",
-            cfg_.exclusive_lent_inclusive ? " (prefill-lent layers inclusive)" : "",
             total_slots_, total_gslots_, covered, n_layer * n_expert, 100.0 * covered / (n_layer * n_expert), need / 1e9);
 }
 
@@ -803,9 +802,7 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, int32_t ram_slot
     if (swaps_in(lp) && last_promote_async_) {
         const uint32_t layer = (uint32_t) (&lp - blk_.data());
         int32_t to = -1, ring = -1;
-        const bool cold_victim = victim_expert != SLOT_EMPTY && cfg_.swap_min_ef > 0 && lp.ef[victim_expert] < cfg_.swap_min_ef;
-        if (cold_victim) st_.swap_cold++;
-        if (victim_expert != SLOT_EMPTY && !cold_victim && !(lp.g_cold.size() > (size_t) victim && lp.g_cold[victim])) {
+        if (victim_expert != SLOT_EMPTY && !(lp.g_cold.size() > (size_t) victim && lp.g_cold[victim])) {
             while (!lp.free_slots.empty() && to < 0) {
                 const int32_t f = lp.free_slots.back(); lp.free_slots.pop_back();
                 if (lp.slot_expert[f] == SLOT_EMPTY && !lp.slot_pinned[f]) to = f;

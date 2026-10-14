@@ -530,11 +530,8 @@ bool engine::init(const model_index * hot, const model_index * cold,
     ec_cfg.iq4_soa = getenv("QWFN_IQ4_SOA") != nullptr; // and its iq4_nl experts (ggml-sycl patch 17)
     ec_cfg.q8_soa = getenv("QWFN_Q8_SOA") != nullptr;   // and its q8_0 experts (ggml-sycl patch 31)
     ec_cfg.promote_d2d = getenv("QWFN_PROMOTE_D2D") != nullptr;     // victim read-backs staged on device, read back on a side queue (patch 35)
-    // Exclusive tiers: RAM holds what VRAM does not (swaps on promotion); QWFN_RAM_LENT_INCLUSIVE=1 keeps the
-    // prefill-lent layers inclusive.
+    // Exclusive tiers: RAM holds what VRAM does not (swaps on promotion).
     ec_cfg.exclusive = getenv("QWFN_RAM_EXCLUSIVE") != nullptr;
-    ec_cfg.exclusive_lent_inclusive = getenv("QWFN_RAM_LENT_INCLUSIVE") != nullptr;
-    if (const char * v = getenv("QWFN_SWAP_MIN_EF")) ec_cfg.swap_min_ef = (uint32_t) std::max(0, atoi(v));
     ec_cfg.use_cold_tier = cfg.use_cold_tier;
     ec_cfg.max_promotions_per_layer = cfg.promote_per_layer;
     ec_cfg.ram_frac      = cfg.ram_frac;

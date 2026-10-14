@@ -85,7 +85,7 @@ struct expert_cache_stats {
     uint64_t swap_evictions = 0; // of those, the RAM slot taken from a resident (no free slot)
     uint64_t swap_dropped = 0;   // victims not kept: no RAM slot to take, or resident again by the settle
     uint64_t swap_converts = 0;  // RAM blocks turned from the device layout back to the file's for a CPU use
-    uint64_t swap_cold = 0;      // victims not read back: below config::swap_min_ef
+    uint64_t swap_cold = 0;      // always 0 (QWFN_SWAP_MIN_EF dropped, see docs/dropped-features.md); kept for the server's stats
     // settle_promotions(): the stream sync (the promotion copies landing) and the host work after it, seconds;
     // and the bytes the promotions moved each way.
     double   t_settle_sync = 0, t_settle_finish = 0;
@@ -166,12 +166,6 @@ public:
         // overwrites it), and the RAM slot the promoted expert leaves is freed at the next settle -- the next
         // swap's destination. The arena is split per layer by what that layer's VRAM tier does not hold.
         bool   exclusive = false;
-        // With exclusive: the layers whose VRAM tier a prefill borrows keep inclusive RAM (sized as if they had no
-        // VRAM tier, no swaps), so a prefill does not drop their VRAM experts to disk.
-        bool   exclusive_lent_inclusive = false;
-        // With exclusive: a VRAM victim used fewer than this many times (the decayed per-expert count) is not read
-        // back into RAM (dropped, as in the inclusive tiers); 0 reads every victim back.
-        uint32_t swap_min_ef = 0;
         unsigned queue_depth  = 256;
         io_engine::backend io_backend = io_engine::backend::uring;
         // Bound the H2D traffic spent warming T0: one block is ~2.18 MB, so
@@ -513,7 +507,7 @@ private:
     std::vector<pending_swap> pending_swaps_;
     std::vector<pending_swap> landing_;   // ring swaps already mapped whose read-back is queued: the ring entry frees (and the check runs) once the side queue is synced
     bool                      exclusive_ = false;
-    bool swaps_in(const layer_pool & lp) const { return exclusive_ && !(cfg_.exclusive_lent_inclusive && lp.g_in_lent); }
+    bool swaps_in(const layer_pool &) const { return exclusive_; }
     void exclusive_split(uint32_t n_expert);        // re-split the arena by what each layer's VRAM tier does not hold
     void finish_swap(pending_swap & sw);          // after the sync: the RAM tier's map follows the bytes
     void release_slot(layer_pool & lp, int32_t s);
