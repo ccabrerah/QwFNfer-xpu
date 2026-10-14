@@ -163,7 +163,7 @@ Extra arguments are appended to the server's command line (later values win).
 |---|---|
 | `QWFN_SYNC_PROMOTE` | Expert promotions to VRAM complete synchronously (default: asynchronous). |
 | `QWFN_VRAM_LRU` | VRAM tier replacement by pure recency (default: frequency with staleness). |
-| `QWFN_LATE_FULL` | Full-width late fold of experts promoted mid-step (default: `promote_per_layer` rows per position). |
+| `QWFN_LATE_NARROW` | The late fold of experts promoted mid-step sized to the promotion budget (`promote_per_layer` rows per position) instead of the full width (on in the launcher). |
 | `QWFN_PREFETCH_EARLY` | Submit the next layer's speculative reads before this layer's demand reads land (default: after). |
 | `QWFN_PREDICT_SHARED` / `QWFN_PREDICT_PLAIN` | Predict routing from the residual with the shared expert / the bare residual (A/B). |
 | `QWFN_READ_SPLIT=k` | Issue every expert read as k pieces (1-8). |
@@ -173,7 +173,7 @@ Extra arguments are appended to the server's command line (later values win).
 | `QWFN_PAGEABLE_ARENA` / `QWFN_PREFILL_PAGEABLE` | RAM tier / prefill staging in pageable instead of pinned memory. |
 | `QWFN_CBATCH_KV=N` | Override the cache-batched prompt path's tokens x context cap (0 disables the rule). |
 | `QWFN_NO_CACHE_BATCH` | Short prompts as repeated decodes instead of one cache-batched step. |
-| `QWFN_GRAPH_STASH_MB=N` / `QWFN_NO_GRAPH_STASH` | Budget for stashed decode graphs of other step widths (default 256 MB) / none. |
+| `QWFN_GRAPH_STASH` / `QWFN_GRAPH_STASH_MB=N` | Keep the decode layer graphs of other step widths (MTP verify steps) instead of rebuilding them (on in the launcher) / their budget (default 256 MB). |
 
 ### Decode and prefill graph (A/B against older paths)
 
@@ -185,12 +185,12 @@ Extra arguments are appended to the server's command line (later values win).
 | `QWFN_LEGACY_PREFILL_MOE` | The grouped prefill MoE instead of `mul_mat_id` on the device. |
 | `QWFN_LEGACY_QSA_DECODE` | The older one-token sparse attention graph. |
 | `QWFN_LEGACY_UPLOAD` | Prefill expert uploads on the default stream. |
-| `QWFN_HC_MEAN_T1_ONLY` / `QWFN_PACK_T1_ONLY` | Stream mean / output packing at one-token steps only. |
+| `QWFN_HC_MEAN_MULTI` / `QWFN_PACK_MULTI` | The stream mean as one matmul / the readback pack for up to 4 positions (MTP verify steps) too; default one-token steps only (both on in the launcher). |
 | `QWFN_NO_FUSE` | No graph-level GPU fusions. |
 | `QWFN_NO_INPLACE` | No in-place writes of layer outputs. |
 | `QWFN_NO_PACK` | No packed readback of routing results. |
-| `QWFN_NO_UPLOAD_SKIP` | Upload zero partials even when the device already holds zeros. |
-| `QWFN_NO_INJECT_FOLD` / `QWFN_NO_DOWN_FOLD` | Do not fold the hyper-connection inject / down scales into the weights at load. |
+| `QWFN_UPLOAD_SKIP` | Skip uploading zero partials when the device already holds zeros (on in the launcher). |
+| `QWFN_NO_INJECT_FOLD` / `QWFN_DOWN_FOLD` | Do not fold the hyper-connection inject scale into the weights at load (upstream's fold) / fold the down scales too (ours, on in the launcher). |
 | `QWFN_FORCE_BATCHED` | Run one-token steps through the batched path (unit test of its permutation). |
 
 ### Diagnostics

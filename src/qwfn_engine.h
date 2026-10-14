@@ -446,7 +446,7 @@ private:
     std::vector<int64_t>     gA_bucket_;   // attention layers: the block bucket the graph was built for
     // Per-T cache of the decode layer graphs (an MTP step's T changes from step to step: 1 + accepted/gated
     // drafts). A graph built for another T is parked here, under its T, instead of freed, and restored when
-    // that T comes back; index [T][layer], T = 1..1 + MTP_MAX_DRAFTS. QWFN_NO_GRAPH_STASH=1: the old rebuild.
+    // that T comes back; index [T][layer], T = 1..1 + MTP_MAX_DRAFTS. Only with QWFN_GRAPH_STASH=1 (default: the rebuild).
     struct stashed_graph { layer_graph g; int64_t bucket = -1; uint8_t pack = 0; };
     std::vector<std::vector<stashed_graph>> gA_stash_;
     size_t gA_stash_bytes_ = 0, gA_stash_budget_ = 0;   // their compute buffers; QWFN_GRAPH_STASH_MB (default 256)

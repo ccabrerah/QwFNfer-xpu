@@ -11,8 +11,8 @@ is [`B70-registry.md`](B70-registry.md).
 Every switch in `scripts/b70/qwfn-b70.sh` is a row of the README's **Major improvements** table (what it changes and
 its measured effect); the README's run configuration lists them by group.
 
-Engine defaults in this fork (no switch): the late fold sized to the promotion budget (`QWFN_LATE_FULL=1`
-restores), deferred speculative prefetch (`QWFN_PREFETCH_EARLY=1` restores).
+Every behaviour this fork adds to the engine is behind a switch and off by default (the engine then behaves as
+upstream's); the launcher turns on the adopted ones. Removed switches and their data: `dropped-features.md`.
 
 ## Flags
 

@@ -299,7 +299,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
         }
         down_names.push_back("output_hc_down.weight");
         if (!getenv("QWFN_NO_INJECT_FOLD")) hp_.hc_inject_prescaled = fold_set(inj_names, "inject");
-        if (!getenv("QWFN_NO_DOWN_FOLD"))   hp_.hc_down_prescaled   = fold_set(down_names, "down");
+        if (getenv("QWFN_DOWN_FOLD"))       hp_.hc_down_prescaled   = fold_set(down_names, "down");   // ours, opt-in (the inject fold is upstream's)
     }
     constexpr int64_t MAXT = 1 + MTP_MAX_DRAFTS;   // positions of the longest verify step
     pack_n_ = MAXT * (n_embd + 2 * (int64_t) U + 2 * (int64_t) QWFN_SPEC_MAX);   // room for a multi-token step
@@ -595,8 +595,8 @@ bool engine::init(const model_index * hot, const model_index * cold,
     // A decode step fetches each layer once, for the union of its positions, and that fetch promotes at
     // most promote_per_layer * n_new experts (eval_decode sets the cap per step): a T-position step's fold
     // never holds more than late_rows(T). At T = 1 that cuts the fold's three mul_mat_id from 8 experts to 2
-    // in every layer graph. QWFN_LATE_FULL=1 restores the full width.
-    n_late_per_pos_ = getenv("QWFN_LATE_FULL") ? n_late_ : (int) std::max<uint32_t>(1, ec_cfg.max_promotions_per_layer);
+    // in every layer graph. QWFN_LATE_NARROW=1 turns this on (default: the full width).
+    n_late_per_pos_ = getenv("QWFN_LATE_NARROW") ? (int) std::max<uint32_t>(1, ec_cfg.max_promotions_per_layer) : n_late_;
     // Before the tier sizes itself from the free VRAM: the heads' 123 MB must come out of the tier, not the decode reserve.
     if (!cfg.predictor_path.empty() && !load_predictor(cfg.predictor_path, err)) return false;
     if (!ec_.init(hot, cold, ec_cfg, err)) return false;
@@ -643,7 +643,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
 
     gA_.assign(hp_.n_layer, layer_graph{});
     gA_bucket_.assign(hp_.n_layer, -1);
-    if (!getenv("QWFN_NO_GRAPH_STASH")) gA_stash_.assign(2 + MTP_MAX_DRAFTS, std::vector<stashed_graph>(hp_.n_layer));
+    if (getenv("QWFN_GRAPH_STASH")) gA_stash_.assign(2 + MTP_MAX_DRAFTS, std::vector<stashed_graph>(hp_.n_layer));
     gA_stash_budget_ = (size_t) (getenv("QWFN_GRAPH_STASH_MB") ? atol(getenv("QWFN_GRAPH_STASH_MB")) : 256) << 20;
     gM_.assign(hp_.n_layer, moe_graph{});
     if (getenv("QWFN_VRAM_AUDIT")) {
@@ -2276,9 +2276,9 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         // nothing on the device needs t_sel_/t_w_ afterwards. Decided here so the
         // build and the readback of a cached graph agree.
         // Any T up to the pack's room (a verify step): nothing on the device reads t_sel_/t_w_/t_selnext_/
-        // t_specscore_ after the layer graph, only the host does. QWFN_PACK_T1_ONLY=1: one-token steps only.
-        static const bool pack_t1_only = getenv("QWFN_PACK_T1_ONLY") != nullptr;
-        const bool pack_ok = t_pack_ && decode && (pack_t1_only ? T == 1 : T <= 1 + MTP_MAX_DRAFTS) && moe_in_graph(il) && !legacy_moe && !check_moe;
+        // t_specscore_ after the layer graph, only the host does. QWFN_PACK_MULTI=1 turns this on (default: T == 1).
+        static const bool pack_multi = getenv("QWFN_PACK_MULTI") != nullptr;
+        const bool pack_ok = t_pack_ && decode && (pack_multi ? T <= 1 + MTP_MAX_DRAFTS : T == 1) && moe_in_graph(il) && !legacy_moe && !check_moe;
         // A graph that speculatively runs an attention successor's block is shaped by the bucket too.
         const bool spec_attn_next = cfg_.spec_block && decode && use_qd && il + 1 < hp_.n_layer
                                     && hp_.is_attn_layer(il + 1) && spec_block_mask_[il + 1];
@@ -2829,7 +2829,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     if ((int) late_gpu.size() > late_rows(T)) { fprintf(stderr, "[qwfn] %zu late experts, fold holds %d\n", late_gpu.size(), late_rows(T)); abort(); }
                     // Nothing late and the rows already zero on the device from an earlier layer:
                     // the fold reads the same zeros without two more copies.
-                    static const bool upload_skip = getenv("QWFN_NO_UPLOAD_SKIP") == nullptr;
+                    static const bool upload_skip = getenv("QWFN_UPLOAD_SKIP") != nullptr;   // ours, opt-in
                     if (upload_skip && late_gpu.empty() && late_zero_rows_ >= T) {
                         n_upload_skip += 2;
                     } else {
@@ -3119,7 +3119,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             const auto tup = std::chrono::steady_clock::now();
             // No CPU experts leaves acc bitwise zero; skip it when t_pc_ already holds zeros.
             const bool pc_zero = memcmp(acc.data(), zeros_.data(), nfl * sizeof(float)) == 0;
-            static const bool upload_skip = getenv("QWFN_NO_UPLOAD_SKIP") == nullptr;
+            static const bool upload_skip = getenv("QWFN_UPLOAD_SKIP") != nullptr;   // ours, opt-in
             if (upload_skip && decode && pc_zero && pc_zero_t_ == t_pc_ && pc_zero_rows_ >= T) {
                 n_upload_skip++;
             } else {
