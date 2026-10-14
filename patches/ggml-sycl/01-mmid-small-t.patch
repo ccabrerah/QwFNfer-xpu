@@ -1,13 +1,26 @@
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 686a4c7..b1cf92b 100644
+index 686a4c7..480014e 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -5120,6 +5120,26 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+@@ -5101,6 +5101,12 @@ static void mmid_counting_sort_rows(
+     }
+ }
+ 
++// GGML_SYCL_MMID_SMALL_T=1 (patch 01): a MUL_MAT_ID of up to 8 tokens runs the fused one-token kernel per token
++static bool ggml_sycl_mmid_small_t_on() {
++    static const bool on = [] { const char * e = getenv("GGML_SYCL_MMID_SMALL_T"); return e && atoi(e) != 0; }();
++    return on;
++}
++
+ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+                                  ggml_tensor *dst) try {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
+@@ -5120,6 +5126,26 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
          if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
              return;
          }
-+    } else if (ne12 <= 8 && ids->ne[1] == ne12 && ne13 == 1 && ids->ne[2] == 1) {
-+        // few tokens (e.g. a speculative decoding verify): run the fused kernel on each token view, so ids stay on the device
++    } else if (ggml_sycl_mmid_small_t_on() && ne12 <= 8 && ids->ne[1] == ne12 && ne13 == 1 && ids->ne[2] == 1) {
++        // GGML_SYCL_MMID_SMALL_T=1, few tokens (e.g. a speculative decoding verify): run the fused kernel on each token view, so ids stay on the device
 +        // the fused checks do not depend on the token: all tokens take this path, or the first one declines
 +        bool ok = true;
 +        for (int64_t t = 0; t < ne12 && ok; t++) {

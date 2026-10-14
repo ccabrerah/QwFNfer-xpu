@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-sycl/topk-moe.cpp b/ggml/src/ggml-sycl/topk-moe.cpp
-index 78574c4..7b0c946 100644
+index 78574c4..a0e9b95 100644
 --- a/ggml/src/ggml-sycl/topk-moe.cpp
 +++ b/ggml/src/ggml-sycl/topk-moe.cpp
 @@ -571,7 +571,8 @@ int ggml_sycl_fuse_topk_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
@@ -17,8 +17,8 @@ index 78574c4..7b0c946 100644
          out_nodes[1] = i + (int) ops.size() - 1;
  
 -        if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-+        // div_as_output: the final RESHAPE is a view of the DIV; the kernel's weights land in the DIV's memory
-+        static const bool div_out = [] { const char * e = getenv("GGML_SYCL_TOPK_DIV_OUT"); return !e || atoi(e) != 0; }();
++        // GGML_SYCL_TOPK_DIV_OUT=1, div_as_output: the final RESHAPE is a view of the DIV; the kernel's weights land in the DIV's memory
++        static const bool div_out = [] { const char * e = getenv("GGML_SYCL_TOPK_DIV_OUT"); return e && atoi(e) != 0; }();
 +        if (div_out && args.norm && !args.scale) {
 +            const int div_idx = i + (int) ops.size() - 2;
 +            const ggml_tensor * div = cgraph->nodes[div_idx];

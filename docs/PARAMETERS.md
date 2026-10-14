@@ -238,6 +238,9 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_FUSE_HC=1` | 04, 11 | 1 | Hyper-connection combine + norm fused (prefill). 2 also logs declines; 3 forces two passes (test). |
 | `GGML_SYCL_FUSE_HC_DECODE=1` | 06 | 1 | The same fusion at decode sizes. |
 | `GGML_SYCL_FUSE_HC_GATE=1` | 11 | 1 | The combine gate evaluated inside the fused kernel. |
+| `GGML_SYCL_MMID_SMALL_T=1` | 01 | on | A MUL_MAT_ID of up to 8 tokens (a verify step) runs the fused one-token kernel per token, ids staying on the device. |
+| `GGML_SYCL_TOPK_DIV_OUT=1` | 12 | on | The fused router top-k writes its normalised weights into the DIV's memory, so the fusion also fires at decode. Measured null (a launch traded for a wait). |
+| `GGML_CPU_Q2_0_AVX2=1` | 23 | on | AVX2 `ggml_vec_dot_q2_0_q8_0` for the CPU experts (394 -> 150 us per expert gate+up on one core) instead of the scalar loop. |
 | `GGML_SYCL_MMVW=1` | 05, 22 | 1 | Wide-load bf16/f16 matvec for 1-4 tokens. |
 | `GGML_SYCL_SMALLK=1` | 05, 22 | 1 | Small-K f32 matmul without oneMKL's per-call cost. |
 | `GGML_SYCL_MOE_Q2W=1` | 07, 08, 22 | 1 | q2_0 MoE matvec, a 64-weight block per lane; with it the fused gate+up+SwiGLU. |

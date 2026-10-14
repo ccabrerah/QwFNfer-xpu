@@ -5,10 +5,23 @@ x86 had only the scalar loop for Q2_0 x Q8_0 (arch-fallback.h). 2-bit codes unpa
 mul_sum_i8_pairs_float against each Q8_0 half, FMA-accumulated in a float vector as ggml_vec_dot_q4_0_q8_0 does.
 One expert's gate+up (1280 x 2560) on one core: 394 -> 150 us; max error 2.7e-8 of sum|w*a| vs 5.2e-8 scalar.
 
+diff --git a/ggml/src/ggml-cpu/arch-fallback.h b/ggml/src/ggml-cpu/arch-fallback.h
+index 2b9a426..aa22489 100644
+--- a/ggml/src/ggml-cpu/arch-fallback.h
++++ b/ggml/src/ggml-cpu/arch-fallback.h
+@@ -83,7 +83,6 @@
+ #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
+ #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+ // quants.c
+-#define ggml_vec_dot_q2_0_q8_0_generic ggml_vec_dot_q2_0_q8_0
+ // repack.cpp
+ #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
+ #define ggml_quantize_mat_q8_K_4x4_generic ggml_quantize_mat_q8_K_4x4
 diff --git a/ggml/src/ggml-cpu/arch/x86/quants.c b/ggml/src/ggml-cpu/arch/x86/quants.c
+index ea54cfe..1ad9ee1 100644
 --- a/ggml/src/ggml-cpu/arch/x86/quants.c
 +++ b/ggml/src/ggml-cpu/arch/x86/quants.c
-@@ -1505,6 +1505,52 @@
+@@ -1505,6 +1505,56 @@ void ggml_vec_dot_tq1_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
  #endif
  }
  
@@ -21,6 +34,10 @@ diff --git a/ggml/src/ggml-cpu/arch/x86/quants.c b/ggml/src/ggml-cpu/arch/x86/qu
 +    UNUSED(nrc);
 +
 +#if defined(__AVX2__)
++    // GGML_CPU_Q2_0_AVX2=1 (patch 23): this kernel; otherwise the scalar loop
++    static int avx2_on = -1;
++    if (avx2_on < 0) { const char * e = getenv("GGML_CPU_Q2_0_AVX2"); avx2_on = e && atoi(e) != 0; }
++    if (!avx2_on) { ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc); return; }
 +    UNUSED(bx);
 +    UNUSED(by);
 +    UNUSED(bs);
@@ -61,14 +78,3 @@ diff --git a/ggml/src/ggml-cpu/arch/x86/quants.c b/ggml/src/ggml-cpu/arch/x86/qu
  void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
      assert(nrc == 1);
      UNUSED(nrc);
-diff --git a/ggml/src/ggml-cpu/arch-fallback.h b/ggml/src/ggml-cpu/arch-fallback.h
---- a/ggml/src/ggml-cpu/arch-fallback.h
-+++ b/ggml/src/ggml-cpu/arch-fallback.h
-@@ -83,7 +83,6 @@
- #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
- #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
- // quants.c
--#define ggml_vec_dot_q2_0_q8_0_generic ggml_vec_dot_q2_0_q8_0
- // repack.cpp
- #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
- #define ggml_quantize_mat_q8_K_4x4_generic ggml_quantize_mat_q8_K_4x4
