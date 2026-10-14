@@ -179,6 +179,12 @@ void prefill_streamer::release_device() {
 // The actual read, into buffer `b`. Runs on the reader thread when overlap is
 // on and on the caller otherwise -- never both at once, so the io engine has a
 // single user.
+static double pft_ms() {   // QWFN_PF_TRACE: ms since the first call
+    static const auto t0 = std::chrono::steady_clock::now();
+    return 1e3 * std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+static bool pft_on() { static const bool on = getenv("QWFN_PF_TRACE") != nullptr; return on; }
+
 bool prefill_streamer::read_into(hbuf & b, uint32_t layer, std::string & err) {
     const uint32_t n_expert = mi_->hp().n_expert;
 
@@ -281,7 +287,15 @@ void prefill_streamer::reader_loop() {
             reading_ = true;
         }
         std::string e;
+        const auto tr0 = std::chrono::steady_clock::now();
+        if (pft_on()) fprintf(stderr, "[pft] t=%.0f reader start layer %d\n", pft_ms(), layer);
+        const uint64_t nv0 = bytes_read, nr0 = bytes_from_ram, nvr0 = bytes_from_vram;
         const bool ok = read_into(hb_[t], (uint32_t) layer, e);
+        { static const bool tr = getenv("QWFN_PF_TRACE") != nullptr;
+          if (pft_on()) fprintf(stderr, "[pft] t=%.0f reader end layer %d\n", pft_ms(), layer);
+          if (tr) fprintf(stderr, "[pftrace] layer %2d reader: %.1f ms (nvme %.0f MB, ram %.0f MB, vram %.0f MB)\n", layer,
+                  1e3 * std::chrono::duration<double>(std::chrono::steady_clock::now() - tr0).count(), (bytes_read - nv0) / 1e6,
+                  (bytes_from_ram - nr0) / 1e6, (bytes_from_vram - nvr0) / 1e6); }
         {
             std::lock_guard<std::mutex> lk(m_);
             hb_[t].ready  = ok;
@@ -348,6 +362,7 @@ void prefill_streamer::prefetch_layer(uint32_t layer, bool from_ram) {
     if (!overlap_) return;
     std::lock_guard<std::mutex> lk(m_);
     if (stop_) return;
+    if (pft_on()) fprintf(stderr, "[pft] t=%.0f main prefetch_layer(%u) called\n", pft_ms(), layer);
     if (hb_[0].layer == (int32_t) layer || hb_[1].layer == (int32_t) layer) return;
     // One speculative job at a time; a layer that is actually needed jumps the
     // queue via load_layer instead.
@@ -366,6 +381,7 @@ bool prefill_streamer::load_layer(uint32_t layer, std::string & err) {
     if (!ensure_device(err)) return false;
     if (layer == loaded_) return true;
     const auto t0 = std::chrono::steady_clock::now();
+    if (pft_on()) fprintf(stderr, "[pft] t=%.0f main load_layer(%u) enter\n", pft_ms(), layer);
 
     int idx = 0;
     if (!overlap_) {
@@ -393,6 +409,9 @@ bool prefill_streamer::load_layer(uint32_t layer, std::string & err) {
         part_type_[q] = b.ptype[q];
     }
     t_read += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    { static const bool tr = getenv("QWFN_PF_TRACE") != nullptr;
+      if (pft_on()) fprintf(stderr, "[pft] t=%.0f main load_layer(%u) got it\n", pft_ms(), layer);
+      if (tr) fprintf(stderr, "[pftrace] layer %2u main waited %.1f ms\n", layer, 1e3 * std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()); }
 
     if (dev_buf_) {
         const uint32_t n_expert = mi_->hp().n_expert;
