@@ -1741,6 +1741,9 @@ void expert_cache::lend_restore(double budget_s) {
             if (nxt >= 0) prefetch_start((uint32_t) nxt, nxt_batch.data(), (uint32_t) nxt_batch.size(), nxt_r);   // beside the uploads
         }
         settle_promotions();   // the uploads land and the RAM slots they read are released
+        // Only this layer has batches left (the pipelined pick excludes it): read its next one now, unpipelined.
+        if (nxt < 0 && !out_of_time && (nxt = pick(-1, nxt_batch)) >= 0)
+            prefetch_start((uint32_t) nxt, nxt_batch.data(), (uint32_t) nxt_batch.size(), nxt_r);
         if (nxt >= 0) {
             prefetch_finish(nxt_r);
             cur_batch.swap(nxt_batch);
