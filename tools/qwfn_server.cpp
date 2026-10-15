@@ -1262,6 +1262,8 @@ int main(int argc, char ** argv) {
           "      --mmproj PATH   vision projector gguf; enables image input. It runs on the CPU (weights in RAM, no VRAM\n"
           "                      at all): a 1400x1000 screenshot encodes in ~15 s, a 320x240 image in 0.3 s\n"
           "      --vision-threads N  threads for the image encode (default: --threads, the physical cores)\n"
+          "      --vision-gpu        run the vision tower on the GPU (weights in VRAM ~0.9 GB, activations on the device;\n"
+          "                          ~18x faster encodes). Requires --vram slack for the tower + its graph arena.\n"
           "      --state-host V  attention state in pinned host memory: none (default) | idx | kv,idx. The VRAM it held goes to\n"
           "                      the expert tier; costs ~0.35 ms/token (idx) or ~2 ms/token (kv,idx) of PCIe reads\n"
           "      --alias NAME    model id reported by /v1/models\n"
@@ -1313,6 +1315,7 @@ int main(int argc, char ** argv) {
     long   prefix_cache_min = 1024; bool prefix_cache_min_set = false;
     long   prefix_cache_boundary = 4096;
     int vision_threads = 0;
+    bool vision_gpu = false;
     int def_reasoning_budget = 0;
     int lookup_drafts = 0;
     int port = 8080;
@@ -1330,6 +1333,7 @@ int main(int argc, char ** argv) {
         if (a == "--port"   && i + 1 < argc) { port = atoi(next()); continue; }
         if (a == "--mmproj" && i + 1 < argc) { mmproj_path = next(); continue; }
         if (a == "--vision-threads" && i + 1 < argc) { vision_threads = atoi(next()); continue; }
+        if (a == "--vision-gpu") { vision_gpu = true; continue; }
         if (a == "--alias"  && i + 1 < argc) { alias = next(); continue; }
         if (a == "--think"  && i + 1 < argc) { def_effort = next(); continue; }
         if (a == "--think-budget" && i + 1 < argc) { def_reasoning_budget = atoi(next()); continue; }
@@ -1475,8 +1479,17 @@ int main(int argc, char ** argv) {
     };
     // set_mtp_logits: per request, in generate (the draft is sampled from the head's distribution at temperature)
     if (!mmproj_path.empty()) {
-        S.vis_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-        if (!S.vis_backend) { fprintf(stderr, "vision: no CPU backend\n"); return 1; }
+        if (vision_gpu) {
+            // The tower lives on the device: weights uploaded to VRAM at load, the graph computed
+            // there (flash attention when GGML_SYCL_ENABLE_FLASH_ATTN=1, as prod sets). Measured
+            // 2026-10-06: ~18-20x faster than the CPU tower (1400x1000: 31.3 s -> 1.7 s idle box).
+            S.vis_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+            if (!S.vis_backend) { fprintf(stderr, "vision: no GPU backend\n"); return 1; }
+            fprintf(stderr, "vision: tower on the GPU backend\n");
+        } else {
+            S.vis_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+            if (!S.vis_backend) { fprintf(stderr, "vision: no CPU backend\n"); return 1; }
+        }
         if (!S.vis.load(mmproj_path, S.vis_backend, ggml_backend_get_default_buffer_type(S.vis_backend), err)) {
             fprintf(stderr, "vision: %s\n", err.c_str()); return 1;
         }
