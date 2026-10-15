@@ -54,8 +54,8 @@ launcher (`scripts/b70/qwfn-b70.sh`) turns on the adopted ones.
 
 - **What it did:** made the engine's fixed rule "a VRAM resident unused for 24 tokens is replaceable whatever its use
   count" (`STALE_FETCHES = 48 * 24`, upstream's constant) tunable.
-- **Data:** 256 tokens instead of 24: promotions -18% (natural text, 35.7k -> 29.3k per 2,500 tokens), -21% (code,
-  28.6k -> 22.7k per 1,500), -25% (MTP-1, 39.9k -> 30.0k); swaps -27..-35%; sweep 24/64/128/256/512 promotions
+- **Data:** 256 tokens instead of 24: promotions -18% (natural text, 35.7k -> 29.3k per 2,500 tokens), -21% (free
+  generation from a one-token prompt, 28.6k -> 22.7k per 1,500), -25% (MTP-1, 39.9k -> 30.0k); swaps -27..-35%; sweep 24/64/128/256/512 promotions
   35.7k / 34.2k / 31.7k / 29.3k / 28.7k. Decode in within-window runs looked +4..6%, but interleaved A-B-B-A pairs
   (twice) gave 103.2 vs 102.6 s per 2,500 tokens (-0.6%, noise). Replay NLL equal or better in every arm (it moves
   with placement, see the note at the end). An offline simulator on routing traces had predicted <1-2 ms/token.
