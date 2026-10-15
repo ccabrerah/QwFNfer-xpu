@@ -208,3 +208,9 @@ Tag `v0.4.0` keeps every experimental switch. Removed since, with their measurem
 
 The engine is merged with upstream QwFNfer master (2026-10-03: Windows support, the io worker pool, io_uring fixes, CI, attached files) and the ggml-sycl series is rebased onto llama.cpp master `a0e6dc7` (2026-10-14); patch 23 is gone (llama.cpp has its own AVX2 Q2_0 dot product). Against the previous build: backend tests pass, decode speed equal, replay NLL over 8 texts +0.1% (within noise), server smoke and 3-session stress pass. Upstream SYCL work that overlaps this series or its ideas (grouped MoE GEMM, Q8_0 wide-load MMVQ, more fusions, sparse FA) is still to be compared.
 
+
+## Upstream's ops in place of ours (2026-10-15)
+
+| Experiment | Result | Status |
+|---|---|---|
+| llama.cpp's Q8_0 kernels (#29186) instead of patches 18-21 + 28 | per dense Q8_0 matrix against double precision: upstream's one-column ESIMD kernel (f32 activations) ~1e-7 relative error, ours (q8_1 activations) ~1.2e-2, the CPU backend also 1.2e-2; 2 columns ~1.1e-2 both. Replay NLL over 16 texts +0.12% (SE 0.18) vs a summation-order control's +0.03% (SE 0.14). Decode with the draft head (1 draft, `--vram 22`) 24.6-25.0 -> 26.1-26.3 tok/s (+5%) | **adopted: the five patches dropped** (`dropped-features.md`) |
