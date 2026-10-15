@@ -26,8 +26,8 @@
 # Inputs:
 #   LLAMA_CPP_ROOT  llama.cpp source (ggml headers, vendor/)         default ~/.unsloth/llama.cpp
 #   GGML_LIBS       portable ggml/llama shared libraries              default ~/.cache/qwfnfer-build/ggml/bin
-#                   Built once from Unsloth's llama.cpp (b10798-mix-659e406, the mix the engine
-#                   is validated against), library targets only:
+#                   Built once from Unsloth's llama.cpp (commit ca14269; the b10798-mix-659e406 tag
+#                   has been moved to a commit without qwen4exp, see README), library targets only:
 #
 #                     H=$PWD/cmake/glibc_compat.h
 #                     cmake -S ~/.unsloth/llama.cpp -B ~/.cache/qwfnfer-build/ggml -G Ninja \
@@ -35,7 +35,7 @@
 #                       -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON \
 #                       -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;120" \
 #                       -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
-#                       -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF \
+#                       -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF \
 #                       -DCMAKE_C_FLAGS="-include $H -fno-math-errno" -DCMAKE_CXX_FLAGS="-include $H -fno-math-errno" \
 #                       -DCMAKE_CUDA_FLAGS="-Xcompiler=-fno-math-errno -Xcompiler=-include,$H"
 #                     cmake --build ~/.cache/qwfnfer-build/ggml
@@ -72,7 +72,8 @@ OUT=dist/$NAME
 echo "== engine (portable build against $GGML_LIBS)"
 cmake -S . -B build-portable -G Ninja -DCMAKE_BUILD_TYPE=Release -DQWFN_PORTABLE=ON \
       -DLLAMA_CPP_ROOT="$LLAMA_CPP_ROOT" -DLLAMA_CPP_BUILD="$GGML_LIBS" > build-portable.cmake.log 2>&1 || { tail -20 build-portable.cmake.log; exit 1; }
-cmake --build build-portable --target qwfn-server qwfn-tok | tail -2
+cmake --build build-portable --target qwfn-server qwfn-tok > build-portable.log 2>&1 || { grep -A 12 -E "FAILED|error:" build-portable.log | head -60; exit 1; }
+tail -1 build-portable.log
 
 have_runtime=yes
 for so in $RUNTIME_SOS; do [ -f "$RUNTIME_LIBS/$so" ] || have_runtime=no; done
