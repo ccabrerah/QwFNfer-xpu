@@ -225,10 +225,10 @@ index 90f9268..78080a3 100644
                  }
                  else
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 1dc7df1..b8b69a9 100644
+index 9a7140e..32c85f2 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -5417,8 +5417,15 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
+@@ -5384,8 +5384,15 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
      // need ne[0] % DMMV_X == 0.
      const int64_t dmmv_x_required = (src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) ?
                                      2*GGML_SYCL_DMMV_X : GGML_SYCL_DMMV_X;
@@ -245,7 +245,7 @@ index 1dc7df1..b8b69a9 100644
  }
  
  static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-@@ -5576,7 +5583,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
+@@ -5475,7 +5482,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
                  src0->type == GGML_TYPE_Q4_0)) {
              use = use || !use_mul_mat_vec_q;
          }

@@ -166,6 +166,36 @@ launcher (`scripts/b70/qwfn-b70.sh`) turns on the adopted ones.
 - **Why dropped:** llama.cpp added its own AVX2 Q2_0 dot product (#30447, two blocks per step in two FMA chains) before
   the 2026-10-14 rebase; the patch no longer applies and is not needed.
 
+### Patches 18-21 and 28 -- our one-token and 2-4-column Q8_0 matvec path (superseded by upstream, 2026-10-15)
+
+Switches `GGML_SYCL_Q8W` (18), `GGML_SYCL_Q8_REUSE` (19), `GGML_SYCL_Q8_DIRECT` (20), `GGML_SYCL_Q8_EPILOGUE` (21),
+`GGML_SYCL_Q8W_NCOLS` (28); all in the launcher until 2026-10-15. Last in the tree at commit 06538ee (and `v0.4.0`).
+
+- **What they did:** the dense Q8_0 weights (attention, shared experts, the hyper-connection mixers, the PLE key,
+  `ssm_out`, the embedding head) at decode. 18: one-token matvec over the reorder layout with a whole 34-byte block
+  per lane as two 16-byte loads and 8 dp4a against q8_1 activations (stock: 2-byte pieces, two lanes per block).
+  19: the last one-token src1 quantized to q8_1 kept for the next matmul on the same input. 20: a one-token Q8_0
+  MUL_MAT straight to the reordered MMVQ kernel, skipping `ggml_sycl_op_mul_mat`'s generic routine. 21:
+  MUL_MAT -> [SCALE ->] SILU as one launch (overlay v4's mixers). 28: patch 18's kernel for 2-4 columns (the MTP
+  verify step), each column accumulated as at one column.
+- **Data when adopted:** 18: dense8 matvec 24.76 -> 21.48 us/call (~405 -> ~467 GB/s), layer graphs -1.0 ms/token.
+  19 + 20: -0.32 ms/token, exact. 21: -0.62 ms/token with overlay v4. 28: verify-step dense Q8_0 11.8 -> 9.3 ms/step,
+  short-prompt decode with the draft head +9% (35.5 vs 32.6 tok/s). A Q8_0 matvec on f32 activations of our own
+  (`GGML_SYCL_Q8F`, 2026-09-28) was not adopted then: +42 us/graph of GPU wait.
+- **Why dropped:** llama.cpp's #29186 (in the 2026-10-14 rebase) runs a one-token Q8_0 MUL_MAT through an ESIMD
+  DMMV on f32 activations, and 2-4 columns through a wide-load MMVQ. On every dense Q8_0 matrix of the deployed
+  layout, against a double-precision reference (`q8acc`, research repo `scripts/box/upq8/`): one column, upstream
+  relative RMS error ~1e-7 against ~1.2e-2 for our q8_1 path (activations with outlier channels; the CPU backend
+  quantizes the same way and shows the same 1.2e-2); two columns, both ~1.1e-2. The build without these patches gives
+  outputs bit-identical to the switches-off arm (32 of 32 matvec outputs). Kernel time ~0.6 ms/token lower
+  (8.1 vs 8.7 ms incl. our quantize kernel), decode equal without the draft head (24.18 / 23.75 vs 23.75 / 25.41 tok/s).
+  Replay NLL over 16 texts (2,000-token prompt + 1,024 replayed): upstream +0.12% against ours (SE 0.18, worse on
+  11/16), a control with our q8_1 inputs in another summation order +0.03% (SE 0.14); per-text spread 0.70% vs 0.56%:
+  numerics noise (an earlier 8-text run: +0.7%, SE 0.5; a single 1,000-token text from a 5-token prompt moved
+  1.94 -> 2.15, which first looked like a bug). Decode as served (draft head, 1 draft, `--vram 22`, 2,500 replayed
+  tokens, A-B-B-A): ours 25.00 / 24.55 tok/s, upstream 26.26 / 26.14 (+5%; acceptance 65.9% vs 66.4%): the verify
+  step's 2-column matvecs are not slower on upstream's wide-load MMVQ, and the one-token ones drop a quantize launch.
+
 ## Notes for anyone measuring here again
 
 - **Replay NLL is not a placement-independent number.** Expert placement differs between runs (it depends on

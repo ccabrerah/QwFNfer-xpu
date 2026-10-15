@@ -22,10 +22,10 @@ index 1e353ff..ff24fd5 100644
  // devide buffer
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device);
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 3ae8332..1646446 100644
+index 680b457..f1c0da2 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -8335,6 +8335,9 @@ static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, cons
+@@ -8177,6 +8177,9 @@ static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, cons
      if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
          return (void *)ggml_backend_sycl_split_buffer_type;
      }
@@ -35,7 +35,7 @@ index 3ae8332..1646446 100644
  
      // Tensor parallelism (--split-mode tensor) entry points.
      if (strcmp(name, "ggml_backend_comm_init") == 0) {
-@@ -8434,4 +8437,16 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
+@@ -8276,4 +8279,16 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
      return sycl_backend;
  }
  

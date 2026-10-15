@@ -21,11 +21,7 @@ export GGML_SYCL_FUSE_HC=1 GGML_SYCL_FUSE_HC_DECODE=1            # hyper-connect
 export KMP_BLOCKTIME=0 GGML_SYCL_MMVW=1 GGML_SYCL_SMALLK=1 GGML_SYCL_MOE_Q2W=1 QWFN_PREDICT_CUR2=1   # decode
 export QWFN_Q2_SOA=1 GGML_SYCL_FUSE_SPARSE_DECODE=1 GGML_SYCL_FUSE_HC_GATE=1                         # decode (patches 09-11)
 export QWFN_IQ4_SOA=1                                                                                # iq4_nl experts in VRAM as IQ4_NL_SOA (patch 17)
-export GGML_SYCL_Q8W=1                                                                               # one-token Q8_0 matvec, a block per lane (patch 18)
-export GGML_SYCL_Q8_REUSE=1 GGML_SYCL_Q8_DIRECT=1                                                    # one-token Q8_0: q8_1 input reused, direct dispatch (patches 19-20)
-export GGML_SYCL_Q8_EPILOGUE=1                                                                       # Q8_0 MUL_MAT -> [SCALE ->] SILU as one launch (patch 21; overlay v4's mixers)
 export GGML_SYCL_DMMV_NCOLS=1                                                                        # 2-4-column Q5_K/Q6_K matvecs through the ESIMD kernel (patch 24; the MTP verify step)
-export GGML_SYCL_Q8W_NCOLS=1                                                                         # 2-4-column Q8_0 matvecs through patch 18's wide kernel (patch 28; the MTP verify step)
 export QWFN_LEND_RESTORE=1                                                                           # after a streamed prompt, read the lent layers' VRAM experts back before decode
 export QWFN_MTP_SHARED_CELLS=1                                                                       # the draft head attends over the trunk's selected cells (last attention layer), not its whole cache
 export QWFN_PF_VRAM=1                                                                                # a streamed prefill copies VRAM-resident experts on the device instead of reading them (needs patch 30)

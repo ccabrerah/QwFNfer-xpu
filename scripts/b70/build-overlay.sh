@@ -36,7 +36,7 @@ if [ "$VER" = v3 ] || [ "$VER" = v4 ]; then
   parts=("$OUT/q3down.gguf" "$OUT/dense8.gguf" "$OUT/q2kxl.gguf" "$OUT/q3kxl.gguf")
   if [ "$VER" = v4 ]; then
     # v4: v3 plus the hyper-connection mixers' up/down at Q8_0 as Unsloth ships them at every tier (their inject
-    # weights, F32 there, stay at the stock BF16). Runs best with patch 21 (GGML_SYCL_Q8_EPILOGUE).
+    # weights, F32 there, stay at the stock BF16).
     [ -f "$OUT/hcq8.gguf" ] || $FETCH UD-Q3_K_XL "$OUT/hcq8.gguf" \
       '^blk\.[0-9]+\.hc_(attn|ffn)_(up|down)\.weight$' '^output_hc_(up|down)\.weight$'
     parts=("$OUT/hcq8.gguf" "${parts[@]}")

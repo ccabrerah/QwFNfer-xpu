@@ -12,10 +12,10 @@ verify steps, short turns over a long cache) leave it too. GGML_SYCL_SPF_CHECK=1
 GGML_SYCL_SPF_DEBUG=1 reports where the matcher stops.
 
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index b8b69a9..f4833e4 100644
+index 32c85f2..6e435bc 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -7000,6 +7000,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -6878,6 +6878,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              }
          }
          // K/V gathers from the q8_0 cache + F16 casts + one-token FLASH_ATTN_EXT (GGML_SYCL_FUSE_SPARSE_DECODE=1)
@@ -27,7 +27,7 @@ index b8b69a9..f4833e4 100644
          if (node->op == GGML_OP_GET_ROWS && ggml_sycl_sparse_decode_attn_fused(*sycl_ctx, cgraph, i)) {
              i += 8;
              continue;
-@@ -7231,6 +7236,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -7073,6 +7078,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
          }
  
          bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);

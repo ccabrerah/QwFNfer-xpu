@@ -251,10 +251,6 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_FUSE_CONV=1` | 15 | 1 | One-token DeltaNet conv as one kernel. |
 | `GGML_SYCL_FUSE_IDX=1` | 16 | 1 | Prefill indexer per-head score sum as one kernel (bit-identical). |
 | `GGML_SYCL_IQ4_SOA_LPR=16\|8\|4` | 17 | 8 | Force the IQ4_NL_SOA matvec's lanes per row. 8 on this model's 20-block expert-down rows: -17% against the default 16. |
-| `GGML_SYCL_Q8W=1` | 18 | 1 | One-token Q8_0 matvec, a whole block per lane. |
-| `GGML_SYCL_Q8_REUSE=1` | 19 | 1 | Reuse a one-token q8_1 activation across matmuls sharing their input. |
-| `GGML_SYCL_Q8_DIRECT=1` | 20 | 1 | One-token Q8_0 MUL_MAT dispatched straight to its kernel. |
-| `GGML_SYCL_Q8_EPILOGUE=1` | 21 | 1 | Q8_0 MUL_MAT -> [SCALE ->] SILU as one launch (needs `GGML_SYCL_Q8W`). |
 | `GGML_SYCL_DMMV_NCOLS=1` | 24 | 1 | 2-4-column Q5_K/Q6_K matvecs through the ESIMD kernel (the MTP verify step). |
 | `GGML_SYCL_FUSE_SPARSE_PREFILL=1` | 25 | 1 | Long prompts: QSA attention gathered per query on DPAS (also changes the engine's graph order; =2 is the order only). |
 | `GGML_SYCL_SPF_MIN_KV=N` | 25 | 45056 | Below n_kv N the dense path runs. |
@@ -262,7 +258,6 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_SPF_CHECK=1` / `GGML_SYCL_SPF_DEBUG=1` | 25 | | Run dense and gathered and compare per layer / report where the matcher stops. |
 | `GGML_SYCL_DNNL_DETERMINISTIC=1` | 26 | 1 | oneDNN matmuls in deterministic mode (no split-K atomic accumulation): the same bits every run. |
 | `GGML_SYCL_TOPK_DETERMINISTIC=1` | 27 | 1 | Radix top-k emits in column order, ties to the lowest index, no atomics (the QSA indexer's block selection reproducible). With 26: bit-identical runs. |
-| `GGML_SYCL_Q8W_NCOLS=1` | 28 | 1 | 2-4-column Q8_0 matvecs (the MTP verify step) through patch 18's wide kernel, each weight block loaded once for all columns; needs `GGML_SYCL_Q8W`. A column's result equals the one-column kernel's. |
 | (no switch) | 30 | | CPY from Q2_0_SOA / IQ4_NL_SOA to the canonical blocks (used by `QWFN_PF_VRAM`). Patch 29 was tried and is not in the series. |
 | (no switch) | 31 | | Q8_0_SOA: the type, its conversions, dequantize and CPY, and the one-token MoE matvec (8 lanes per row for the 20-block expert-down rows: the widest with no idle lane). |
 | `GGML_SYCL_Q2_LPR=16\|8\|4` | 32 | 8 | Lanes per row of the one-token q2_0 MoE kernels (gate/up + SwiGLU fused, and the wide matvec); 8 on 40-block rows: -9% against 16. |

@@ -15,10 +15,11 @@ What each overlay contains and what it measured: v2 in the README's validated ru
 preferred config. v1, the base of both, is attention and shared-expert gate/up at Q5_K and `ssm_out` at Q6_K from
 UD-Q2_K_XL (replay NLL -1.2%, no speed cost). v4 is v3 plus `hcq8.gguf`: the hyper-connection mixers' up/down
 (`hc_{attn,ffn}_{up,down}`, `output_hc_{up,down}`) at Q8_0 from UD-Q3_K_XL -- Unsloth keeps them at Q8_0 at every
-tier; their 4-row `*_inject` weights are F32 there and stay at the stock BF16 here. It needs patch 21
-(`GGML_SYCL_Q8_EPILOGUE`) to be faster than v3: without it the Q8_0 path adds kernel launches that cancel the smaller
-reads. The engine folds the mixers' 1/hc scale into BF16/F16/F32 weights, and into Q8_0 block scales only when every
-block stays exact -- Unsloth's do not, so v4 keeps the scale, which patch 21 applies in the matvec's epilogue.
+tier; their 4-row `*_inject` weights are F32 there and stay at the stock BF16 here. It was adopted with
+patch 21 (`GGML_SYCL_Q8_EPILOGUE`, the scale and SiLU as the Q8_0 matvec's epilogue); since 2026-10-15 the Q8_0
+matvecs run on llama.cpp's own ESIMD kernel (f32 activations, no quantize launch) and patches 18-21 are gone
+(`dropped-features.md`). The engine folds the mixers' 1/hc scale into BF16/F16/F32 weights, and into Q8_0 block scales
+only when every block stays exact -- Unsloth's do not, so v4 keeps the scale as a separate SCALE node.
 
 `tools/overlay/shard_prune.py OVERLAY_DIR SHARD OUT` rewrites the stock first shard keeping only the tensors that
 overlay's head still reads from it: against v3 it drops 14 GB (v1/v2 heads stop working), against v4 15.3 GB (the

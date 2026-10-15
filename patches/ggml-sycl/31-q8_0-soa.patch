@@ -89,7 +89,7 @@ index 3176a21..00b480a 100644
                  (src0->type == GGML_TYPE_IQ4_NL_SOA && src1->type == GGML_TYPE_IQ4_NL)) &&
                 ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index f4833e4..3ae8332 100644
+index 6e435bc..680b457 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -1056,41 +1056,59 @@ catch (sycl::exception const &exc) {
@@ -187,7 +187,7 @@ index f4833e4..3ae8332 100644
          SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(data, tmp, size).wait()));
          sycl::free(tmp, *stream);
          return;
-@@ -6780,7 +6798,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
+@@ -6679,7 +6697,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
          GGML_ASSERT(q2_0_soa_geometry(tensor, offset, size, bps, nslices) && "Q2_0_SOA: whole packed slices only");
          ggml_sycl_pool_alloc<uint8_t> tmp(sycl_ctx->pool(), size);
          SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tmp.get(), data, size)));
@@ -197,10 +197,10 @@ index f4833e4..3ae8332 100644
      }
      SYCL_CHECK(CHECK_TRY_ERROR(
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
-index 8ad766a..16cfcd9 100644
+index a260f5c..13f6231 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -3431,6 +3431,86 @@ static void launch_mul_mat_vec_iq4_nl_soa_moe(
+@@ -3249,6 +3249,86 @@ static void launch_mul_mat_vec_iq4_nl_soa_moe(
      else                           go(std::integral_constant<int, WARP_SIZE / 4>{});
  }
  
@@ -287,7 +287,7 @@ index 8ad766a..16cfcd9 100644
  static bool ggml_sycl_moe_q2w_enabled() {
      static const bool v = [] { const char * e = getenv("GGML_SYCL_MOE_Q2W"); return e && atoi(e) != 0; }();
      return v;
-@@ -3559,6 +3639,12 @@ bool ggml_sycl_mul_mat_vec_q_id(
+@@ -3377,6 +3457,12 @@ bool ggml_sycl_mul_mat_vec_q_id(
                  vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                  expert_weight_stride, dst_row_stride, src1_row_stride, stream);
              return true;
