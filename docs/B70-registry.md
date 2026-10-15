@@ -200,3 +200,7 @@ original model's draft head (acceptance unchanged, ~0.66) and tokenizer (identic
 6-9% slower in short decode than the original weights (its routers are F32; not yet profiled). Thinking tokens on one
 drawing prompt at xhigh, three samples each: v4 layout 53K (original 47K), M2 18.7K (24.5K), M1 12.3K (24.6K).
 
+## Slimming (2026-10-14)
+
+Tag `v0.4.0` keeps every experimental switch. Removed since, with their measurements: `docs/dropped-features.md`. Every behaviour this fork adds is now behind a switch, default off; the launcher turns the adopted ones on. Verified against `v0.4.0`: greedy output identical on three prompts, replay NLL identical, decode speed equal (24.83 / 25.02 vs 24.99 / 25.17 tok/s), backend tests and the server smoke and stress checks all pass.
+
