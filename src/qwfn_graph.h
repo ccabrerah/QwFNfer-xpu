@@ -90,6 +90,11 @@ public:
     // engine passes a null kq_mask, i.e. when it skipped the host-side build.
     ggml_tensor * causal_mask_dev(int64_t n_kv, int64_t T);
     ggml_tensor * qsa_bias_dev(int64_t n_blocks, int64_t r, int64_t T);
+    // QWFN_LIGHTNING_IDX=1 (decode / verify steps) or 2 (prompt chunks too): the indexer's block scores
+    // sum_h relu(q_h . key_b) + bias[b, t] as ggml's LIGHTNING_INDEXER (unit head weights), no [n_blocks, heads, T]
+    // product in between. null when off for this graph. q [idx_dim, heads, T] with contiguous rows; keys: n_blocks rows
+    // of idx_dim, row stride keys->nb[1]; bias F32 [n_blocks, T].
+    ggml_tensor * idx_score_lightning(ggml_tensor * q, ggml_tensor * keys, int64_t n_blocks, ggml_tensor * bias, bool prompt);
 
     ggml_tensor * sparse_attn(ggml_tensor * cur, ggml_tensor * inp_pos,
                               ggml_tensor * kq_mask, const int sections[4], int il,

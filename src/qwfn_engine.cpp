@@ -580,6 +580,8 @@ bool engine::init(const model_index * hot, const model_index * cold,
         const size_t work_set  = (size_t) (2 * n_embd * hc + 6 * n_embd + hc + 3 * U + 5 + PH) * B * 4 + (64ull << 20);
         const size_t staging   = (cfg.prefill_on_gpu && cfg.use_gpu) ? prefill_streamer::device_bytes_for(hot) : 0;
         ec_cfg.lend_bytes   = staging + work_set + pf_graph + inputs + qsa_graph;
+        lend_fixed_  = staging + inputs + qsa_graph;
+        lend_pf_tok_ = (cfg.prefill_on_gpu && cfg.use_gpu) ? (size_t) 4 * n_embd * U * sizeof(float) : 0;
         // What decode allocates after the tier grows with the context: the attention
         // graphs are shaped by the block bucket (flat up to ~48K tokens, then per
         // 256 blocks), the CUDA pool with their temporaries, the head's graphs, and
@@ -661,7 +663,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
         // load is the CUDA context, the graphs' activations and ggml's pool.
         auto sz = [](ggml_backend_buffer_t b) { return b ? ggml_backend_buffer_get_size(b) / 1e6 : 0.0; };
         fprintf(stderr, "[qwfn] VRAM audit (MB): dense core %.0f | state %.0f | tier %.0f + lent %.0f | qsa keys %.0f | batch scratch %.0f | work %.0f | residency tables %.0f | rollback %.0f | head dense %.0f | predictor %.0f\n",
-                w_.device_bytes() / 1e6, st_.bytes() / 1e6, sz(ec_.vram_buffer()), sz(ec_.vram_extra_buffer()), sz(qbuf_), sz(scr_buf_), sz(wbuf_), sz(vbuf_), sz(rbbuf_), sz(mbuf_), sz(predbuf_));
+                w_.device_bytes() / 1e6, st_.bytes() / 1e6, sz(ec_.vram_buffer()), ec_.vram_extra_allocated() / 1e6, sz(qbuf_), sz(scr_buf_), sz(wbuf_), sz(vbuf_), sz(rbbuf_), sz(mbuf_), sz(predbuf_));
         size_t dfree = 0, dtotal = 0;
         if (ggml_backend_dev_t d = ggml_backend_buft_get_device(w_.buft())) { ggml_backend_dev_memory(d, &dfree, &dtotal); }
         fprintf(stderr, "[qwfn] VRAM audit: device %.0f MB total, %.0f MB free after init\n", dtotal / 1e6, dfree / 1e6);
@@ -1000,7 +1002,7 @@ const float * engine::eval(const int32_t * hist, int32_t n_hist, int32_t n_new, 
     if (!streamed && client_lent_) vram_lend_end();
     if (!streamed) ec_.lend_restore_if_pending();   // QWFN_LEND_RESTORE: after the prompt's last pass, before decode
     if (!streamed) sync_tier_epoch();
-    if (streamed && !prefill_enter(err)) return nullptr;
+    if (streamed && !prefill_enter(err, n_new)) return nullptr;
     bool ok = true;
     if (streamed && !legacy_prefill) {
         for (int32_t off = 0; off < n_new && ok; ) {
@@ -1529,10 +1531,12 @@ void engine::load_work_set(const work_set & ws) {
 // back to the device, then take the prefill's memory from it -- the
 // n_batch work set, the MoE chunk allocator; the staging follows on the first
 // load_layer. Undone by prefill_leave().
-bool engine::prefill_enter(std::string & err) {
+bool engine::prefill_enter(std::string & err, int32_t n_new) {
     if (in_prefill_) return true;
-    ec_.lend_begin();
-    const int64_t n_embd = hp_.n_embd, hc = hp_.hc_count, B = cfg_.n_batch, U = hp_.n_expert_used, PH = hp_.ple_n_head();
+    static const bool lend_fit = getenv("QWFN_LEND_FIT") != nullptr;
+    static const size_t fit_margin = (size_t) (getenv("QWFN_LEND_FIT_MARGIN_MB") ? atol(getenv("QWFN_LEND_FIT_MARGIN_MB")) : 256) << 20;
+    const int64_t n_embd = hp_.n_embd, hc = hp_.hc_count, U = hp_.n_expert_used, PH = hp_.ple_n_head();
+    const int64_t B = lend_fit ? std::min<int64_t>(cfg_.n_batch, ((int64_t) std::max<int32_t>(n_new, 1) + 255) / 256 * 256) : cfg_.n_batch;
     ggml_init_params wp{}; wp.mem_size = ggml_tensor_overhead() * 64; wp.no_alloc = true;
     pwctx_ = ggml_init(wp);
     work_set ws;
@@ -1555,6 +1559,15 @@ bool engine::prefill_enter(std::string & err) {
         d_cur_     = ggml_new_tensor_2d(pwctx_, GGML_TYPE_F32, n_embd, B);
         d_partial_ = ggml_new_tensor_2d(pwctx_, GGML_TYPE_F32, n_embd, B);
     }
+    size_t need = SIZE_MAX;
+    if (lend_fit) {
+        size_t ws_bytes = 64ull << 20;
+        for (ggml_tensor * t = ggml_get_first_tensor(pwctx_); t; t = ggml_get_next_tensor(pwctx_, t))
+            ws_bytes += ggml_backend_buft_get_alloc_size(w_.buft(), t) + ggml_backend_buft_get_alignment(w_.buft());
+        const size_t Tm = (size_t) std::min<int64_t>(B, std::max<uint32_t>(64, cfg_.prefill_chunk));
+        need = lend_fixed_ + ws_bytes + lend_pf_tok_ * Tm + fit_margin;
+    }
+    ec_.lend_begin(need);
     pwbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(pwctx_, w_.buft());
     if (!pwbuf_) { ggml_free(pwctx_); pwctx_ = nullptr; ec_.lend_end(); err = "failed to allocate the prefill work set"; return false; }
     load_work_set(ws);
@@ -1566,6 +1579,16 @@ bool engine::prefill_enter(std::string & err) {
 void engine::prefill_leave() {
     if (!in_prefill_) return;
     ec_.settle_promotions();
+    // QWFN_LEND_LOG=1: what the prefill held at its end (the arenas only grow) against what was lent.
+    static const bool lend_log = getenv("QWFN_LEND_LOG") != nullptr;
+    if (lend_log) {
+        size_t dfree = 0, dtotal = 0;
+        if (ggml_backend_dev_t d = ggml_backend_buft_get_device(w_.buft())) ggml_backend_dev_memory(d, &dfree, &dtotal);
+        auto ga = [](ggml_gallocr_t g) { return g ? ggml_gallocr_get_buffer_size(g, 0) / 1e6 : 0.0; };
+        fprintf(stderr, "[qwfn] prefill VRAM at its end: device free %.0f MB | lent %.0f of %.0f MB | work set %.0f | MoE arena %.0f | shared arena %.0f MB\n",
+                dfree / 1e6, ec_.lent_now() / 1e6, ec_.lent_bytes() / 1e6, pwbuf_ ? ggml_backend_buffer_get_size(pwbuf_) / 1e6 : 0.0,
+                ga(galloc_pf_dyn_), ga(galloc_gpu_));
+    }
     pf_.release_device();
     if (galloc_pf_dyn_) { ggml_gallocr_free(galloc_pf_dyn_); galloc_pf_dyn_ = nullptr; galloc_pf_ = nullptr; }
     // The shared allocator grew to the attention chunk's arena; start it over
@@ -1593,9 +1616,9 @@ void engine::sync_tier_epoch() {
     tier_epoch_seen_ = ec_.tier_epoch();
 }
 
-void engine::vram_lend_begin() {
+void engine::vram_lend_begin(size_t need) {
     if (in_prefill_) return;               // already lent, and the prefill returns it
-    ec_.lend_begin();
+    ec_.lend_begin(need);
     client_lent_ = true;
 }
 

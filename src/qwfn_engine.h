@@ -304,7 +304,7 @@ public:
     // before it stages the vision projector for an image -- and take it back.
     // A streamed prefill lends it anyway and returns it; eval() re-syncs the
     // replayed graphs whenever the tier moved, so a lend is safe from anywhere.
-    void    vram_lend_begin();
+    void    vram_lend_begin(size_t need = SIZE_MAX);   // need: bytes wanted free (per layer with QWFN_LEND_FIT; otherwise all)
     void    vram_lend_end();
 
     // Substitute externally computed embeddings (vision) for the tokens at
@@ -588,7 +588,11 @@ private:
     ggml_gallocr_t        galloc_pf_dyn_ = nullptr;
     bool                  in_prefill_ = false;
     uint64_t              tier_epoch_seen_ = 0;
-    bool prefill_enter(std::string & err);
+    // n_new: the prompt tokens of this pass. QWFN_LEND_FIT=1 sizes the work set to them (rounded up to 256, at most
+    // n_batch) and lends the expert tier only what the pass needs: lend_fixed_ (staging, the attention chunk's inputs
+    // and arena: as at load) + the work set + the MoE chunk arena (lend_pf_tok_ per token of min(T, prefill_chunk)).
+    bool prefill_enter(std::string & err, int32_t n_new);
+    size_t lend_fixed_ = 0, lend_pf_tok_ = 0;
     void sync_tier_epoch();                // rebuild the replayed graphs if the tier moved
     bool client_lent_ = false;             // vram_lend_begin() without a prefill since
     void prefill_leave();

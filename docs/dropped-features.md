@@ -108,6 +108,23 @@ launcher (`scripts/b70/qwfn-b70.sh`) turns on the adopted ones.
   across four starts. Tok/s differences were inside the I/O spread.
 - **Why dropped:** A/B hooks of an adopted change.
 
+### `QWFN_HC_POST_OP` -- the hyper-connection combine as llama.cpp's DSV4_HC_POST (2026-10-15, never shipped)
+
+- **What it did:** `hc_combine` emitted `ggml_dsv4_hc_post(block_out, residual, 2 sigmoid(inject), no comb)` -- the op
+  llama.cpp's own qwen4exp graph uses (#28901, SYCL kernel #29132) -- instead of OUT_PROD + ADD.
+- **Data** (window ops, served layout with the draft head, per decode layer graph): recurrent 587 -> 593-611 us,
+  attention 885 -> 893-896 us, host launch 458 -> 469-474 us per graph; `test-backend-ops` DSV4_HC_POST 9/9.
+- **Why dropped:** upstream's op covers the product and the add only; our patches 04/06/11 fuse the gate (sigmoid,
+  scale), the product, the add and the next mixer's RMS norm + gamma into one kernel, so emitting the op loses that
+  fusion (sigmoid, scale, HC_POST, RMS_NORM+MUL = four launches against one). Patches 03/04/06/11 stay.
+
+### `QWFN_HC_MEAN_MULTI` -- the stream mean as one matmul at verify steps (2026-10-15)
+
+- **What it did:** extended upstream's one-token stream mean (sigmoid-gated streams times a [hc] vector of 1/hc, one
+  matmul) to the MTP verify step's 2-4 positions (on in the launcher since 2026-10-11).
+- **Why dropped:** `QWFN_HC_PRE_OP` (kept, on in the launcher) emits llama.cpp's DSV4_HC_PRE, which does the gate
+  and the mean in one kernel at every step width, so the matmul form is no longer built when it is on.
+
 ## ggml-sycl patches and backend switches
 
 ### Patch 34, `GGML_SYCL_Q8_PROD` -- q8_1 quantization fused into the producer
@@ -195,6 +212,30 @@ Switches `GGML_SYCL_Q8W` (18), `GGML_SYCL_Q8_REUSE` (19), `GGML_SYCL_Q8_DIRECT` 
   1.94 -> 2.15, which first looked like a bug). Decode as served (draft head, 1 draft, `--vram 22`, 2,500 replayed
   tokens, A-B-B-A): ours 25.00 / 24.55 tok/s, upstream 26.26 / 26.14 (+5%; acceptance 65.9% vs 66.4%): the verify
   step's 2-column matvecs are not slower on upstream's wide-load MMVQ, and the one-token ones drop a quantize launch.
+
+### Patch 14's stream-mean fusion (`GGML_SYCL_FUSE_HC_MIX`, half of the patch; superseded by upstream, 2026-10-15)
+
+- **What it did:** matched the engine's one-token hyper-connection mixer tail -- UNARY(SIGMOID) -> MUL -> RESHAPE ->
+  PERMUTE -> CONT -> RESHAPE -> MUL_MAT with the [hc] vector of 1/hc -- and ran it as one kernel
+  (`ggml_sycl_hc_mix_mean`, the sum in smallk's order). The patch's other half, the SiLU epilogue of the bf16/f16
+  one-token matvec, stays (patch 22 builds on it; upstream has no equivalent).
+- **Data when adopted:** part of patches 12-15's "~300 fewer kernels per token", layer graphs -8% together.
+- **Why dropped:** llama.cpp added `GGML_OP_DSV4_HC_PRE` (#28901, SYCL #29132): the gated mean in one kernel, at any
+  step width. The engine emits it under `QWFN_HC_PRE_OP` (kept, on in the launcher). Window ops (served layout with
+  the draft head): decode layer graphs identical to the fusion's (recurrent 587-588 vs 587 us, attention 886-887 vs
+  885 us); prefill dense graphs on a 38K prompt 27.0 / 26.3 s against 31.5 / 28.0 s, since the op also replaces the
+  prefill's sigmoid, multiply, copy, three adds and scale; `test-backend-ops` DSV4_HC_PRE 18/18.
+
+### `QWFN_LIGHTNING_IDX=2` -- llama.cpp's lightning indexer for prompt chunks (2026-10-15; the switch's value 1 stays)
+
+- **What it does:** the indexer's block scores as `GGML_OP_LIGHTNING_INDEXER` (llama.cpp #29825's form) instead of a
+  [blocks, 4 heads, T] matmul, a ReLU and patch 16's head sum; it never materializes the per-head scores.
+- **Data:** decode / verify steps (value 1, kept): attention layer graphs 885 -> 864 us, host launch 458 -> 440 us per
+  graph. Prompt chunks (value 2): dense graphs on a 38K prompt +4-5 s (33.4 / 32.7 vs 27-31 s), on 100K +25 s (111.3
+  vs 85.9 s): the op's SYCL kernel scores one (query, block) pair per sub-group on the vector units, where the
+  chunk's matmul uses the matrix engines. Its memory saving at the default `--ubatch-kv` (48M cells) is ~0.4 GB of the
+  prefill's lent VRAM, not enough to pay for that.
+- **Status:** value 2 is kept in the engine for measurement only; prompts keep patch 16.
 
 ## Notes for anyone measuring here again
 

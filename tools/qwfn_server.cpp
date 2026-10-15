@@ -1042,8 +1042,26 @@ static bool render_content(server & S, const json & content, std::string & text,
             pending_img pi;
             int gw = 0, gh = 0;
             const auto t0 = clk::now();
-            // On the CPU: no VRAM is borrowed from the expert tier for this.
-            if (!S.vis.encode(img, pi.emb, pi.n_tok, gw, gh, err)) return false;
+            // On the CPU: no VRAM is borrowed from the expert tier for this. On the GPU (--vision-gpu) the encode's
+            // activations and the runtime's scratch (~0.9 GB at 348 image tokens, ~1.7 GB at 4,063) come from free VRAM,
+            // and after a long conversation the decode graphs hold most of the reserve (2026-10-15: out of device memory
+            // at a 1400-px image after a 61K-token agent conversation, 33.56 of 34.24 GB in use, on the v33 stack too).
+            // Borrow what is missing from the expert tier -- per layer with QWFN_LEND_FIT -- under the engine lock; the
+            // image prompt's prefill lends anyway, and the engine takes the tier back before the next decode.
+            // QWFN_VISION_FREE_MB: the free VRAM an encode wants (default 2048).
+            if (!S.vis.on_cpu() && !S.vis.weights_on_host() && S.vis_backend) {
+                static const size_t want = (size_t) (getenv("QWFN_VISION_FREE_MB") ? atol(getenv("QWFN_VISION_FREE_MB")) : 2048) << 20;
+                size_t dfree = 0, dtotal = 0;
+                if (ggml_backend_dev_t d = ggml_backend_get_device(S.vis_backend)) ggml_backend_dev_memory(d, &dfree, &dtotal);
+                if (dfree < want) {
+                    S.eng.vram_lend_begin(want - dfree);
+                    fprintf(stderr, "[qwfn-server] image: %.0f MB of VRAM free, borrowed %.0f MB from the expert tier for the encode\n",
+                            dfree / 1e6, (want - dfree) / 1e6);
+                }
+            }
+            const bool ok_enc = S.vis.encode(img, pi.emb, pi.n_tok, gw, gh, err);
+            if (!S.vis.on_cpu()) S.vis.release_arena();   // the arena does not stay in VRAM between images
+            if (!ok_enc) return false;
             fprintf(stderr, "[qwfn-server] image: %zu bytes, %dx%d px -> %dx%d grid, %d tokens, encoded in %.2f s\n",
                     raw.size(), img.nx, img.ny, gw, gh, pi.n_tok, since(t0));
             imgs.emplace_back(text.size(), std::move(pi));   // marker position in text

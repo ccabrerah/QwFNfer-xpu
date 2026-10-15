@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index cb69476..d3e863c 100644
+index c7e8ead..cad494e 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
 @@ -70,6 +70,155 @@
@@ -158,7 +158,7 @@ index cb69476..d3e863c 100644
  static bool ggml_sycl_fuse_hc_mix_on() {
      static const bool on = [] { const char * e = getenv("GGML_SYCL_FUSE_HC_MIX"); return e && atoi(e) != 0; }();
      return on;
-@@ -6613,6 +6762,7 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
+@@ -6574,6 +6723,7 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
  
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
@@ -166,7 +166,7 @@ index cb69476..d3e863c 100644
  
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
-@@ -6721,6 +6871,39 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -6682,6 +6832,39 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              i++;
              continue;
          }

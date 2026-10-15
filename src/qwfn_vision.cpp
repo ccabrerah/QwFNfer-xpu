@@ -343,6 +343,10 @@ void vision_encoder::stage_out() {
     if (galloc_) { ggml_gallocr_free(galloc_); galloc_ = ggml_gallocr_new(buft_); }
 }
 
+void vision_encoder::release_arena() {
+    if (galloc_) { ggml_gallocr_free(galloc_); galloc_ = ggml_gallocr_new(buft_); }
+}
+
 // ---- encode -----------------------------------------------------------------
 
 bool vision_encoder::encode(const image_u8 & img, std::vector<float> & out,

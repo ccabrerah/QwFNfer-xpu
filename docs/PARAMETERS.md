@@ -185,7 +185,12 @@ Extra arguments are appended to the server's command line (later values win).
 | `QWFN_LEGACY_PREFILL_MOE` | The grouped prefill MoE instead of `mul_mat_id` on the device. |
 | `QWFN_LEGACY_QSA_DECODE` | The older one-token sparse attention graph. |
 | `QWFN_LEGACY_UPLOAD` | Prefill expert uploads on the default stream. |
-| `QWFN_HC_MEAN_MULTI` / `QWFN_PACK_MULTI` | The stream mean as one matmul / the readback pack for up to 4 positions (MTP verify steps) too; default one-token steps only (both on in the launcher). |
+| `QWFN_PACK_MULTI` | The readback pack for up to 4 positions (MTP verify steps) too; default one-token steps only (on in the launcher). |
+| `QWFN_HC_PRE_OP` | The hyper-connection mixer's sigmoid gate and stream mean as ggml's `DSV4_HC_PRE` (llama.cpp's own op, one kernel at every step width) instead of sigmoid, multiply and the mean (on in the launcher; replaces ggml-sycl patch 14's mean fusion). |
+| `QWFN_LIGHTNING_IDX=1\|2` | The sparse-attention indexer's block scores (relu per head, summed, plus the block bias) as ggml's `LIGHTNING_INDEXER` instead of a matmul and a head sum: no [blocks, heads, T] score tensor; the bias goes in as an F16 mask (+-1e9 become +-inf, the selection is unchanged) 1: decode and verify steps (on in the launcher: -21 us per attention layer graph, fewer launches); 2: prompt chunks too (slower there, +4-5 s on a 38K prompt, so prompts keep patch 16's head sum). |
+| `QWFN_LEND_FIT` / `QWFN_LEND_FIT_MARGIN_MB=N` | A streamed prompt pass lends the expert tier only what it needs: the work set sized to the pass's tokens and the lent VRAM taken per layer (the last layers first) until it covers the staging, the arenas and N MB (default 256); the other layers keep their VRAM experts through the prompt. |
+| `QWFN_VISION_FREE_MB=N` | Server, `--vision-gpu`: the free VRAM an image encode wants (default 2048); below it the encode borrows the difference from the expert tier (per layer with `QWFN_LEND_FIT`), as the image prompt's prefill does anyway. |
+| `QWFN_LEND_LOG` | One line per streamed pass: device free memory at its end, VRAM lent, and the work set / MoE / shared arena sizes. |
 | `QWFN_NO_FUSE` | No graph-level GPU fusions. |
 | `QWFN_NO_INPLACE` | No in-place writes of layer outputs. |
 | `QWFN_NO_PACK` | No packed readback of routing results. |
@@ -245,7 +250,7 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_MOE_Q2W=1` | 07, 08, 22 | 1 | q2_0 MoE matvec, a 64-weight block per lane; with it the fused gate+up+SwiGLU. |
 | `GGML_SYCL_FUSE_SPARSE_DECODE=1` | 10 | 1 | One-token sparse attention straight from the q8_0 cache. |
 | `GGML_SYCL_TOPK_WG=1` | 13 | 1 | Work-group-wide top-k for the router and the predictor. |
-| `GGML_SYCL_FUSE_HC_MIX=1` | 14 | 1 | Hyper-connection mixer fusions. |
+| `GGML_SYCL_FUSE_HC_MIX=1` | 14 | 1 | The hyper-connection mixer's SiLU as the bf16/f16 one-token matvec's epilogue. |
 | `GGML_SYCL_FUSE_ADDCHAIN=1` | 15 | 1 | Chains of 2-4 ADDs as one kernel. |
 | `GGML_SYCL_FUSE_MOESUM=1` | 15 | 1 | MoE weighted sum reading the expert rows in place. |
 | `GGML_SYCL_FUSE_CONV=1` | 15 | 1 | One-token DeltaNet conv as one kernel. |

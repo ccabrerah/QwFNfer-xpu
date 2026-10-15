@@ -64,6 +64,9 @@ public:
     bool load(const std::string & mmproj_path, ggml_backend_t backend,
               ggml_backend_buffer_type_t buft, std::string & err);
     bool weights_on_host() const { return stage_; }
+    // Free the activation arena (it grows to the largest image encoded and would otherwise stay in VRAM between
+    // images); the next encode allocates it again.
+    void release_arena();
     bool on_cpu() const { return cpu_; }
     // Threads for the CPU backend's graph compute (the engine's own workers are
     // idle while an image is encoded, so all hardware threads is the default).

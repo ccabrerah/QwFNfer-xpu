@@ -89,10 +89,10 @@ index 3176a21..00b480a 100644
                  (src0->type == GGML_TYPE_IQ4_NL_SOA && src1->type == GGML_TYPE_IQ4_NL)) &&
                 ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 6e435bc..680b457 100644
+index b66cff8..99f0e4a 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -1056,41 +1056,59 @@ catch (sycl::exception const &exc) {
+@@ -1017,41 +1017,59 @@ catch (sycl::exception const &exc) {
  // slices must be packed (the MUL_MAT_ID weights the engine builds, and 1-D transfer handles, are).
  // patch 17: IQ4_NL_SOA uses the same layout -- an iq4_nl block is a 2-byte scale and 16 code bytes, like q2_0's --
  // with 32 elements per block instead of 64.
@@ -169,7 +169,7 @@ index 6e435bc..680b457 100644
  
  static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                  ggml_tensor *tensor,
-@@ -1143,7 +1161,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -1104,7 +1122,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
          uint8_t * tmp = sycl::malloc_device<uint8_t>(size, *stream);
          GGML_ASSERT(tmp);
          SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tmp, data, size).wait()));
@@ -178,7 +178,7 @@ index 6e435bc..680b457 100644
          SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
          sycl::free(tmp, *stream);
          return;
-@@ -1182,7 +1200,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+@@ -1143,7 +1161,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
          SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
          uint8_t * tmp = sycl::malloc_device<uint8_t>(size, *stream);
          GGML_ASSERT(tmp);
@@ -187,7 +187,7 @@ index 6e435bc..680b457 100644
          SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(data, tmp, size).wait()));
          sycl::free(tmp, *stream);
          return;
-@@ -6679,7 +6697,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
+@@ -6640,7 +6658,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
          GGML_ASSERT(q2_0_soa_geometry(tensor, offset, size, bps, nslices) && "Q2_0_SOA: whole packed slices only");
          ggml_sycl_pool_alloc<uint8_t> tmp(sycl_ctx->pool(), size);
          SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tmp.get(), data, size)));

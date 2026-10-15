@@ -275,17 +275,22 @@ public:
     // The VRAM-resident experts of `layer` (its tier present: not lent), valid ones only.
     void vram_resident_parts(uint32_t layer, std::vector<vram_slice> & out);
 
-    // The VRAM tier is two buffers: a permanent one and a dynamic one of
+    // The VRAM tier is two parts: a permanent buffer and a dynamic one of
     // lend_bytes that holds expert slots during decode and is FREED for the
     // duration of a prefill, so the prefill's staging, batch buffers and graph
     // arenas can take that memory. lend_begin() invalidates those layers'
     // slots and frees the buffer; lend_end() allocates it again, empty, and
     // refills it from the RAM tier. Pointers into it change across that, so
     // tier_epoch() advances and graphs built against it must be rebuilt.
+    // QWFN_LEND_FIT=1: the dynamic part is one buffer per layer, and lend_begin(need) frees only as many layers
+    // (the last ones first) as `need` bytes take; the others keep their VRAM tier through the prefill.
     size_t    lent_bytes() const { return extra_bytes_; }
+    size_t    vram_extra_allocated() const { size_t n = 0; for (const lend_unit & u : lend_units_) if (u.buf) n += ggml_backend_buffer_get_size(u.buf); return n; }
+    size_t    lent_now() const { size_t n = 0; for (const lend_unit & u : lend_units_) if (!u.buf) n += u.bytes; return n; }
+    bool      any_lent() const { for (const lend_unit & u : lend_units_) if (!u.buf) return true; return false; }
     // QWFN_LEND_RESTORE=1: run the restore a prefill left pending (the engine calls this before a decode-type
     // eval, so a prompt split into several passes restores once, after its last pass).
-    void lend_restore_if_pending() { if (lend_restore_pending_ && vram_extra_) { lend_restore_pending_ = false; lend_restore(); } }
+    void lend_restore_if_pending() { if (lend_restore_pending_ && !lend_units_.empty() && !any_lent()) { lend_restore_pending_ = false; lend_restore(); } }
     uint64_t  tier_epoch() const { return tier_epoch_; }
     // QWFN_WARM_COUNTS=FILE (warm start): the per-expert use counts are saved there (at shutdown and every few minutes) and,
     // at the next start, loaded back; warm_start() then reads each layer's hottest experts into the tiers (VRAM first, then
@@ -296,7 +301,7 @@ public:
     void      warm_start(double budget_s);
     // QWFN_TIER_CHECK=1 (diagnostic): every VRAM-resident expert read back and compared with the file (device layout -> file layout).
     void      tier_check(const char * when);
-    void      lend_begin();
+    void      lend_begin(size_t need = SIZE_MAX);   // need: bytes the caller will allocate (QWFN_LEND_FIT); SIZE_MAX: all
     void      lend_end();
 
     // Tier layouts for the mul_mat_id MoE paths. n_slots == 0 when absent.
@@ -325,7 +330,6 @@ public:
     // memory traffic per token -- as much as the weights themselves.
     ggml_backend_buffer_t arena_buffer() const { return arena_buf_; }
     ggml_backend_buffer_t vram_buffer()  const { return vram_buf_; }
-    ggml_backend_buffer_t vram_extra_buffer() const { return vram_extra_; }
     const io_engine &     io() const { return cold_ ? io_cold_ : io_hot_; }
     uint8_t *             arena()        const { return arena_; }
 
@@ -439,7 +443,7 @@ private:
     void                   land_layer(uint32_t layer) { for (const pending_swap & sw : landing_) if (sw.layer == layer) { land_swaps(); return; } }   // before anything touches this layer's pool
     void                   land_swaps();         // sync the side queue; free the ring entries of landing_ and run the diagnostic check
     void                   issue_readbacks();   // queue the unissued ring read-backs on the side queue (the compute queue must be idle of their copies)
-    void      lend_begin_impl();
+    void      lend_begin_impl(size_t need);
     void      lend_end_impl();
 
     int32_t  find_slot(layer_pool & lp, uint32_t expert_id) const;
@@ -519,11 +523,13 @@ private:
     size_t                 total_slots_ = 0;
     size_t                 total_gslots_ = 0;
     ggml_backend_buffer_t  vram_buf_ = nullptr;      // permanent part of the tier
-    ggml_backend_buffer_t  vram_extra_ = nullptr;    // dynamic part, absent during a prefill
+    struct lend_unit { ggml_backend_buffer_t buf = nullptr; size_t bytes = 0; uint32_t il0 = 0, il1 = 0; };
+    std::vector<lend_unit> lend_units_;              // the dynamic part (layers [il0, il1) each); buf null while lent
     size_t                 extra_bytes_ = 0;
     // QWFN_LEND_RESTORE=1: per lent layer, the experts its VRAM tier held when a prefill borrowed it, hottest first;
     // lend_end() reads them back into the tier (time budget QWFN_LEND_RESTORE_MS, default 3000).
     std::vector<std::vector<uint16_t>> lend_saved_;
+    std::vector<uint8_t> lend_saved_taken_;   // per layer: its list was taken (a later pass does not retake it)
     bool lend_restore_pending_ = false;
     void lend_restore(double budget_s = -1);
     // A batched read into RAM victims in two halves (prefetch() is both): start claims the slots and submits, finish

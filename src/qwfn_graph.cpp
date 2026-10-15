@@ -63,17 +63,27 @@ ggml_tensor * graph_builder::hc_mix_w(ggml_tensor * x, ggml_tensor * w_norm, ggm
 
     ggml_tensor * lo = ggml_mul_mat(ctx0, w_down, xn);                 // [hc_lr, T]
     lo = ggml_silu(ctx0, hp_->hc_down_prescaled ? lo : ggml_scale(ctx0, lo, 1.0f / (float) hc));
-    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, w_up, lo));  // [hc_dim, T]
+    ggml_tensor * gate_in = ggml_mul_mat(ctx0, w_up, lo);              // [hc_dim, T]
 
+    if (inject) {
+        *inject = ggml_mul_mat(ctx0, w_inject, xn);                    // [hc, T]
+    }
+
+    // QWFN_HC_PRE_OP=1: the sigmoid gate and the mean over the streams as ggml's DSV4_HC_PRE (gated), the op
+    // llama.cpp's qwen4exp graph emits: one kernel at every T. Its sum runs stream by stream, then the 1/hc scale.
+    static const bool pre_op = getenv("QWFN_HC_PRE_OP") != nullptr;
+    if (pre_op) {
+        return ggml_dsv4_hc_pre_gated(ctx0, ggml_reshape_3d(ctx0, xn, n_embd, hc, nt),
+                                      ggml_reshape_3d(ctx0, gate_in, n_embd, hc, nt), 1.0f / (float) hc);
+    }
+
+    ggml_tensor * gate = ggml_sigmoid(ctx0, gate_in);
     ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
 
     // Collapse the streams by their mean.
     ggml_tensor * mixed;
-    // QWFN_HC_MEAN_MULTI=1: up to 4 positions (an MTP verify step) too: the reshape below is a plain
-    // [hc] x [hc, n_embd * nt] matmul, each position summed as at one token (default: one position only).
-    static const bool mean_multi = getenv("QWFN_HC_MEAN_MULTI") != nullptr;
-    if (gpu_fuse_ && hc_mean_ && (mean_multi ? nt <= 4 : nt == 1)) {
+    if (gpu_fuse_ && hc_mean_ && nt == 1) {
         // One matmul with the (1/hc) vector: two kernels instead of five. A
         // different summation order from the adds below, so GPU graphs only.
         ggml_tensor * gt = ggml_cont(ctx0, ggml_permute(ctx0, gated, 1, 0, 2, 3));   // [hc, n_embd, T]
@@ -89,10 +99,6 @@ ggml_tensor * graph_builder::hc_mix_w(ggml_tensor * x, ggml_tensor * w_norm, ggm
             mixed = ggml_add(ctx0, mixed, s);
         }
         mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
-    }
-
-    if (inject) {
-        *inject = ggml_mul_mat(ctx0, w_inject, xn);                    // [hc, T]
     }
     return mixed;
 }
@@ -285,15 +291,18 @@ ggml_tensor * graph_builder::qsa_top_k(ggml_tensor * cur, ggml_tensor * inp_pos,
                         1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
     // Rectify each head's dot product before summing, as in the DeepSeek lightning indexer.
-    ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
-            ggml_reshape_2d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h * T));        // [n_blk, 4*T]
-    score = ggml_reshape_3d(ctx0, score, n_blocks, n_idx_h, T);
-    score = ggml_relu(ctx0, score);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));                  // [4, n_blk, T]
-    score = ggml_sum_rows(ctx0, score);                                              // [1, n_blk, T]
-    score = ggml_reshape_2d(ctx0, score, n_blocks, T);
-
-    score = ggml_add(ctx0, score, qsa.bias ? qsa.bias : qsa_bias_dev(n_blocks, r, T));
+    ggml_tensor * bias  = qsa.bias ? qsa.bias : qsa_bias_dev(n_blocks, r, T);
+    ggml_tensor * score = idx_score_lightning(q, pooled, n_blocks, bias, /*prompt=*/true);
+    if (!score) {
+        score = ggml_mul_mat(ctx0, pooled,
+                ggml_reshape_2d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h * T));    // [n_blk, 4*T]
+        score = ggml_reshape_3d(ctx0, score, n_blocks, n_idx_h, T);
+        score = ggml_relu(ctx0, score);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));              // [4, n_blk, T]
+        score = ggml_sum_rows(ctx0, score);                                          // [1, n_blk, T]
+        score = ggml_reshape_2d(ctx0, score, n_blocks, T);
+        score = ggml_add(ctx0, score, bias);
+    }
 
     // Select whole BLOCKS -- ceil(width / r) of them, 513 here -- and expand to
     // their cells. Every cell of a block inherits its block's score, so this is
@@ -339,6 +348,22 @@ ggml_tensor * graph_builder::qsa_bias_dev(int64_t n_blocks, int64_t r, int64_t T
     f = ggml_sub(ctx0, f, ggml_reshape_2d(ctx0, q, 1, T));                                    // > 0 <=> b*r > q
     return ggml_sub(ctx0, ggml_scale(ctx0, ggml_step(ctx0, x), 1e9f),
                           ggml_scale(ctx0, ggml_step(ctx0, f), 2e9f));                        // 0 / 1e9 / 1e9 - 2e9
+}
+
+// The bias goes in as the op's F16 mask: 0 and -inf are exact; +-1e9 (the forced tail block, blocks wholly after
+// the query) become +-inf, which keeps their order against every finite score. Only the order among the blocks pushed
+// to -1e9 / -inf changes, and the causal mask empties all of those.
+// QWFN_LIGHTNING_IDX=1: decode and verify steps only; =2: prompt chunks too (slower there: the op's kernel scores one
+// (query, block) pair per sub-group, where the chunk's matmul runs on the matrix engines; +4-5 s on a 38K prompt).
+ggml_tensor * graph_builder::idx_score_lightning(ggml_tensor * q, ggml_tensor * keys, int64_t n_blocks, ggml_tensor * bias,
+                                                 bool prompt) {
+    static const int mode = [] { const char * e = getenv("QWFN_LIGHTNING_IDX"); return e ? atoi(e) : 0; }();
+    if (mode <= 0 || (prompt && mode < 2)) return nullptr;
+    const int64_t idx_dim = q->ne[0], n_h = q->ne[1], T = q->ne[2];
+    ggml_tensor * k3 = ggml_view_3d(ctx0, keys, idx_dim, 1, n_blocks, keys->nb[1], keys->nb[1], 0);   // [idx_dim, 1, n_blocks]
+    ggml_tensor * w  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_h, T), 1.0f);
+    ggml_tensor * m  = ggml_cast(ctx0, bias, GGML_TYPE_F16);
+    return ggml_reshape_2d(ctx0, ggml_lightning_indexer(ctx0, q, k3, w, m), n_blocks, T);
 }
 
 ggml_tensor * graph_builder::causal_mask_dev(int64_t n_kv, int64_t T) {
@@ -603,12 +628,16 @@ ggml_tensor * graph_builder::sparse_attn_decode_T(const qsa_proj & pj, const qsa
 
     // ---- scores of the T queries over the bucket, top blocks -> cells -----
     ggml_tensor * pool_v = ggml_view_2d(ctx0, pc_w, idx_dim, NB, pc_w->nb[1], 0);                 // after the writes
-    ggml_tensor * score = ggml_mul_mat(ctx0, pool_v, ggml_reshape_2d(ctx0, pj.qi_n, idx_dim, n_idx_h * T));   // [NB, 4*T]
-    score = ggml_relu(ctx0, score);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, score, NB, n_idx_h, T), 1, 0, 2, 3));   // [4, NB, T]
-    score = ggml_sum_rows(ctx0, score);                                                           // [1, NB, T]
-    score = ggml_reshape_2d(ctx0, score, NB, T);
-    score = ggml_add(ctx0, score, ggml_view_2d(ctx0, qT.bias, NB, T, qT.bias->nb[1], 0));        // each position's bias
+    ggml_tensor * biasT = ggml_view_2d(ctx0, qT.bias, NB, T, qT.bias->nb[1], 0);                 // each position's bias
+    ggml_tensor * score = idx_score_lightning(pj.qi_n, pool_v, NB, biasT, /*prompt=*/false);
+    if (!score) {
+        score = ggml_mul_mat(ctx0, pool_v, ggml_reshape_2d(ctx0, pj.qi_n, idx_dim, n_idx_h * T));   // [NB, 4*T]
+        score = ggml_relu(ctx0, score);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, score, NB, n_idx_h, T), 1, 0, 2, 3));   // [4, NB, T]
+        score = ggml_sum_rows(ctx0, score);                                                       // [1, NB, T]
+        score = ggml_reshape_2d(ctx0, score, NB, T);
+        score = ggml_add(ctx0, score, biasT);
+    }
     ggml_tensor * top = ggml_top_k(ctx0, score, KB);                                              // [KB, T] I32
     ggml_tensor * cells = ggml_get_rows(ctx0, qT.blk_cells, ggml_reshape_1d(ctx0, top, KB * T));  // [r, KB*T] I32
     cells = ggml_reshape_2d(ctx0, cells, NC, T);
@@ -713,13 +742,17 @@ ggml_tensor * graph_builder::sparse_attn_decode(ggml_tensor * cur, ggml_tensor *
                             1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     }
     ggml_tensor * pool_v = ggml_view_2d(ctx0, pc_w, idx_dim, NB, pc_w->nb[1], 0);      // after the write
-    ggml_tensor * score = ggml_mul_mat(ctx0, pool_v,
-            ggml_reshape_2d(ctx0, ggml_is_contiguous(q) ? q : ggml_cont(ctx0, q), idx_dim, n_idx_h));   // [NB, 4]
-    score = ggml_relu(ctx0, score);
-    score = ggml_cont(ctx0, ggml_transpose(ctx0, score));                             // [4, NB]
-    score = ggml_sum_rows(ctx0, score);                                               // [1, NB]
-    score = ggml_reshape_2d(ctx0, score, NB, 1);
-    score = ggml_add(ctx0, score, ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, qd.bias, NB, 0), NB, 1));
+    ggml_tensor * bias1 = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, qd.bias, NB, 0), NB, 1);
+    ggml_tensor * score = idx_score_lightning(q, pool_v, NB, bias1, /*prompt=*/false);
+    if (!score) {
+        score = ggml_mul_mat(ctx0, pool_v,
+                ggml_reshape_2d(ctx0, ggml_is_contiguous(q) ? q : ggml_cont(ctx0, q), idx_dim, n_idx_h));   // [NB, 4]
+        score = ggml_relu(ctx0, score);
+        score = ggml_cont(ctx0, ggml_transpose(ctx0, score));                         // [4, NB]
+        score = ggml_sum_rows(ctx0, score);                                           // [1, NB]
+        score = ggml_reshape_2d(ctx0, score, NB, 1);
+        score = ggml_add(ctx0, score, bias1);
+    }
     ggml_tensor * top = ggml_top_k(ctx0, score, KB);                                   // [KB, 1] I32
     ggml_tensor * cells = ggml_get_rows(ctx0, qd.blk_cells, ggml_reshape_1d(ctx0, top, KB));   // [r, KB] I32
     cells = ggml_reshape_1d(ctx0, cells, NC);

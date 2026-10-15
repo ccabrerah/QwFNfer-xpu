@@ -59,10 +59,10 @@ index 91e2980..9e05a1f 100644
              return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;
          case GGML_TYPE_Q2_0:
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index e7a9eba..74f16ee 100644
+index 60c7bfc..486836a 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -1054,11 +1054,16 @@ catch (sycl::exception const &exc) {
+@@ -1015,11 +1015,16 @@ catch (sycl::exception const &exc) {
  // ---- Q2_0_SOA (see scripts/box/q2soa/apply_q2soa.py) ----
  // A tensor's slices: blocks per 2-D slice, and how many slices. Writes and reads must cover whole slices, and the
  // slices must be packed (the MUL_MAT_ID weights the engine builds, and 1-D transfer handles, are).
@@ -81,7 +81,7 @@ index e7a9eba..74f16ee 100644
      if (t->ne[2] > 1 && t->nb[2] != slice_bytes) return false;
      if (t->ne[3] > 1 && t->nb[3] != slice_bytes * t->ne[2]) return false;
      return offset == 0 && size == slice_bytes * (size_t) nslices;
-@@ -1132,7 +1137,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -1093,7 +1098,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
  
      auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
      SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
@@ -90,7 +90,7 @@ index e7a9eba..74f16ee 100644
          int64_t bps, nslices;
          GGML_ASSERT(q2_0_soa_geometry(tensor, offset, size, bps, nslices) && "Q2_0_SOA: whole packed slices only");
          uint8_t * tmp = sycl::malloc_device<uint8_t>(size, *stream);
-@@ -1170,7 +1175,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+@@ -1131,7 +1136,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
      ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
  
      ggml_sycl_set_device(ctx->device);
@@ -99,7 +99,7 @@ index e7a9eba..74f16ee 100644
          int64_t bps, nslices;
          GGML_ASSERT(q2_0_soa_geometry(tensor, offset, size, bps, nslices) && "Q2_0_SOA: whole packed slices only");
          auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
-@@ -5384,7 +5389,7 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
+@@ -5345,7 +5350,7 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
  }
  
  static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -108,7 +108,7 @@ index e7a9eba..74f16ee 100644
             src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
             src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
  }
-@@ -6646,7 +6651,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
+@@ -6607,7 +6612,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
  
      GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
      const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
@@ -117,7 +117,7 @@ index e7a9eba..74f16ee 100644
          // the upload lands in a pool scratch and is reordered into place; the scratch goes back to the pool at
          // once, which is safe on this in-order queue (anything that reuses it is enqueued after the reorder)
          int64_t bps, nslices;
-@@ -6673,7 +6678,7 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
+@@ -6634,7 +6639,7 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
      GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
      GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
      ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
@@ -126,7 +126,7 @@ index e7a9eba..74f16ee 100644
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
      GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
-@@ -7719,7 +7724,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+@@ -7664,7 +7669,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
  static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      // Q2_0_SOA is a weight layout: only the weight of MUL_MAT / MUL_MAT_ID, as whole packed slices
      for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -135,7 +135,7 @@ index e7a9eba..74f16ee 100644
              if (i != 0 || (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID)) return false;
              int64_t bps, ns;
              if (!q2_0_soa_geometry(op->src[0], 0, ggml_nbytes(op->src[0]), bps, ns)) return false;
-@@ -7728,7 +7733,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -7673,7 +7678,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
              if (op->op == GGML_OP_MUL_MAT && ns != 1) return false;
          }
      }

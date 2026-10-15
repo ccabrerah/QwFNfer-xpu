@@ -263,10 +263,17 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
             for (uint32_t il = 0; il < K; il++)       perm_bytes += lbytes[il];
             for (uint32_t il = K; il < n_layer; il++) ext_bytes  += lbytes[il];
             if (ext_bytes) ext_bytes += 1ull << 20;
+            // The dynamic part: one buffer for layers [K, n_layer), or one per layer with QWFN_LEND_FIT (lent by need).
+            static const bool lend_fit = getenv("QWFN_LEND_FIT") != nullptr;
             vram_buf_ = alloc_vram(cfg.vram_buft, perm_bytes);
             if (vram_buf_ && ext_bytes) {
-                vram_extra_ = alloc_vram(cfg.vram_buft, ext_bytes);
-                if (!vram_extra_) {   // no split possible: everything permanent, nothing dynamic
+                if (lend_fit) for (uint32_t il = K; il < n_layer; il++) lend_units_.push_back(lend_unit{ nullptr, lbytes[il], il, il + 1 });
+                else          lend_units_.push_back(lend_unit{ nullptr, ext_bytes, K, n_layer });
+                bool all = true;
+                for (lend_unit & u : lend_units_) all = all && (u.buf = alloc_vram(cfg.vram_buft, u.bytes)) != nullptr;
+                if (!all) {   // no split possible: everything permanent, nothing dynamic
+                    for (lend_unit & u : lend_units_) if (u.buf) ggml_backend_buffer_free(u.buf);
+                    lend_units_.clear();
                     ggml_backend_buffer_free(vram_buf_);
                     vram_buf_ = alloc_vram(cfg.vram_buft, perm_bytes + ext_bytes);
                     K = n_layer; ext_bytes = 0;
@@ -274,20 +281,26 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
             }
             if (!vram_buf_) {
                 fprintf(stderr, "[qwfn] VRAM tier disabled: no device memory available\n");
+                for (lend_unit & u : lend_units_) if (u.buf) ggml_backend_buffer_free(u.buf);
+                lend_units_.clear();
             } else {
-                extra_bytes_ = ext_bytes;
+                extra_bytes_ = 0;
+                for (const lend_unit & u : lend_units_) extra_bytes_ += u.bytes;
                 // Every slot must decode to something finite from the start: the
                 // mul_mat_id MoE points experts that live elsewhere at slot 0 with
                 // weight 0, and 0 * NaN would poison the sum. Zero bytes decode to
                 // zero for every quant type in this model.
                 ggml_backend_buffer_clear(vram_buf_, 0);
-                if (vram_extra_) ggml_backend_buffer_clear(vram_extra_, 0);
+                for (lend_unit & u : lend_units_) ggml_backend_buffer_clear(u.buf, 0);
                 size_t goff_p = 0, goff_e = 0;
                 for (uint32_t il = 0; il < n_layer; il++) {
                     layer_pool & lp = blk_[il];
                     lp.g_slots   = gslots[il];
                     lp.g_in_lent = il >= K;
-                    lp.g_buf     = lp.g_in_lent ? vram_extra_ : vram_buf_;
+                    const lend_unit * lu = nullptr;
+                    for (const lend_unit & u : lend_units_) if (il >= u.il0 && il < u.il1) lu = &u;
+                    if (lu && il == lu->il0) goff_e = 0;   // each unit's layers start at its own base
+                    lp.g_buf     = lp.g_in_lent ? lu->buf : vram_buf_;
                     size_t & goff = lp.g_in_lent ? goff_e : goff_p;
                     lp.g_off = goff;
                     uint8_t * gbase = (uint8_t *) ggml_backend_buffer_get_base(lp.g_buf);
@@ -564,7 +577,8 @@ void expert_cache::shutdown() {
     if (ring_buf_) { ggml_backend_buffer_free(ring_buf_); ring_buf_ = nullptr; ring_base_ = nullptr; }
     if (xfer_ctx_) { ggml_free(xfer_ctx_); xfer_ctx_ = nullptr; xfer_ = nullptr; }
     if (vram_buf_) { ggml_backend_buffer_free(vram_buf_); vram_buf_ = nullptr; }
-    if (vram_extra_) { ggml_backend_buffer_free(vram_extra_); vram_extra_ = nullptr; }
+    for (lend_unit & u : lend_units_) if (u.buf) ggml_backend_buffer_free(u.buf);
+    lend_units_.clear();
     extra_bytes_ = 0;
     total_gslots_ = 0;
     if (arena_buf_) { ggml_backend_buffer_free(arena_buf_); arena_buf_ = nullptr; }
@@ -1599,9 +1613,9 @@ static bool lend_restore_on() {
     return on;
 }
 
-void expert_cache::lend_begin() {
+void expert_cache::lend_begin(size_t need) {
     settle_promotions();
-    lend_begin_impl();
+    lend_begin_impl(need);
 }
 
 void expert_cache::lend_end() {
@@ -1609,20 +1623,28 @@ void expert_cache::lend_end() {
     settle_promotions();
 }
 
-void expert_cache::lend_begin_impl() {
-    if (!vram_extra_) return;
+void expert_cache::lend_begin_impl(size_t need) {
+    // The units to lend: the last ones first, until what is lent (already, or now) covers `need`. One unit
+    // (QWFN_LEND_FIT off) is all or nothing, as before.
+    size_t freed = 0;
+    for (const lend_unit & u : lend_units_) if (!u.buf) freed += u.bytes;
+    std::vector<size_t> pick;
+    for (size_t k = lend_units_.size(); k-- > 0 && freed < need; )
+        if (lend_units_[k].buf) { pick.push_back(k); freed += lend_units_[k].bytes; }
+    if (pick.empty()) return;
     settle_promotions();   // copies still landing in those slots must finish first
     // QWFN_LEND_RESTORE: what the lent layers' tiers hold now, hottest first, read back before the next decode.
     // Exclusive tiers drop these blocks to disk (the RAM tier holds what VRAM did not), so without the restore every
     // streamed prompt -- an agent's every turn past ~180 tokens at 70K context -- leaves a third of the tier to be
     // refilled by demand misses during the reply (measured: ~24 non-VRAM experts per step after a turn, ~3 before).
-    // A prompt split into passes (time sharing, the boundary checkpoint) lends once per pass; the list taken before
-    // its first pass is kept -- later passes would only see the refill of the prompt's own experts.
-    if (lend_restore_on() && lend_saved_.empty()) {
-        lend_saved_.assign(blk_.size(), {});
-        for (uint32_t il = 0; il < blk_.size(); il++) {
+    // A prompt split into passes (time sharing, the boundary checkpoint) lends once per pass; a layer's list is taken
+    // the first time it is lent -- later passes would only see the refill of the prompt's own experts.
+    if (lend_restore_on()) {
+        if (lend_saved_.empty()) { lend_saved_.assign(blk_.size(), {}); lend_saved_taken_.assign(blk_.size(), 0); }
+        for (size_t k : pick) for (uint32_t il = lend_units_[k].il0; il < lend_units_[k].il1; il++) {
             layer_pool & lp = blk_[il];
-            if (!lp.g_in_lent) continue;
+            if (lend_saved_taken_[il]) continue;
+            lend_saved_taken_[il] = 1;
             std::vector<std::pair<uint32_t, uint16_t>> res;
             for (uint32_t g = 0; g < lp.g_slots; g++)
                 if (lp.g_slot_expert[g] != SLOT_EMPTY && lp.g_valid[g] && !(lp.g_cold.size() > g && lp.g_cold[g]))
@@ -1631,45 +1653,56 @@ void expert_cache::lend_begin_impl() {
             for (const auto & r : res) lend_saved_[il].push_back(r.second);
         }
     }
-    for (layer_pool & lp : blk_) {
-        if (!lp.g_in_lent) continue;
-        lp.g_lent = true;
-        std::fill(lp.g_slot_expert.begin(), lp.g_slot_expert.end(), SLOT_EMPTY);
-        std::fill(lp.g_valid.begin(), lp.g_valid.end(), 0);
-        std::fill(lp.g_expert_slot.begin(), lp.g_expert_slot.end(), -1);
-        lp.g_ver++;
+    for (size_t k : pick) {
+        lend_unit & u = lend_units_[k];
+        for (uint32_t il = u.il0; il < u.il1; il++) {
+            layer_pool & lp = blk_[il];
+            lp.g_lent = true;
+            std::fill(lp.g_slot_expert.begin(), lp.g_slot_expert.end(), SLOT_EMPTY);
+            std::fill(lp.g_valid.begin(), lp.g_valid.end(), 0);
+            std::fill(lp.g_expert_slot.begin(), lp.g_expert_slot.end(), -1);
+            lp.g_ver++;
+        }
+        ggml_backend_buffer_free(u.buf);
+        u.buf = nullptr;
     }
-    ggml_backend_buffer_free(vram_extra_);
-    vram_extra_ = nullptr;
     tier_epoch_++;
 }
 
 void expert_cache::lend_end_impl() {
-    if (!extra_bytes_ || vram_extra_) return;
+    if (!any_lent()) return;
     // A prefill just bumped the prompt's experts' counters (capped, but over
     // many ubatches); halve everything so the generation that follows can
     // displace them as its own routing settles.
     for (layer_pool & lp : blk_) for (auto & f : lp.ef) f >>= 1;
-    vram_extra_ = alloc_vram(cfg_.vram_buft, extra_bytes_);
-    if (!vram_extra_) {
-        static bool warned = false;
-        if (!warned) { warned = true; fprintf(stderr, "[qwfn] could not take the dynamic VRAM tier back after the prefill; those layers stay CPU-served until the next one\n"); }
-        return;
-    }
-    // Zeroed: slot 0 of every layer is the zero-weight dummy of the mul_mat_id
-    // MoE, and stale bytes decoded as this layer's type can be NaN scales.
-    ggml_backend_buffer_clear(vram_extra_, 0);
-    uint8_t * gbase = (uint8_t *) ggml_backend_buffer_get_base(vram_extra_);
-    for (layer_pool & lp : blk_) {
-        if (!lp.g_in_lent) continue;
-        lp.g_buf = vram_extra_;
-        size_t goff = lp.g_off;
-        for (int q = 0; q < EXPERT_NPARTS; q++) {
-            lp.g_part[q] = gbase + goff;
-            goff += (size_t) lp.g_slots * lp.g_part_bytes[q];
+    std::vector<uint8_t> back(blk_.size(), 0);
+    bool any = false;
+    for (lend_unit & u : lend_units_) {
+        if (u.buf) continue;
+        u.buf = alloc_vram(cfg_.vram_buft, u.bytes);
+        if (!u.buf) {
+            static bool warned = false;
+            if (!warned) { warned = true; fprintf(stderr, "[qwfn] could not take the dynamic VRAM tier back after the prefill; those layers stay CPU-served until the next one\n"); }
+            continue;
         }
-        lp.g_lent = false;
+        // Zeroed: slot 0 of every layer is the zero-weight dummy of the mul_mat_id
+        // MoE, and stale bytes decoded as this layer's type can be NaN scales.
+        ggml_backend_buffer_clear(u.buf, 0);
+        uint8_t * gbase = (uint8_t *) ggml_backend_buffer_get_base(u.buf);
+        for (uint32_t il = u.il0; il < u.il1; il++) {
+            layer_pool & lp = blk_[il];
+            lp.g_buf = u.buf;
+            size_t goff = lp.g_off;
+            for (int q = 0; q < EXPERT_NPARTS; q++) {
+                lp.g_part[q] = gbase + goff;
+                goff += (size_t) lp.g_slots * lp.g_part_bytes[q];
+            }
+            lp.g_lent = false;
+            back[il] = 1;
+        }
+        any = true;
     }
+    if (!any) return;
     tier_epoch_++;
     // Those layers come back with empty VRAM tiers. Refill them from what the
     // RAM tier holds -- the prefill's warm-up just put the prompt's experts
@@ -1677,7 +1710,7 @@ void expert_cache::lend_end_impl() {
     // the pinned arena; the RAM slots are protected until the next settle.
     for (uint32_t il = 0; il < blk_.size(); il++) {
         layer_pool & lp = blk_[il];
-        if (!lp.g_in_lent || lp.g_slots == 0) continue;
+        if (!back[il] || lp.g_slots == 0) continue;
         std::vector<std::pair<uint32_t, uint32_t>> cand;   // (ef, expert)
         for (uint32_t s = 0; s < lp.n_slots; s++)
             if (lp.slot_valid[s] && lp.slot_expert[s] != SLOT_EMPTY && !lp.slot_cold[s])
@@ -1771,6 +1804,7 @@ void expert_cache::lend_restore(double budget_s) {
         cur = nxt;
     }
     lend_saved_.clear();
+    lend_saved_taken_.clear();
     const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     st_.lend_restored += n_done; st_.lend_restore_bytes += bytes; st_.t_lend_restore += dt;
     static const bool quiet = getenv("QWFN_LEND_RESTORE_QUIET") != nullptr;

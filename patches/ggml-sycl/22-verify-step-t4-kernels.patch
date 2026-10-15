@@ -6,10 +6,10 @@ with a token dimension; smallk with a batch dimension. A T-token call gives the 
 (the MTP verify step runs T = 2..4 positions through them).
 
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 74f16ee..9a7140e 100644
+index 486836a..50e5872 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -5577,23 +5577,34 @@ static bool ggml_sycl_mmid_glu_q2w_fused(ggml_backend_sycl_context & ctx, ggml_c
+@@ -5538,23 +5538,34 @@ static bool ggml_sycl_mmid_glu_q2w_fused(ggml_backend_sycl_context & ctx, ggml_c
      const ggml_tensor_extra_gpu * eu = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
      if ((eg && eg->optimized_feature.reorder) || (eu && eu->optimized_feature.reorder)) return false;
      if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) return false;
@@ -115,7 +115,7 @@ index 146a6c1..2c168b8 100644
 -                                        bool soa = false);
 +                                        bool soa = false, int n_tokens = 1, int y_tok_blocks = 0, int ids_tok_stride = 0, size_t dst_tok_stride = 0);
 diff --git a/ggml/src/ggml-sycl/mmvw.cpp b/ggml/src/ggml-sycl/mmvw.cpp
-index 74f3dd2..3af27ec 100644
+index fd71c27..5d07e9a 100644
 --- a/ggml/src/ggml-sycl/mmvw.cpp
 +++ b/ggml/src/ggml-sycl/mmvw.cpp
 @@ -14,14 +14,16 @@
@@ -285,7 +285,7 @@ index 74f3dd2..3af27ec 100644
      }
  }
  
-@@ -165,11 +194,14 @@ bool ggml_sycl_smallk_supported(const ggml_tensor * src0, const ggml_tensor * sr
+@@ -145,11 +174,14 @@ bool ggml_sycl_smallk_supported(const ggml_tensor * src0, const ggml_tensor * sr
      if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
      const int64_t K = src0->ne[0];
      if (K < 1 || K > 32 || src1->ne[0] != K) return false;
@@ -302,7 +302,7 @@ index 74f3dd2..3af27ec 100644
  }
  
  void ggml_sycl_smallk(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-@@ -178,18 +210,20 @@ void ggml_sycl_smallk(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+@@ -158,18 +190,20 @@ void ggml_sycl_smallk(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
      const int     K   = (int) src0->ne[0];
      const int64_t M   = src0->ne[1], N = src1->ne[1];
      const int64_t s0  = src0->nb[1] / sizeof(float), s1 = src1->nb[1] / sizeof(float);
