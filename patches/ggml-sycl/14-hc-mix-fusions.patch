@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 00006b3..9b10b58 100644
+index b45d1db..cb69476 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -67,6 +67,50 @@
+@@ -69,6 +69,50 @@
  #include "ggml-sycl/mmvw.hpp"
  #include "ggml-sycl/sdattn.hpp"
  #include "ggml-sycl/topkwg.hpp"
@@ -53,7 +53,7 @@ index 00006b3..9b10b58 100644
  #include "ggml-sycl/presets.hpp"
  #include "ggml-sycl/quantize.hpp"
  #include "ggml-sycl/repeat_back.hpp"
-@@ -6219,6 +6263,38 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -6677,6 +6721,38 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              i++;
              continue;
          }

@@ -1,3 +1,5 @@
+diff --git a/ggml/src/ggml-sycl/fusion.cpp b/ggml/src/ggml-sycl/fusion.cpp
+index 79fe13a..2146c2d 100644
 --- a/ggml/src/ggml-sycl/fusion.cpp
 +++ b/ggml/src/ggml-sycl/fusion.cpp
 @@ -2,6 +2,8 @@
@@ -9,8 +11,8 @@
  
  // mul_mat(gate) + mul_mat(up) + GLU: graph shape and tensor properties only. Backend state
  // (weight layout, split buffers, DMMV) is checked by ggml_sycl_mul_mat_glu_mmvq_fused().
-@@ -58,6 +60,113 @@
-     return true;
+@@ -70,6 +72,113 @@ static bool ggml_sycl_fused_unary_has_kernel(ggml_unary_op unary_op) {
+            unary_op == GGML_UNARY_OP_SOFTPLUS;
  }
  
 +static bool hc_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
@@ -123,6 +125,8 @@
  bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops,
                          std::initializer_list<enum ggml_unary_op> unary_ops) {
  #ifndef NDEBUG
+diff --git a/ggml/src/ggml-sycl/fusion.hpp b/ggml/src/ggml-sycl/fusion.hpp
+index 94e7408..32d15d9 100644
 --- a/ggml/src/ggml-sycl/fusion.hpp
 +++ b/ggml/src/ggml-sycl/fusion.hpp
 @@ -14,4 +14,12 @@
@@ -138,10 +142,32 @@
 +int ggml_sycl_can_fuse_hc_norm(const ggml_cgraph * cgraph, int node_idx);
 +
  #endif  // GGML_SYCL_FUSION_HPP
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index df0aae4..cb0da89 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -6459,6 +6459,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+             }
+         }
+ #endif
++        if (node->op == GGML_OP_OUT_PROD) {
++            const int hc_plan = ggml_sycl_can_fuse_hc_norm(cgraph, i);
++            if (hc_plan != 0) {
++                ggml_sycl_op_hc_combine_norm(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
++                                             cgraph->nodes[i + 3], hc_plan == 2);
++                i += 3;
++                continue;
++            }
++        }
+         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
+         if (node->op == GGML_OP_GATED_DELTA_NET) {
+             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
+diff --git a/ggml/src/ggml-sycl/norm.cpp b/ggml/src/ggml-sycl/norm.cpp
+index 36576e9..dcc0b52 100644
 --- a/ggml/src/ggml-sycl/norm.cpp
 +++ b/ggml/src/ggml-sycl/norm.cpp
-@@ -682,6 +682,156 @@
-         ss0, ss1, ss2, ss3, ds0, ds1, ds2, ds3, eps, main_stream, ctx.device);
+@@ -773,6 +773,156 @@ void ggml_sycl_op_rms_norm_scale_fused(ggml_backend_sycl_context & ctx, ggml_ten
+         ss0, ss1, ss2, ss3, ds0, ds1, ds2, ds3, eps, scale_mul, main_stream, ctx.device);
  }
  
 +// OUT_PROD -> ADD -> RMS_NORM -> MUL in one pass: the qwfn hyper-connection combine
@@ -297,11 +323,13 @@
  void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
      const ggml_tensor * rms_norm_src = dst->src[0];
      float eps = 0.0f;
+diff --git a/ggml/src/ggml-sycl/norm.hpp b/ggml/src/ggml-sycl/norm.hpp
+index fb667ac..bd7f1e6 100644
 --- a/ggml/src/ggml-sycl/norm.hpp
 +++ b/ggml/src/ggml-sycl/norm.hpp
-@@ -21,6 +21,11 @@
+@@ -23,6 +23,11 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context& ctx, ggml_tensor* ds
  
- void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context& ctx, ggml_tensor* dst, ggml_tensor* mul);
+ void ggml_sycl_op_rms_norm_scale_fused(ggml_backend_sycl_context& ctx, ggml_tensor* dst, ggml_tensor* scale_tensor);
  
 +// OUT_PROD -> ADD -> RMS_NORM -> MUL (hyper-connection combine + norm); preconditions from
 +// ggml_sycl_can_fuse_hc_norm(). Writes the ADD and MUL results; the other two are elided.
@@ -311,27 +339,11 @@
  void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context& ctx, ggml_tensor* dst, ggml_tensor* mul_tensor, ggml_tensor* add_tensor);
  
  void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context& ctx, ggml_tensor* dst);
---- a/ggml/src/ggml-sycl/ggml-sycl.cpp
-+++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -6008,6 +6008,15 @@
-             }
-         }
- #endif
-+        if (node->op == GGML_OP_OUT_PROD) {
-+            const int hc_plan = ggml_sycl_can_fuse_hc_norm(cgraph, i);
-+            if (hc_plan != 0) {
-+                ggml_sycl_op_hc_combine_norm(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
-+                                             cgraph->nodes[i + 3], hc_plan == 2);
-+                i += 3;
-+                continue;
-+            }
-+        }
-         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
-         if (node->op == GGML_OP_GATED_DELTA_NET) {
-             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 0d7a7ed..91ae948 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -3690,6 +3690,46 @@
+@@ -3803,6 +3803,46 @@ struct test_rms_norm_back : public test_case {
  };
  
  // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
@@ -378,7 +390,7 @@
  struct test_rms_norm_mul_add : public test_case {
      const ggml_type type;
      const std::array<int64_t, 4> ne;
-@@ -9673,6 +9713,18 @@
+@@ -10517,6 +10557,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true, false, true));
      test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
      test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));

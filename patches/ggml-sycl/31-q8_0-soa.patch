@@ -4,12 +4,12 @@ Subject: [PATCH 31] ggml-sycl: Q8_0_SOA, a q8_0 expert layout and its one-token 
 The SOA layout of patches 09 / 17 ([codes][scales] per 2-D slice, codes 16-byte aligned) for q8_0: 32 code bytes and
 a 2-byte scale per block. The one-token MoE matvec takes 16-byte half blocks, LPR lanes per row (8 for rows of 20
 blocks: no idle lane), four sub-groups per work-group; the stock kernel runs one 16-lane work-group per row and reads
-a q8_0 expert-down at ~85 GB/s. Also: the upload / read-back
+a q8_0 expert-down at ~85 GB/s. GGML_SYCL_Q8_SOA_LPR=16|8|4 forces the lanes per row. Also: the upload / read-back
 conversions take the block size (18 or 34 bytes), a dequantize for the multi-token path, and patch 30's CPY back to
 the file's blocks for Q8_0_SOA.
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 2e066fd..39fe2cb 100644
+index af1f9cc..caeffcb 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -432,7 +432,8 @@ extern "C" {
@@ -23,7 +23,7 @@ index 2e066fd..39fe2cb 100644
  
      // [TAG_GGML_PREC]
 diff --git a/ggml/src/ggml-sycl/convert.cpp b/ggml/src/ggml-sycl/convert.cpp
-index 05b5378..efde798 100644
+index 9e05a1f..333e964 100644
 --- a/ggml/src/ggml-sycl/convert.cpp
 +++ b/ggml/src/ggml-sycl/convert.cpp
 @@ -79,6 +79,19 @@ static void dequantize_q2_0_soa_sycl(const void * __restrict__ vx, dst_t * __res
@@ -46,7 +46,7 @@ index 05b5378..efde798 100644
  // IQ4_NL_SOA (patch 17): k elements of whole slices as [codes][scales]; one work-item per code byte, which holds
  // element j (low nibble) and element j + 16 (high nibble) of its block, as dequantize_iq4_nl.
  template <typename dst_t>
-@@ -711,6 +724,8 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
+@@ -748,6 +761,8 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
              return dequantize_q2_0_soa_sycl;
          case GGML_TYPE_IQ4_NL_SOA:
              return dequantize_iq4_nl_soa_sycl;
@@ -55,7 +55,7 @@ index 05b5378..efde798 100644
          case GGML_TYPE_Q1_0:
              return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;
          case GGML_TYPE_Q2_0:
-@@ -805,6 +820,8 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
+@@ -855,6 +870,8 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
              return dequantize_q2_0_soa_sycl;
          case GGML_TYPE_IQ4_NL_SOA:
              return dequantize_iq4_nl_soa_sycl;
@@ -89,10 +89,10 @@ index 3176a21..00b480a 100644
                  (src0->type == GGML_TYPE_IQ4_NL_SOA && src1->type == GGML_TYPE_IQ4_NL)) &&
                 ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index e64cdbd..67f420a 100644
+index f4833e4..3ae8332 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -934,41 +934,59 @@ catch (sycl::exception const &exc) {
+@@ -1056,41 +1056,59 @@ catch (sycl::exception const &exc) {
  // slices must be packed (the MUL_MAT_ID weights the engine builds, and 1-D transfer handles, are).
  // patch 17: IQ4_NL_SOA uses the same layout -- an iq4_nl block is a 2-byte scale and 16 code bytes, like q2_0's --
  // with 32 elements per block instead of 64.
@@ -169,7 +169,7 @@ index e64cdbd..67f420a 100644
  
  static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                  ggml_tensor *tensor,
-@@ -987,7 +1005,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -1143,7 +1161,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
          uint8_t * tmp = sycl::malloc_device<uint8_t>(size, *stream);
          GGML_ASSERT(tmp);
          SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tmp, data, size).wait()));
@@ -178,7 +178,7 @@ index e64cdbd..67f420a 100644
          SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
          sycl::free(tmp, *stream);
          return;
-@@ -1026,7 +1044,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+@@ -1182,7 +1200,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
          SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
          uint8_t * tmp = sycl::malloc_device<uint8_t>(size, *stream);
          GGML_ASSERT(tmp);
@@ -187,7 +187,7 @@ index e64cdbd..67f420a 100644
          SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(data, tmp, size).wait()));
          sycl::free(tmp, *stream);
          return;
-@@ -6329,7 +6347,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
+@@ -6780,7 +6798,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
          GGML_ASSERT(q2_0_soa_geometry(tensor, offset, size, bps, nslices) && "Q2_0_SOA: whole packed slices only");
          ggml_sycl_pool_alloc<uint8_t> tmp(sycl_ctx->pool(), size);
          SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tmp.get(), data, size)));
@@ -197,10 +197,10 @@ index e64cdbd..67f420a 100644
      }
      SYCL_CHECK(CHECK_TRY_ERROR(
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
-index 75b4396..bb6cacd 100644
+index 8ad766a..16cfcd9 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -3157,6 +3157,86 @@ static void launch_mul_mat_vec_iq4_nl_soa_moe(
+@@ -3431,6 +3431,86 @@ static void launch_mul_mat_vec_iq4_nl_soa_moe(
      else                           go(std::integral_constant<int, WARP_SIZE / 4>{});
  }
  
@@ -287,7 +287,7 @@ index 75b4396..bb6cacd 100644
  static bool ggml_sycl_moe_q2w_enabled() {
      static const bool v = [] { const char * e = getenv("GGML_SYCL_MOE_Q2W"); return e && atoi(e) != 0; }();
      return v;
-@@ -3285,6 +3365,12 @@ bool ggml_sycl_mul_mat_vec_q_id(
+@@ -3559,6 +3639,12 @@ bool ggml_sycl_mul_mat_vec_q_id(
                  vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                  expert_weight_stride, dst_row_stride, src1_row_stride, stream);
              return true;
@@ -301,10 +301,10 @@ index 75b4396..bb6cacd 100644
              if (ncols % QK4_NL != 0) return false;
              launch_mul_mat_vec_iq4_nl_soa_moe(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 1710c69..e7de3f7 100644
+index 48ab267..c0f6729 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -702,6 +702,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+@@ -713,6 +713,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
          .type_size                = sizeof(block_iq4_nl),
          .is_quantized             = true,
      },

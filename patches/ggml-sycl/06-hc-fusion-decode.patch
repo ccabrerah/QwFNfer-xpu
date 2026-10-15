@@ -1,6 +1,8 @@
+diff --git a/ggml/src/ggml-sycl/fusion.cpp b/ggml/src/ggml-sycl/fusion.cpp
+index 2146c2d..7f9b0bf 100644
 --- a/ggml/src/ggml-sycl/fusion.cpp
 +++ b/ggml/src/ggml-sycl/fusion.cpp
-@@ -91,9 +91,11 @@
+@@ -103,9 +103,11 @@ static const char * hc_norm_decline(const ggml_cgraph * cgraph, int i, bool * tw
          if (t->type != GGML_TYPE_F32) return "not F32";
          if (t->ne[3] != 1) return "4-D";
      }

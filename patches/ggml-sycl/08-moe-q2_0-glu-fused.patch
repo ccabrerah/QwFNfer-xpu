@@ -1,9 +1,9 @@
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 7f9d1bc..64e3486 100644
+index bd11b40..03e97c0 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -4836,6 +4836,53 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
-     }
+@@ -5240,6 +5240,53 @@ static bool ggml_sycl_mul_mat_glu_mmvq_plain(ggml_backend_sycl_context & ctx, gg
+                                              /*stride_col_dst=*/(int) glu->ne[0], stream);
  }
  
 +// Fused {MUL_MAT_ID(gate), MUL_MAT_ID(up), GLU(swiglu)} for q2_0 experts at one token (GGML_SYCL_MOE_Q2W=1).
@@ -56,7 +56,7 @@ index 7f9d1bc..64e3486 100644
  // Fused dense-FFN mat-vec for the {mul_mat(gate), mul_mat(up), GLU} subgraph at node_idx.
  // Returns false if it declined, in which case the caller runs the three nodes normally.
  static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
-@@ -6080,6 +6127,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -6563,6 +6610,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              continue;
          }
  
@@ -69,10 +69,10 @@ index 7f9d1bc..64e3486 100644
          if (!ok) {
              GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
-index b0a1649..2d4b51d 100644
+index 6da35f9..946126f 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -2867,6 +2867,85 @@ static bool ggml_sycl_moe_q2w_enabled() {
+@@ -3141,6 +3141,85 @@ static bool ggml_sycl_moe_q2w_enabled() {
      return v;
  }
  
@@ -159,10 +159,10 @@ index b0a1649..2d4b51d 100644
      enum ggml_type     src0_type,
      const void *       vx_base,
 diff --git a/ggml/src/ggml-sycl/mmvq.hpp b/ggml/src/ggml-sycl/mmvq.hpp
-index 9d2f564..4ca728f 100644
+index 3a0ef07..24f5a91 100644
 --- a/ggml/src/ggml-sycl/mmvq.hpp
 +++ b/ggml/src/ggml-sycl/mmvq.hpp
-@@ -74,3 +74,9 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(
+@@ -100,3 +100,9 @@ bool ggml_sycl_mul_mat_vec_q_glu_plain(
      dpct::queue_ptr    stream);
  
  #endif // GGML_SYCL_MMVQ_HPP

@@ -1,7 +1,8 @@
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index eb37067..fb6f356 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -5064,6 +5064,63 @@
+@@ -5427,6 +5427,63 @@ static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor *
             src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
  }
  
@@ -65,7 +66,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
  
-@@ -5086,45 +5143,13 @@
+@@ -5449,45 +5506,13 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
          return;
      }
      // GGML_SYCL_Q8_DIRECT: one-token Q8_0 matvec without ggml_sycl_op_mul_mat's generic per-call machinery (device
@@ -118,7 +119,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
              return;
          }
      }
-@@ -6613,6 +6638,42 @@
+@@ -7071,6 +7096,42 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                  continue;
              }
          }
@@ -162,9 +163,10 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          if (node->op == GGML_OP_UNARY && ggml_sycl_fuse_hc_mix_on() && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
              const int last = ggml_sycl_match_hc_mix_mean(cgraph, i);
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index 172d4ab..071bd03 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -1257,6 +1257,53 @@
+@@ -1306,6 +1306,53 @@ static void reorder_mul_mat_vec_q8_0_q8_1_wide_sycl(const void * vx, const void
          });
  }
  
@@ -218,7 +220,7 @@ diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
  template <int ncols_dst>
  static void reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols(
          const void * vx, const void * vy, float * dst,
-@@ -3511,3 +3558,14 @@
+@@ -3941,3 +3988,14 @@ void ggml_sycl_q8_0_reorder_mmvq_direct(const void * vx, const void * vy, float
          reorder_mul_mat_vec_q8_0_q8_1_sycl(vx, vy, dst, ncols, nrows, stream);
      }
  }
@@ -234,9 +236,10 @@ diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
 +    reorder_mul_mat_vec_q8_0_q8_1_wide_silu_sycl(vx, vy, dst, ncols, nrows, scale, stream);
 +}
 diff --git a/ggml/src/ggml-sycl/mmvq.hpp b/ggml/src/ggml-sycl/mmvq.hpp
+index 7358658..04a2fbe 100644
 --- a/ggml/src/ggml-sycl/mmvq.hpp
 +++ b/ggml/src/ggml-sycl/mmvq.hpp
-@@ -77,6 +77,11 @@
+@@ -103,6 +103,11 @@ bool ggml_sycl_mul_mat_vec_q_glu_plain(
  void ggml_sycl_q8_0_reorder_mmvq_direct(const void * vx, const void * vy, float * dst, int ncols, int nrows,
                                          dpct::queue_ptr stream);
  

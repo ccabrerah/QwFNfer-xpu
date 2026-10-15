@@ -11,9 +11,11 @@ dense path runs (it is cheaper per call there); GGML_SYCL_SPF_MIN_T (default 256
 verify steps, short turns over a long cache) leave it too. GGML_SYCL_SPF_CHECK=1 runs both and compares per layer;
 GGML_SYCL_SPF_DEBUG=1 reports where the matcher stops.
 
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index b8b69a9..f4833e4 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -6550,6 +6550,11 @@
+@@ -7000,6 +7000,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              }
          }
          // K/V gathers from the q8_0 cache + F16 casts + one-token FLASH_ATTN_EXT (GGML_SYCL_FUSE_SPARSE_DECODE=1)
@@ -25,7 +27,7 @@ GGML_SYCL_SPF_DEBUG=1 reports where the matcher stops.
          if (node->op == GGML_OP_GET_ROWS && ggml_sycl_sparse_decode_attn_fused(*sycl_ctx, cgraph, i)) {
              i += 8;
              continue;
-@@ -6749,6 +6754,7 @@
+@@ -7231,6 +7236,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
          }
  
          bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
@@ -33,6 +35,8 @@ GGML_SYCL_SPF_DEBUG=1 reports where the matcher stops.
          if (!ok) {
              GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
          }
+diff --git a/ggml/src/ggml-sycl/sdattn.cpp b/ggml/src/ggml-sycl/sdattn.cpp
+index 073ae56..2e3daa0 100644
 --- a/ggml/src/ggml-sycl/sdattn.cpp
 +++ b/ggml/src/ggml-sycl/sdattn.cpp
 @@ -13,6 +13,9 @@
@@ -45,7 +49,7 @@ GGML_SYCL_SPF_DEBUG=1 reports where the matcher stops.
  
  namespace {
  
-@@ -188,3 +191,386 @@
+@@ -188,3 +191,386 @@ bool ggml_sycl_sparse_decode_attn_fused(ggml_backend_sycl_context & ctx, ggml_cg
          [=](sycl::nd_item<2> it) { sdattn_merge(pod, pmd, n_chunks, dst, it); });
      return true;
  }
@@ -432,6 +436,8 @@ GGML_SYCL_SPF_DEBUG=1 reports where the matcher stops.
 +                (long long) node->ne[2], maxd, maxa, sumd / a.size(), nbad);
 +    spf_check_pending.fa = nullptr;
 +}
+diff --git a/ggml/src/ggml-sycl/sdattn.hpp b/ggml/src/ggml-sycl/sdattn.hpp
+index 1d6a762..0ec614c 100644
 --- a/ggml/src/ggml-sycl/sdattn.hpp
 +++ b/ggml/src/ggml-sycl/sdattn.hpp
 @@ -6,3 +6,11 @@

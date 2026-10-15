@@ -1,12 +1,11 @@
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index dd2f96d..caa6eac 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -1199,6 +1199,62 @@
-                                                                                            nd_item);
-                          });
+@@ -1250,6 +1250,62 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void * vx, const void * vy,
      });
-+}
-+
+ }
+ 
 +
 +// GGML_SYCL_Q8W=1: one-token Q8_0 matvec over the reorder layout with a whole block per lane. The reorder layout keeps
 +// a block's 32 quants contiguous and 32-byte aligned, so they arrive as two 16-byte loads (the stock kernel above
@@ -61,10 +60,12 @@ diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
 +                dst[row] = sum;
 +            }
 +        });
- }
- 
++}
++
  template <int ncols_dst>
-@@ -2415,7 +2471,11 @@
+ static void reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols(
+         const void * vx, const void * vy, float * dst,
+@@ -2660,7 +2716,11 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                          return;
                      } else {
                          GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q8_0_q8_1_sycl\n");

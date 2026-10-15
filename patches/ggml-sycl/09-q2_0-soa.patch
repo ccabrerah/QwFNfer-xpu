@@ -1,5 +1,5 @@
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 85a1ae7..436af5a 100644
+index c37ba94..43db82e 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -430,7 +430,8 @@ extern "C" {
@@ -13,7 +13,7 @@ index 85a1ae7..436af5a 100644
  
      // [TAG_GGML_PREC]
 diff --git a/ggml/src/ggml-sycl/convert.cpp b/ggml/src/ggml-sycl/convert.cpp
-index b660b56..92b38c4 100644
+index 08eca7a..91e2980 100644
 --- a/ggml/src/ggml-sycl/convert.cpp
 +++ b/ggml/src/ggml-sycl/convert.cpp
 @@ -44,6 +44,41 @@ static void dequantize_block_sycl(const void *__restrict__ vx,
@@ -58,7 +58,7 @@ index b660b56..92b38c4 100644
  template <typename dst_t>
  static void dequantize_row_q2_K_sycl(const void *vx, dst_t *y, const int64_t k,
                                       dpct::queue_ptr stream) {
-@@ -655,6 +690,8 @@ static void convert_unary_sycl(const void * vx, dst_t * y, const int64_t k, dpct
+@@ -692,6 +727,8 @@ static void convert_unary_sycl(const void * vx, dst_t * y, const int64_t k, dpct
  
  to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
      switch (type) {
@@ -67,7 +67,7 @@ index b660b56..92b38c4 100644
          case GGML_TYPE_Q1_0:
              return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;
          case GGML_TYPE_Q2_0:
-@@ -745,6 +782,8 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
+@@ -795,6 +832,8 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
  
  to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
      switch (type) {
@@ -77,10 +77,10 @@ index b660b56..92b38c4 100644
              return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;
          case GGML_TYPE_Q2_0:
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index e673cd7..0487ef7 100644
+index 03e97c0..69f1b4d 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -685,6 +685,42 @@ catch (sycl::exception const &exc) {
+@@ -807,6 +807,42 @@ catch (sycl::exception const &exc) {
    std::exit(1);
  }
  
@@ -123,8 +123,8 @@ index e673cd7..0487ef7 100644
  static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                  ggml_tensor *tensor,
                                                  const void *data, size_t offset,
-@@ -696,6 +732,17 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
-     ggml_sycl_set_device(ctx->device);
+@@ -852,6 +888,17 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+ 
      auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
      SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
 +    if (tensor->type == GGML_TYPE_Q2_0_SOA) {
@@ -141,7 +141,7 @@ index e673cd7..0487ef7 100644
  #ifndef _WIN32
      // Note: Use host buffer to save the data from mmap(), then copy to device. It's workaround for mmap() issue on PVC GPU.
      // This function will be called during load model from disk. Use memory buffer replace dynamic won't save more time and brings potential memory leak risk here.
-@@ -723,6 +770,18 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+@@ -879,6 +926,18 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
      ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
  
      ggml_sycl_set_device(ctx->device);
@@ -160,7 +160,7 @@ index e673cd7..0487ef7 100644
      auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
  
      SYCL_CHECK(CHECK_TRY_ERROR(
-@@ -4718,7 +4777,8 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
+@@ -5081,7 +5140,8 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
  }
  
  static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -170,7 +170,7 @@ index e673cd7..0487ef7 100644
             src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
  }
  
-@@ -4859,7 +4919,7 @@ static bool ggml_sycl_mmid_glu_q2w_fused(ggml_backend_sycl_context & ctx, ggml_c
+@@ -5262,7 +5322,7 @@ static bool ggml_sycl_mmid_glu_q2w_fused(ggml_backend_sycl_context & ctx, ggml_c
      const ggml_tensor * wg = gate->src[0], * wu = up->src[0];
      const ggml_tensor * x  = gate->src[1], * ids = gate->src[2];
      if (up->src[1] != x || up->src[2] != ids) return false;                      // same input, same routing
@@ -179,7 +179,7 @@ index e673cd7..0487ef7 100644
      if (ggml_backend_buffer_is_sycl_split(wg->buffer) || ggml_backend_buffer_is_sycl_split(wu->buffer)) return false;
      const ggml_tensor_extra_gpu * eg = static_cast<const ggml_tensor_extra_gpu *>(wg->extra);
      const ggml_tensor_extra_gpu * eu = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
-@@ -4880,7 +4940,8 @@ static bool ggml_sycl_mmid_glu_q2w_fused(ggml_backend_sycl_context & ctx, ggml_c
+@@ -5283,7 +5343,8 @@ static bool ggml_sycl_mmid_glu_q2w_fused(ggml_backend_sycl_context & ctx, ggml_c
      ggml_sycl_pool_alloc<char> q8(ctx.pool(), (size_t) padded * sizeof(block_q8_1) / QK8_1);
      quantize_row_q8_1_sycl<quantize_q8_1>((const float *) x->data, q8.get(), (int) K, 1, padded, stream);
      ggml_sycl_mul_mat_vec_q2_0_moe_glu(wg->data, wu->data, q8.get(), (const int32_t *) ids->data, (float *) glu->data,
@@ -189,7 +189,7 @@ index e673cd7..0487ef7 100644
      return true;
  }
  
-@@ -5891,6 +5952,16 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
+@@ -6341,6 +6402,16 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
  
      GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
      const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
@@ -206,7 +206,7 @@ index e673cd7..0487ef7 100644
      SYCL_CHECK(CHECK_TRY_ERROR(
          (stream)->memcpy((char *)tensor->data + offset, data, size)));
  }
-@@ -5908,6 +5979,7 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
+@@ -6358,6 +6429,7 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
      GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
      GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
      ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
@@ -214,7 +214,7 @@ index e673cd7..0487ef7 100644
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
      GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
-@@ -6797,6 +6869,18 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
+@@ -7286,6 +7358,18 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
  }
  
  static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
@@ -234,10 +234,10 @@ index e673cd7..0487ef7 100644
      GGML_SYCL_DEBUG("[SYCL] call %s op->op=%s op->type=%s -> %s\n", __func__, ggml_op_name(op->op),
                      ggml_type_name(op->type), res ? "true" : "false");
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
-index 2d4b51d..fd399cc 100644
+index 946126f..29f5fd5 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -2778,7 +2778,27 @@ static __dpct_inline__ int q2_0_expand_byte(const uint32_t q) {
+@@ -3052,7 +3052,27 @@ static __dpct_inline__ int q2_0_expand_byte(const uint32_t q) {
      return (int) ((q & 0x3u) | (((q >> 2) & 0x3u) << 8) | (((q >> 4) & 0x3u) << 16) | (((q >> 6) & 0x3u) << 24));
  }
  
@@ -266,7 +266,7 @@ index 2d4b51d..fd399cc 100644
  static void mul_mat_vec_q2_0_moe_wide(
      const void * __restrict__ vx_base, const void * __restrict__ vy_base,
      float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
-@@ -2800,14 +2820,10 @@ static void mul_mat_vec_q2_0_moe_wide(
+@@ -3074,14 +3094,10 @@ static void mul_mat_vec_q2_0_moe_wide(
      const int blocks_per_row = ncols / QK2_0;
      float acc = 0.0f;
      if (row < nrows) {
@@ -283,7 +283,7 @@ index 2d4b51d..fd399cc 100644
              const block_q8_1 * y0 = y + 2 * b;
              const block_q8_1 * y1 = y0 + 1;
              const int * u0 = (const int *) y0->qs;
-@@ -2823,7 +2839,6 @@ static void mul_mat_vec_q2_0_moe_wide(
+@@ -3097,7 +3113,6 @@ static void mul_mat_vec_q2_0_moe_wide(
              }
              const sycl::float2 ds0 = y0->ds.convert<float, sycl::rounding_mode::automatic>();
              const sycl::float2 ds1 = y1->ds.convert<float, sycl::rounding_mode::automatic>();
@@ -291,7 +291,7 @@ index 2d4b51d..fd399cc 100644
              acc += d * ((s0 * ds0.x() - ds0.y()) + (s1 * ds1.x() - ds1.y()));
          }
      }
-@@ -2841,7 +2856,7 @@ static void launch_mul_mat_vec_q2_0_moe_wide(
+@@ -3115,7 +3130,7 @@ static void launch_mul_mat_vec_q2_0_moe_wide(
      const void * vx_base, const void * vy, const int32_t * ids_dev,
      float * dst_base, const int ncols, const int nrows, const int n_experts_used,
      const size_t expert_weight_stride, const size_t dst_row_stride,
@@ -300,7 +300,7 @@ index 2d4b51d..fd399cc 100644
      const int blocks_per_row = ncols / QK2_0;
      constexpr int SG_PER_WG = 4;   // subgroups per work-group
      auto go = [&](auto lpr_tag) {
-@@ -2853,7 +2868,9 @@ static void launch_mul_mat_vec_q2_0_moe_wide(
+@@ -3127,7 +3142,9 @@ static void launch_mul_mat_vec_q2_0_moe_wide(
          stream->submit([&](sycl::handler & cgh) {
              cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                  [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
@@ -311,7 +311,7 @@ index 2d4b51d..fd399cc 100644
                          expert_weight_stride, dst_row_stride, src1_row_stride, item);
                  });
          });
-@@ -2869,11 +2886,7 @@ static bool ggml_sycl_moe_q2w_enabled() {
+@@ -3143,11 +3160,7 @@ static bool ggml_sycl_moe_q2w_enabled() {
  
  
  // ---- fused gate + up + SwiGLU, q2_0 MoE, one token (see apply_moeglu.py) ----
@@ -324,7 +324,7 @@ index 2d4b51d..fd399cc 100644
      const block_q8_1 * y1 = y0 + 1;
      const int * u0 = (const int *) y0->qs;
      const int * u1 = (const int *) y1->qs;
-@@ -2884,10 +2897,10 @@ static __dpct_inline__ float q2_0_block_dot(const block_q2_0 * bx, const block_q
+@@ -3158,10 +3171,10 @@ static __dpct_inline__ float q2_0_block_dot(const block_q2_0 * bx, const block_q
      for (int k = 0; k < 8; k++) s1 = dpct::dp4a(q2_0_expand_byte((w[2 + k / 4] >> (8 * (k % 4))) & 0xFFu), u1[k], s1);
      const sycl::float2 ds0 = y0->ds.convert<float, sycl::rounding_mode::automatic>();
      const sycl::float2 ds1 = y1->ds.convert<float, sycl::rounding_mode::automatic>();
@@ -337,7 +337,7 @@ index 2d4b51d..fd399cc 100644
  static void mul_mat_vec_q2_0_moe_glu_wide(
      const void * __restrict__ vx_gate, const void * __restrict__ vx_up, const void * __restrict__ vy,
      float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev, const int ncols, const int nrows,
-@@ -2904,11 +2917,15 @@ static void mul_mat_vec_q2_0_moe_glu_wide(
+@@ -3178,11 +3191,15 @@ static void mul_mat_vec_q2_0_moe_glu_wide(
      const int blocks_per_row = ncols / QK2_0;
      float g = 0.0f, u = 0.0f;
      if (row < nrows) {
@@ -357,7 +357,7 @@ index 2d4b51d..fd399cc 100644
          }
      }
  #pragma unroll
-@@ -2925,7 +2942,8 @@ bool ggml_sycl_moe_q2w_on() { return ggml_sycl_moe_q2w_enabled(); }
+@@ -3199,7 +3216,8 @@ bool ggml_sycl_moe_q2w_on() { return ggml_sycl_moe_q2w_enabled(); }
  
  void ggml_sycl_mul_mat_vec_q2_0_moe_glu(const void * vx_gate, const void * vx_up, const void * vy, const int32_t * ids_dev,
                                          float * dst_base, int ncols, int nrows, int n_experts_used,
@@ -367,7 +367,7 @@ index 2d4b51d..fd399cc 100644
      const int blocks_per_row = ncols / QK2_0;
      constexpr int SG_PER_WG = 4;
      auto go = [&](auto lpr_tag) {
-@@ -2937,7 +2955,9 @@ void ggml_sycl_mul_mat_vec_q2_0_moe_glu(const void * vx_gate, const void * vx_up
+@@ -3211,7 +3229,9 @@ void ggml_sycl_mul_mat_vec_q2_0_moe_glu(const void * vx_gate, const void * vx_up
          stream->submit([&](sycl::handler & cgh) {
              cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                  [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
@@ -378,7 +378,7 @@ index 2d4b51d..fd399cc 100644
                          stride_gate, stride_up, dst_row_stride, item);
                  });
          });
-@@ -2985,6 +3005,11 @@ bool ggml_sycl_mul_mat_vec_q_id(
+@@ -3259,6 +3279,11 @@ bool ggml_sycl_mul_mat_vec_q_id(
                  vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                  expert_weight_stride, dst_row_stride, src1_row_stride, stream);
              return true;
@@ -391,10 +391,10 @@ index 2d4b51d..fd399cc 100644
              if (ggml_sycl_moe_q2w_enabled() && ncols % QK2_0 == 0) {
                  launch_mul_mat_vec_q2_0_moe_wide(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
 diff --git a/ggml/src/ggml-sycl/mmvq.hpp b/ggml/src/ggml-sycl/mmvq.hpp
-index 4ca728f..80c5717 100644
+index 24f5a91..146a6c1 100644
 --- a/ggml/src/ggml-sycl/mmvq.hpp
 +++ b/ggml/src/ggml-sycl/mmvq.hpp
-@@ -79,4 +79,5 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(
+@@ -105,4 +105,5 @@ bool ggml_sycl_mul_mat_vec_q_glu_plain(
  bool ggml_sycl_moe_q2w_on();
  void ggml_sycl_mul_mat_vec_q2_0_moe_glu(const void * vx_gate, const void * vx_up, const void * vy, const int32_t * ids_dev,
                                          float * dst_base, int ncols, int nrows, int n_experts_used,
@@ -402,10 +402,10 @@ index 4ca728f..80c5717 100644
 +                                        size_t stride_gate, size_t stride_up, size_t dst_row_stride, dpct::queue_ptr stream,
 +                                        bool soa = false);
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 5ef03e1..8028c37 100644
+index 01dc8d0..fe5add6 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -690,6 +690,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+@@ -701,6 +701,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
          .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
          .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
      },

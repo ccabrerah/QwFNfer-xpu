@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-sycl/fusion.cpp b/ggml/src/ggml-sycl/fusion.cpp
-index ec24ebc..8c03fed 100644
+index 7f9b0bf..ec541ab 100644
 --- a/ggml/src/ggml-sycl/fusion.cpp
 +++ b/ggml/src/ggml-sycl/fusion.cpp
-@@ -68,7 +68,7 @@ static bool hc_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+@@ -80,7 +80,7 @@ static bool hc_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
  
  // Each check is stated in terms of what hc_norm_f32 (norm.cpp) assumes. Returns null if
  // fusable, else a reason (printed with GGML_SYCL_FUSE_HC=2).
@@ -11,7 +11,7 @@ index ec24ebc..8c03fed 100644
      *two_pass = false;
      if (i + 4 > cgraph->n_nodes) return "graph end";
      const ggml_op ops[4]  = { GGML_OP_OUT_PROD, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
-@@ -81,6 +81,7 @@ static const char * hc_norm_decline(const ggml_cgraph * cgraph, int i, bool * tw
+@@ -93,6 +93,7 @@ static const char * hc_norm_decline(const ggml_cgraph * cgraph, int i, bool * tw
      const ggml_tensor * mul = cgraph->nodes[i + 3];
      const ggml_tensor * y   = op->src[0];
      const ggml_tensor * w   = op->src[1];
@@ -19,7 +19,7 @@ index ec24ebc..8c03fed 100644
  
      // the subgraph test checks uses, not wiring: the chain must actually be connected
      const ggml_tensor * R = add->src[0] == op ? add->src[1] : add->src[1] == op ? add->src[0] : nullptr;
-@@ -113,7 +114,7 @@ static const char * hc_norm_decline(const ggml_cgraph * cgraph, int i, bool * tw
+@@ -125,7 +126,7 @@ static const char * hc_norm_decline(const ggml_cgraph * cgraph, int i, bool * tw
      // in place): each element is read before it is written, by the same work-item.
      const bool r2_inplace = add->data == R->data && add->nb[1] == R->nb[1] && add->nb[2] == R->nb[2];
      if (hc_ranges_overlap(add, R) && !r2_inplace) return "R2 partially overlaps R";
@@ -28,7 +28,7 @@ index ec24ebc..8c03fed 100644
          if (hc_ranges_overlap(add, t)) return "R2 overlaps an input";
      }
      // Xn exactly over R is the likely placement when R dies at the ADD (the norm output,
-@@ -126,19 +127,19 @@ static const char * hc_norm_decline(const ggml_cgraph * cgraph, int i, bool * tw
+@@ -138,19 +139,19 @@ static const char * hc_norm_decline(const ggml_cgraph * cgraph, int i, bool * tw
      // Xn over R (other than exactly), y or w is unsafe in one pass but safe in two: R, y
      // and w are dead once pass 1 has written R2, and the queue is in order.
      const bool xn_over_r = mul->data == R->data && mul->nb[1] == R->nb[1] && mul->nb[2] == R->nb[2];
@@ -51,7 +51,7 @@ index ec24ebc..8c03fed 100644
      if (mode == 3 && !why) {
          two_pass = true;   // test hook: test-backend-ops never aliases, so force pass 2
      }
-@@ -169,6 +170,41 @@ int ggml_sycl_can_fuse_hc_norm(const ggml_cgraph * cgraph, int node_idx) {
+@@ -181,6 +182,41 @@ int ggml_sycl_can_fuse_hc_norm(const ggml_cgraph * cgraph, int node_idx) {
      return why ? 0 : two_pass ? 2 : 1;
  }
  
@@ -111,10 +111,10 @@ index 32d15d9..386178a 100644
  
  #endif  // GGML_SYCL_FUSION_HPP
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index b8f5552..d1eb003 100644
+index e07a5de..089df52 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -6146,6 +6146,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -6596,6 +6596,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              }
          }
  #endif
@@ -133,10 +133,10 @@ index b8f5552..d1eb003 100644
              const int hc_plan = ggml_sycl_can_fuse_hc_norm(cgraph, i);
              if (hc_plan != 0) {
 diff --git a/ggml/src/ggml-sycl/norm.cpp b/ggml/src/ggml-sycl/norm.cpp
-index 8b38429..a5c8f61 100644
+index dcc0b52..a9b06fa 100644
 --- a/ggml/src/ggml-sycl/norm.cpp
 +++ b/ggml/src/ggml-sycl/norm.cpp
-@@ -697,13 +697,17 @@ static void hc_norm_f32(const float * R, const float * y, const float * w, const
+@@ -788,13 +788,17 @@ static void hc_norm_f32(const float * R, const float * y, const float * w, const
                          const int64_t r2_s1, const int64_t r2_s2, const int64_t x_s1, const int64_t x_s2,
                          const int64_t g_s1, const int g_nrows, const float eps,
                          const sycl::nd_item<3> & item_ct1, float * s_sum, int block_size,
@@ -156,7 +156,7 @@ index 8b38429..a5c8f61 100644
      const float * Rr  = R  + c * r_s1  + t * r_s2;
      const float * yr  = y  + t * y_s2;
      float *       R2r = R2 + c * r2_s1 + t * r2_s2;
-@@ -766,9 +770,16 @@ static void hc_norm_apply_f32(const float * R2, const float * scale, const float
+@@ -857,9 +861,16 @@ static void hc_norm_apply_f32(const float * R2, const float * scale, const float
  }
  
  void ggml_sycl_op_hc_combine_norm(ggml_backend_sycl_context & ctx, ggml_tensor * out_prod, ggml_tensor * add,
@@ -174,7 +174,7 @@ index 8b38429..a5c8f61 100644
      const ggml_tensor * R = add->src[0] == out_prod ? add->src[1] : add->src[0];
      const ggml_tensor * g = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
      float eps = 0.0f;
-@@ -781,7 +792,8 @@ void ggml_sycl_op_hc_combine_norm(ggml_backend_sycl_context & ctx, ggml_tensor *
+@@ -872,7 +883,8 @@ void ggml_sycl_op_hc_combine_norm(ggml_backend_sycl_context & ctx, ggml_tensor *
      const size_t  f = sizeof(float);
      const float * R_dd = (const float *) R->data;
      const float * y_dd = (const float *) y->data;
@@ -184,7 +184,7 @@ index 8b38429..a5c8f61 100644
      const float * g_dd = (const float *) g->data;
      float *       R2_dd = (float *) add->data;
      float *       X_dd  = (float *) mul->data;
-@@ -803,7 +815,8 @@ void ggml_sycl_op_hc_combine_norm(ggml_backend_sycl_context & ctx, ggml_tensor *
+@@ -894,7 +906,8 @@ void ggml_sycl_op_hc_combine_norm(ggml_backend_sycl_context & ctx, ggml_tensor *
              cgh.parallel_for(sycl::nd_range<3>(global_dims * block_dims, block_dims),
                  [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                      hc_norm_f32(R_dd, y_dd, w_dd, g_dd, R2_dd, X_dd, ncols, r_s1, r_s2, y_s2, w_s0, w_s2,
@@ -194,7 +194,7 @@ index 8b38429..a5c8f61 100644
                  });
          });
      } else {
-@@ -816,7 +829,7 @@ void ggml_sycl_op_hc_combine_norm(ggml_backend_sycl_context & ctx, ggml_tensor *
+@@ -907,7 +920,7 @@ void ggml_sycl_op_hc_combine_norm(ggml_backend_sycl_context & ctx, ggml_tensor *
                  [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                      hc_norm_f32(R_dd, y_dd, w_dd, g_dd, R2_dd, X_dd, ncols, r_s1, r_s2, y_s2, w_s0, w_s2,
                                  r2_s1, r2_s2, x_s1, x_s2, g_s1, g_nrows, eps, item_ct1,
@@ -204,10 +204,10 @@ index 8b38429..a5c8f61 100644
          });
      }
 diff --git a/ggml/src/ggml-sycl/norm.hpp b/ggml/src/ggml-sycl/norm.hpp
-index 878af94..8453f9c 100644
+index bd7f1e6..e6b68ee 100644
 --- a/ggml/src/ggml-sycl/norm.hpp
 +++ b/ggml/src/ggml-sycl/norm.hpp
-@@ -24,7 +24,8 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context& ctx, ggml_tensor* ds
+@@ -26,7 +26,8 @@ void ggml_sycl_op_rms_norm_scale_fused(ggml_backend_sycl_context& ctx, ggml_tens
  // OUT_PROD -> ADD -> RMS_NORM -> MUL (hyper-connection combine + norm); preconditions from
  // ggml_sycl_can_fuse_hc_norm(). Writes the ADD and MUL results; the other two are elided.
  void ggml_sycl_op_hc_combine_norm(ggml_backend_sycl_context& ctx, ggml_tensor* out_prod, ggml_tensor* add,

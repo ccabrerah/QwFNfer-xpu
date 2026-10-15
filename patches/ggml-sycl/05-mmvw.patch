@@ -1,6 +1,8 @@
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index cb0da89..bd11b40 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -64,6 +64,7 @@
+@@ -66,6 +66,7 @@
  #include "ggml-sycl/getrows.hpp"
  #include "ggml-sycl/mem.hpp"
  #include "ggml-sycl/norm.hpp"
@@ -8,7 +10,7 @@
  #include "ggml-sycl/presets.hpp"
  #include "ggml-sycl/quantize.hpp"
  #include "ggml-sycl/repeat_back.hpp"
-@@ -4736,6 +4737,17 @@
+@@ -5099,6 +5100,17 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
      }
  
      const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);

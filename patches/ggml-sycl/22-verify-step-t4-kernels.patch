@@ -6,9 +6,10 @@ with a token dimension; smallk with a batch dimension. A T-token call gives the 
 (the MTP verify step runs T = 2..4 positions through them).
 
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index fb6f356..1dc7df1 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -5275,23 +5275,34 @@
+@@ -5678,23 +5678,34 @@ static bool ggml_sycl_mmid_glu_q2w_fused(ggml_backend_sycl_context & ctx, ggml_c
      const ggml_tensor_extra_gpu * eu = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
      if ((eg && eg->optimized_feature.reorder) || (eu && eu->optimized_feature.reorder)) return false;
      if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) return false;
@@ -50,9 +51,10 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  }
  
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index 071bd03..59d076b 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -3137,15 +3137,17 @@
+@@ -3381,15 +3381,17 @@ template <int LPR, bool SOA>
  static void mul_mat_vec_q2_0_moe_glu_wide(
      const void * __restrict__ vx_gate, const void * __restrict__ vx_up, const void * __restrict__ vy,
      float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev, const int ncols, const int nrows,
@@ -75,7 +77,7 @@ diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
  
      const int blocks_per_row = ncols / QK2_0;
      float g = 0.0f, u = 0.0f;
-@@ -3176,22 +3178,22 @@
+@@ -3420,22 +3422,22 @@ bool ggml_sycl_moe_q2w_on() { return ggml_sycl_moe_q2w_enabled(); }
  void ggml_sycl_mul_mat_vec_q2_0_moe_glu(const void * vx_gate, const void * vx_up, const void * vy, const int32_t * ids_dev,
                                          float * dst_base, int ncols, int nrows, int n_experts_used,
                                          size_t stride_gate, size_t stride_up, size_t dst_row_stride, dpct::queue_ptr stream,
@@ -103,15 +105,17 @@ diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
          });
      };
 diff --git a/ggml/src/ggml-sycl/mmvq.hpp b/ggml/src/ggml-sycl/mmvq.hpp
+index 04a2fbe..adb830d 100644
 --- a/ggml/src/ggml-sycl/mmvq.hpp
 +++ b/ggml/src/ggml-sycl/mmvq.hpp
-@@ -89,4 +89,4 @@
+@@ -115,4 +115,4 @@ bool ggml_sycl_moe_q2w_on();
  void ggml_sycl_mul_mat_vec_q2_0_moe_glu(const void * vx_gate, const void * vx_up, const void * vy, const int32_t * ids_dev,
                                          float * dst_base, int ncols, int nrows, int n_experts_used,
                                          size_t stride_gate, size_t stride_up, size_t dst_row_stride, dpct::queue_ptr stream,
 -                                        bool soa = false);
 +                                        bool soa = false, int n_tokens = 1, int y_tok_blocks = 0, int ids_tok_stride = 0, size_t dst_tok_stride = 0);
 diff --git a/ggml/src/ggml-sycl/mmvw.cpp b/ggml/src/ggml-sycl/mmvw.cpp
+index 74f3dd2..3af27ec 100644
 --- a/ggml/src/ggml-sycl/mmvw.cpp
 +++ b/ggml/src/ggml-sycl/mmvw.cpp
 @@ -14,14 +14,16 @@
@@ -132,7 +136,7 @@ diff --git a/ggml/src/ggml-sycl/mmvw.cpp b/ggml/src/ggml-sycl/mmvw.cpp
                   const sycl::nd_item<1> & it, float * slm) {
      constexpr int RPW = MMVW_WG / TPR;            // rows per work-group
      constexpr int SG_PER_ROW = TPR / WARP_SIZE;
-@@ -30,42 +32,55 @@
+@@ -30,42 +32,55 @@ void mmvw_kernel(const T * __restrict__ W, const float * __restrict__ x, float *
      const int t = lid % TPR;
      const int64_t row = (int64_t) it.get_group(0) * RPW + r_local;
  
@@ -204,7 +208,7 @@ diff --git a/ggml/src/ggml-sycl/mmvw.cpp b/ggml/src/ggml-sycl/mmvw.cpp
      constexpr int RPW = MMVW_WG / TPR;
      const int64_t n_wg = (nrows + RPW - 1) / RPW;
      stream->submit([&](sycl::handler & cgh) {
-@@ -73,22 +88,33 @@
+@@ -73,22 +88,33 @@ void mmvw_launch(const void * W, const float * x, float * y, int64_t ncols, int6
          const T * Wt = (const T *) W;
          cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(n_wg * MMVW_WG), sycl::range<1>(MMVW_WG)),
                           [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
@@ -245,7 +249,7 @@ diff --git a/ggml/src/ggml-sycl/mmvw.cpp b/ggml/src/ggml-sycl/mmvw.cpp
      }
  }
  
-@@ -102,8 +128,8 @@
+@@ -102,8 +128,8 @@ bool ggml_sycl_mmvw_enabled() {
  bool ggml_sycl_mmvw_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
      if (src0->type != GGML_TYPE_BF16 && src0->type != GGML_TYPE_F16) return false;
      if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
@@ -256,7 +260,7 @@ diff --git a/ggml/src/ggml-sycl/mmvw.cpp b/ggml/src/ggml-sycl/mmvw.cpp
      if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
      const int64_t ncols = src0->ne[0];
      if (ncols % 8 != 0 || src1->ne[0] != ncols) return false;
-@@ -119,15 +145,18 @@
+@@ -119,15 +145,18 @@ void ggml_sycl_mmvw(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, c
                      bool silu, ggml_tensor * out) {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
      dpct::queue_ptr stream = ctx.stream();
@@ -281,7 +285,7 @@ diff --git a/ggml/src/ggml-sycl/mmvw.cpp b/ggml/src/ggml-sycl/mmvw.cpp
      }
  }
  
-@@ -165,11 +194,14 @@
+@@ -165,11 +194,14 @@ bool ggml_sycl_smallk_supported(const ggml_tensor * src0, const ggml_tensor * sr
      if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
      const int64_t K = src0->ne[0];
      if (K < 1 || K > 32 || src1->ne[0] != K) return false;
@@ -298,7 +302,7 @@ diff --git a/ggml/src/ggml-sycl/mmvw.cpp b/ggml/src/ggml-sycl/mmvw.cpp
  }
  
  void ggml_sycl_smallk(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-@@ -178,18 +210,20 @@
+@@ -178,18 +210,20 @@ void ggml_sycl_smallk(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
      const int     K   = (int) src0->ne[0];
      const int64_t M   = src0->ne[1], N = src1->ne[1];
      const int64_t s0  = src0->nb[1] / sizeof(float), s1 = src1->nb[1] / sizeof(float);

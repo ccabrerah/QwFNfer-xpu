@@ -1,7 +1,8 @@
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index d3e863c..e7a9eba 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -260,6 +260,55 @@
+@@ -262,6 +262,55 @@ static int ggml_sycl_match_hc_mix_mean(const ggml_cgraph * cgraph, int i) {
      }
      return j;
  }
@@ -57,7 +58,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  #include "ggml-sycl/presets.hpp"
  #include "ggml-sycl/quantize.hpp"
  #include "ggml-sycl/repeat_back.hpp"
-@@ -6478,6 +6527,15 @@
+@@ -6936,6 +6985,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                  continue;
              }
          }

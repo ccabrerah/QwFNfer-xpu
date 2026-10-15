@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index d1eb003..00006b3 100644
+index 089df52..b45d1db 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -66,6 +66,7 @@
+@@ -68,6 +68,7 @@
  #include "ggml-sycl/norm.hpp"
  #include "ggml-sycl/mmvw.hpp"
  #include "ggml-sycl/sdattn.hpp"
@@ -10,7 +10,7 @@ index d1eb003..00006b3 100644
  #include "ggml-sycl/presets.hpp"
  #include "ggml-sycl/quantize.hpp"
  #include "ggml-sycl/repeat_back.hpp"
-@@ -6133,6 +6134,30 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+@@ -6583,6 +6584,30 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
              i += nodes_to_skip;
              continue;
          }
@@ -42,7 +42,7 @@ index d1eb003..00006b3 100644
          if (node->op == GGML_OP_GET_ROWS && ggml_sycl_sparse_decode_attn_fused(*sycl_ctx, cgraph, i)) {
              i += 8;
 diff --git a/ggml/src/ggml-sycl/topk-moe.cpp b/ggml/src/ggml-sycl/topk-moe.cpp
-index 7b0c946..1f3946f 100644
+index a0e9b95..d6173f0 100644
 --- a/ggml/src/ggml-sycl/topk-moe.cpp
 +++ b/ggml/src/ggml-sycl/topk-moe.cpp
 @@ -6,6 +6,7 @@

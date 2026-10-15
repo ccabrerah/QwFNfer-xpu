@@ -7,9 +7,11 @@ on the same inputs then differs in the last bits between runs (measured on this 
 bf16 [10240 x 320] x f32 [10240 x 1024] at the start of every layer, different bits on a rerun in one process), and
 greedy text diverges at near-ties. With the attribute every run of a graph gives the same bits.
 
+diff --git a/ggml/src/ggml-sycl/gemm.hpp b/ggml/src/ggml-sycl/gemm.hpp
+index 81bc5c2..5936726 100644
 --- a/ggml/src/ggml-sycl/gemm.hpp
 +++ b/ggml/src/ggml-sycl/gemm.hpp
-@@ -56,6 +56,11 @@
+@@ -56,6 +56,11 @@ public:
          const auto c_md    = dnnl::memory::desc(c_dims, ct, c_strides);
          dnnl::primitive_attr primitive_attr;
          primitive_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);

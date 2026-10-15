@@ -2,14 +2,14 @@
 
 QwFNfer-xpu runs Qwen3.8-Flash-Next on an Intel Arc Pro B70 (32 GB) through llama.cpp's SYCL backend. The
 engine uses only the ggml backend API; the GPU work specific to this card lives in a ggml-sycl patch series
-on top of llama.cpp `bbdd9f2`.
+on top of llama.cpp `a0e6dc7` (master of 2026-10-14; up to v0.4.0 `bbdd9f2`).
 
 Reference machine: Arc Pro B70 on PCIe 3.0 x16, Ryzen 7 5700 (8C/16T), 32 GB RAM, NVMe Gen3 x4, oneAPI
 2026.0, Linux 7.1 (xe driver). Model: `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` Q2_0.
 
 ## Build
 
-1. llama.cpp with the patch series (fetches `bbdd9f2`, applies `patches/ggml-sycl/*.patch` in order,
+1. llama.cpp with the patch series (fetches `a0e6dc7`, applies `patches/ggml-sycl/*.patch` in order,
    builds with icx/icpx and oneDNN):
 
    ```sh

@@ -10,9 +10,11 @@ winners above the pivot in index order, then the lowest-index pivot-equal column
 which reserves ranges with global atomics, is bypassed (it only runs for rows of 64K+ columns). Together with patch
 26, two cold runs of the same prompt give bit-identical hidden states at every layer and identical greedy text.
 
+diff --git a/ggml/src/ggml-sycl/topk-radix.cpp b/ggml/src/ggml-sycl/topk-radix.cpp
+index 8cd0bd2..a2b37f7 100644
 --- a/ggml/src/ggml-sycl/topk-radix.cpp
 +++ b/ggml/src/ggml-sycl/topk-radix.cpp
-@@ -50,6 +50,7 @@
+@@ -50,6 +50,7 @@ static void top_k_radix_select_f32(
      int32_t *       dst_idx,
      const int       ncols,
      const int       k,
@@ -20,7 +22,7 @@ which reserves ranges with global atomics, is bypassed (it only runs for rows of
      uint32_t *      slm,
      const sycl::nd_item<1> & item_ct1
  ) {
-@@ -133,6 +134,29 @@
+@@ -133,6 +134,29 @@ static void top_k_radix_select_f32(
      // columns fill the tail. Both counters live in SLM since the whole row is this group.
      const uint32_t base_eq = (uint32_t) k - need;
  
@@ -50,7 +52,7 @@ which reserves ranges with global atomics, is bypassed (it only runs for rows of
      for (int col = tid; col < ncols; col += block_size) {
          const uint32_t kp = top_k_radix_key(src[col]) & mask;
          if (kp > prefix) {
-@@ -147,6 +171,11 @@
+@@ -147,6 +171,11 @@ static void top_k_radix_select_f32(
      }
  }
  
@@ -62,7 +64,7 @@ which reserves ranges with global atomics, is bypassed (it only runs for rows of
  static void top_k_radix_f32_sycl(
      ggml_backend_sycl_context & ctx,
      const float * src,
-@@ -166,6 +195,7 @@
+@@ -166,6 +195,7 @@ static void top_k_radix_f32_sycl(
  
      const sycl::range<1> block_dims(block_size);
      const sycl::range<1> grid_dims(nrows);
@@ -70,7 +72,7 @@ which reserves ranges with global atomics, is bypassed (it only runs for rows of
  
      main_stream->submit([&](sycl::handler &cgh) {
          sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(SYCL_TOP_K_RADIX_SLM_WORDS), cgh);
-@@ -177,7 +207,7 @@
+@@ -177,7 +207,7 @@ static void top_k_radix_f32_sycl(
  
                  top_k_radix_select_f32(
                      src + (int64_t) row * ncols, dst_indices + (int64_t) row * k,
@@ -79,7 +81,7 @@ which reserves ranges with global atomics, is bypassed (it only runs for rows of
                      slm.get_multi_ptr<sycl::access::decorated::no>().get(),
                      item_ct1);
              });
-@@ -522,7 +552,9 @@
+@@ -522,7 +552,9 @@ void ggml_sycl_top_k_radix(
      const int       k,
      dpct::queue_ptr main_stream
  ) {

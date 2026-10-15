@@ -1,7 +1,8 @@
 diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index 4755093..19ab611 100644
 --- a/ggml/src/ggml-sycl/common.hpp
 +++ b/ggml/src/ggml-sycl/common.hpp
-@@ -338,6 +338,16 @@
+@@ -400,6 +400,16 @@ struct ggml_backend_sycl_context {
      std::string name;
      optimize_feature opt_feature;
  
@@ -19,9 +20,10 @@ diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
  
      explicit ggml_backend_sycl_context(int device) :
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 74f16ee..218479d 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -3593,6 +3593,11 @@
+@@ -3802,6 +3802,11 @@ static void ggml_sycl_set_peer_access(const int n_tokens, [[maybe_unused]] int m
      peer_access_enabled = enable_peer_access;
  }
  
@@ -33,7 +35,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  template <template <int> typename quantize_f>
  static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
                                   const ggml_tensor *src1, ggml_tensor *dst,
-@@ -3719,7 +3724,29 @@
+@@ -3927,7 +3932,29 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
          }
  
          if constexpr(quantize_enabled) {
@@ -64,7 +66,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
              if (src1_on_device && src1_is_contiguous) {
                  scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
-@@ -3732,6 +3759,7 @@
+@@ -3940,6 +3967,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                      std::exit(1);
                  }
              }
@@ -72,7 +74,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
          }
  
          if (dst_on_device) {
-@@ -6367,6 +6395,8 @@
+@@ -6817,6 +6845,8 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
  static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
      ggml_sycl_set_main_device(sycl_ctx->device);
      g_moesum_n = 0;   // apply_fuse3.py: no CONT skip survives a graph
@@ -81,7 +83,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
-@@ -6376,6 +6406,25 @@
+@@ -6826,6 +6856,25 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
          if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
              continue;
          }

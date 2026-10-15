@@ -7,9 +7,11 @@ one column runs on patch 18's wide kernel (a whole block per lane in two 16-byte
 columns: each lane loads a weight block once and dots it with every column's q8_1 block. Per column, the accumulation
 and the sub-group reduction are the one-column kernel's, so column c's result equals that kernel's for column c alone.
 
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index 59d076b..8ad766a 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -1257,6 +1257,72 @@
+@@ -1306,6 +1306,72 @@ static void reorder_mul_mat_vec_q8_0_q8_1_wide_sycl(const void * vx, const void
          });
  }
  
@@ -82,7 +84,7 @@ and the sub-group reduction are the one-column kernel's, so column c's result eq
  // GGML_SYCL_Q8_EPILOGUE (patch 21): the same kernel with dst[row] = silu(scale * acc), computed exactly as the separate
  // SCALE (scale * x + 0.0f) and UNARY(SILU) (op_silu) kernels would.
  static void reorder_mul_mat_vec_q8_0_q8_1_wide_silu_sycl(const void * vx, const void * vy, float * dst, const int ncols,
-@@ -2508,7 +2574,16 @@
+@@ -2753,7 +2819,16 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
              case GGML_TYPE_Q8_0:
                  if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                      ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {

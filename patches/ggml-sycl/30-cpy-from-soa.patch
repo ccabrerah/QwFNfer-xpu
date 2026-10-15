@@ -6,9 +6,11 @@ expert tier holds for one expert's part, patches 09 / 17) becomes the canonical 
 VRAM-resident expert into its staging on the device instead of reading it from disk and uploading it. Exact (a byte
 permutation). Patch 29 (a wide Q8_0 MoE matvec) was tried and is not in the series.
 
+diff --git a/ggml/src/ggml-sycl/cpy.cpp b/ggml/src/ggml-sycl/cpy.cpp
+index ef7413a..3176a21 100644
 --- a/ggml/src/ggml-sycl/cpy.cpp
 +++ b/ggml/src/ggml-sycl/cpy.cpp
-@@ -1282,6 +1282,21 @@
+@@ -1282,6 +1282,21 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
                                                    nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11,
                                                    nb12, nb13, main_stream);
  #endif

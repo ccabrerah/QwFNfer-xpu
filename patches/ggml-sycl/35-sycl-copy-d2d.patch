@@ -6,9 +6,10 @@ For the engine's expert promotions (QWFN_PROMOTE_D2D): the victim's bytes are co
 queue (patch 33), beside the next layer's kernels. Reachable as the reg proc "ggml_backend_sycl_copy_d2d_async".
 
 diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
+index ff24fd5..7188499 100644
 --- a/ggml/include/ggml-sycl.h
 +++ b/ggml/include/ggml-sycl.h
-@@ -24,6 +24,9 @@
+@@ -24,6 +24,9 @@ GGML_BACKEND_API bool ggml_backend_is_sycl(ggml_backend_t backend);
  // buffers are shared). Its transfers and synchronize() neither wait for nor block `backend`'s queue; ordering against
  // it is the caller's job. Also reachable as the reg proc "ggml_backend_sycl_init_side_queue".
  GGML_BACKEND_API ggml_backend_t ggml_backend_sycl_init_side_queue(ggml_backend_t backend);
@@ -19,9 +20,10 @@ diff --git a/ggml/include/ggml-sycl.h b/ggml/include/ggml-sycl.h
  // devide buffer
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device);
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 1646446..63b979f 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -7822,6 +7822,9 @@
+@@ -8338,6 +8338,9 @@ static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, cons
      if (strcmp(name, "ggml_backend_sycl_init_side_queue") == 0) {   // patch 33
          return (void *)ggml_backend_sycl_init_side_queue;
      }
@@ -31,7 +33,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  
      // Tensor parallelism (--split-mode tensor) entry points.
      if (strcmp(name, "ggml_backend_comm_init") == 0) {
-@@ -7933,4 +7936,14 @@
+@@ -8449,4 +8452,14 @@ ggml_backend_t ggml_backend_sycl_init_side_queue(ggml_backend_t backend) {
      return side;
  }
  

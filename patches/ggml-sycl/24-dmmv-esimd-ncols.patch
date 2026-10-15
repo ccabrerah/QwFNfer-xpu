@@ -7,40 +7,12 @@ Here the row pair's blocks are dequantized once into 256 floats each -- the same
 one-column kernel's mac_pair -- and MACed against every column's f32 activation, so each column is accumulated as the
 one-column kernel accumulates it. Routed only on the reordered ESIMD path, single-device buffers, contiguous src1/dst.
 
---- a/ggml/src/ggml-sycl/ggml-sycl.cpp	2026-10-03 01:15:08.234194796 -0300
-+++ b/ggml/src/ggml-sycl/ggml-sycl.cpp	2026-10-03 01:15:08.255326702 -0300
-@@ -5054,8 +5054,15 @@
-     // need ne[0] % DMMV_X == 0.
-     const int64_t dmmv_x_required = (src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) ?
-                                     2*GGML_SYCL_DMMV_X : GGML_SYCL_DMMV_X;
-+    // patch 25 (GGML_SYCL_DMMV_NCOLS=1): 2..4 columns of a reordered Q5_K / Q6_K weight go through the ESIMD
-+    // multi-column kernel; the caller keeps that to the reordered ESIMD path.
-+    static const bool ncols_on = [] { const char * e = getenv("GGML_SYCL_DMMV_NCOLS"); return e && atoi(e) != 0; }();
-+    const bool ncols_ok = ncols_on && (src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) &&
-+                          src1->ne[1] >= 2 && src1->ne[1] <= 4 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
-+                          ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
-+                          !ggml_backend_buffer_is_sycl_split(src0->buffer);   // a split dst is written at stride row_diff, not ne0
-     return ggml_sycl_supports_dmmv(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
--           src0->ne[0] % dmmv_x_required == 0 && src1->ne[1] == 1;
-+           src0->ne[0] % dmmv_x_required == 0 && (src1->ne[1] == 1 || ncols_ok);
- }
- 
- static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-@@ -5209,7 +5216,10 @@
-                 src0->type == GGML_TYPE_Q4_0)) {
-             use = use || !use_mul_mat_vec_q;
-         }
-+        if (src1->ne[1] > 1) use = g_ggml_sycl_enable_esimd && ggml_sycl_supports_reorder_esimd(src0->type);   // patch 25
-         use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && use;
-+    } else if (src1->ne[1] > 1) {
-+        use_dequantize_mul_mat_vec = false;   // patch 25: the multi-column DMMV exists only on the reordered ESIMD path
+diff --git a/ggml/src/ggml-sycl/dmmv.cpp b/ggml/src/ggml-sycl/dmmv.cpp
+index 90f9268..78080a3 100644
+--- a/ggml/src/ggml-sycl/dmmv.cpp
++++ b/ggml/src/ggml-sycl/dmmv.cpp
+@@ -2138,6 +2138,188 @@ static void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd(const void *vx, const
      }
- 
-     if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
---- a/ggml/src/ggml-sycl/dmmv.cpp	2026-10-03 01:15:08.232410170 -0300
-+++ b/ggml/src/ggml-sycl/dmmv.cpp	2026-10-03 01:15:08.253791346 -0300
-@@ -2006,6 +2006,188 @@
-     });
  }
  
 +
@@ -228,7 +200,7 @@ one-column kernel accumulates it. Routed only on the reordered ESIMD path, singl
  #endif // GGML_SYCL_DMMV_HAS_ESIMD
  
  static void dequantize_mul_mat_vec_q4_K_sycl_reorder(const void *vx, const float *y,
-@@ -2177,7 +2359,10 @@
+@@ -2325,7 +2507,10 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
              if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                  ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
  #ifdef GGML_SYCL_DMMV_HAS_ESIMD
@@ -240,7 +212,7 @@ one-column kernel accumulates it. Routed only on the reordered ESIMD path, singl
                      dequantize_mul_mat_vec_q5_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
                  }
                  else
-@@ -2193,7 +2378,10 @@
+@@ -2341,7 +2526,10 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
              if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                  ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
  #ifdef GGML_SYCL_DMMV_HAS_ESIMD
@@ -252,3 +224,35 @@ one-column kernel accumulates it. Routed only on the reordered ESIMD path, singl
                      dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
                  }
                  else
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 1dc7df1..b8b69a9 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -5417,8 +5417,15 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
+     // need ne[0] % DMMV_X == 0.
+     const int64_t dmmv_x_required = (src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) ?
+                                     2*GGML_SYCL_DMMV_X : GGML_SYCL_DMMV_X;
++    // patch 25 (GGML_SYCL_DMMV_NCOLS=1): 2..4 columns of a reordered Q5_K / Q6_K weight go through the ESIMD
++    // multi-column kernel; the caller keeps that to the reordered ESIMD path.
++    static const bool ncols_on = [] { const char * e = getenv("GGML_SYCL_DMMV_NCOLS"); return e && atoi(e) != 0; }();
++    const bool ncols_ok = ncols_on && (src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) &&
++                          src1->ne[1] >= 2 && src1->ne[1] <= 4 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
++                          ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
++                          !ggml_backend_buffer_is_sycl_split(src0->buffer);   // a split dst is written at stride row_diff, not ne0
+     return ggml_sycl_supports_dmmv(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+-           src0->ne[0] % dmmv_x_required == 0 && src1->ne[1] == 1;
++           src0->ne[0] % dmmv_x_required == 0 && (src1->ne[1] == 1 || ncols_ok);
+ }
+ 
+ static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -5576,7 +5583,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
+                 src0->type == GGML_TYPE_Q4_0)) {
+             use = use || !use_mul_mat_vec_q;
+         }
++        if (src1->ne[1] > 1) use = g_ggml_sycl_enable_esimd && ggml_sycl_supports_reorder_esimd(src0->type);   // patch 25
+         use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && use;
++    } else if (src1->ne[1] > 1) {
++        use_dequantize_mul_mat_vec = false;   // patch 25: the multi-column DMMV exists only on the reordered ESIMD path
+     }
+ 
+     if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {

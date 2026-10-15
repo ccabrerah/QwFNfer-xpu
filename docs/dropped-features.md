@@ -157,6 +157,15 @@ launcher (`scripts/b70/qwfn-b70.sh`) turns on the adopted ones.
   no other value was ever better.
 - **Why dropped:** a tuning knob nobody set.
 
+### Patch 23, `GGML_CPU_Q2_0_AVX2` -- AVX2 `ggml_vec_dot_q2_0_q8_0` (superseded by upstream)
+
+- **What it did:** x86 had only the scalar loop for Q2_0 x Q8_0 (the CPU-computed experts). 2-bit codes unpacked to
+  bytes, offset to {-1,0,1,2}, `mul_sum_i8_pairs_float` against each Q8_0 half, FMA-accumulated (the model was
+  Strata's AVX2 row kernel).
+- **Data:** one expert's gate+up (1280 x 2560) on one core 394 -> 150 us; max error 2.7e-8 of sum|w*a| vs 5.2e-8 scalar.
+- **Why dropped:** llama.cpp added its own AVX2 Q2_0 dot product (#30447, two blocks per step in two FMA chains) before
+  the 2026-10-14 rebase; the patch no longer applies and is not needed.
+
 ## Notes for anyone measuring here again
 
 - **Replay NLL is not a placement-independent number.** Expert placement differs between runs (it depends on

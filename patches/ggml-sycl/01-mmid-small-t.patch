@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
-index 686a4c7..480014e 100644
+index 6759af0..df0aae4 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -5101,6 +5101,12 @@ static void mmid_counting_sort_rows(
+@@ -5518,6 +5518,12 @@ static void mmid_counting_sort_rows(
      }
  }
  
@@ -15,7 +15,7 @@ index 686a4c7..480014e 100644
  static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                   ggml_tensor *dst) try {
      scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
-@@ -5120,6 +5126,26 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+@@ -5537,6 +5543,26 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
          if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
              return;
          }
@@ -41,4 +41,4 @@ index 686a4c7..480014e 100644
 +        }
      }
  
-     std::vector<char> ids_host(ggml_nbytes(ids));
+     // The per-expert loop below reads the experts in whatever layout they have: reorder MXFP4 here as well, so prompt processing does not depend on a single-token decode having run first.

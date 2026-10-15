@@ -1,6 +1,8 @@
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index eade894..6da35f9 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -2771,6 +2771,102 @@
+@@ -3045,6 +3045,102 @@ static void launch_mul_mat_vec_q_moe(
      });
  }
  
@@ -103,7 +105,7 @@
  bool ggml_sycl_mul_mat_vec_q_id(
      enum ggml_type     src0_type,
      const void *       vx_base,
-@@ -2811,6 +2907,11 @@
+@@ -3085,6 +3181,11 @@ bool ggml_sycl_mul_mat_vec_q_id(
                  expert_weight_stride, dst_row_stride, src1_row_stride, stream);
              return true;
          case GGML_TYPE_Q2_0:

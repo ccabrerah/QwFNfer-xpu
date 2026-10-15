@@ -1,5 +1,5 @@
 #!/bin/bash
-# The ggml/llama.cpp tree QwFNfer-xpu runs on: ggml-org/llama.cpp at bbdd9f2 plus the ggml-sycl patch series in
+# The ggml/llama.cpp tree QwFNfer-xpu runs on: ggml-org/llama.cpp at a0e6dc7 (master of 2026-10-14; bbdd9f2 up to v0.4.0) plus the ggml-sycl patch series in
 # patches/ggml-sycl (applied in file-name order), built for Intel GPUs with oneAPI (icx/icpx) and oneDNN.
 #   scripts/b70/build-llama-sycl.sh [DIR]        (default ~/src/llama-b70)
 # Needs: the oneAPI Base Toolkit (setvars.sh), a SYCL build of oneDNN (DNNL_DIR, default /opt/onednn-sycl),
@@ -9,7 +9,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 DIR=${1:-$HOME/src/llama-b70}
-SHA=bbdd9f246e9667f9aeb7ad11cca269466f981184
+SHA=a0e6dc7384edb8f5d927155e1d26c10b4a310e6d
 DNNL_DIR=${DNNL_DIR:-/opt/onednn-sycl/lib/cmake/dnnl}
 ONEAPI=${ONEAPI:-/opt/intel/oneapi/setvars.sh}
 

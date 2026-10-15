@@ -26,7 +26,7 @@ cmake --build build -j && sudo cmake --install build
 
 ## 2. Build
 
-The engine runs on a patched ggml tree (llama.cpp `bbdd9f2` + `patches/ggml-sycl/*.patch`), then builds against it:
+The engine runs on a patched ggml tree (llama.cpp `a0e6dc7` + `patches/ggml-sycl/*.patch`), then builds against it:
 
 ```sh
 git clone https://github.com/ccabrerah/QwFNfer-xpu && cd QwFNfer-xpu

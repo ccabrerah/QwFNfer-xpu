@@ -1,7 +1,8 @@
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 218479d..eb37067 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
 +++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
-@@ -3593,6 +3593,11 @@
+@@ -3802,6 +3802,11 @@ static void ggml_sycl_set_peer_access(const int n_tokens, [[maybe_unused]] int m
      peer_access_enabled = enable_peer_access;
  }
  
@@ -13,7 +14,7 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
  static bool ggml_sycl_q8_reuse_on() {
      static const bool on = [] { const char * e = getenv("GGML_SYCL_Q8_REUSE"); return e && atoi(e) != 0; }();
      return on;
-@@ -5080,6 +5085,49 @@
+@@ -5443,6 +5448,49 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
          ggml_sycl_mmvw(ctx, src0, src1, dst);
          return;
      }
@@ -64,9 +65,10 @@ diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
      if (!split && dst->op == GGML_OP_MUL_MAT && ggml_sycl_smallk_enabled() && ggml_sycl_smallk_supported(src0, src1, dst)) {
          ggml_sycl_smallk(ctx, src0, src1, dst);
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index caa6eac..172d4ab 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -3500,3 +3500,14 @@
+@@ -3930,3 +3930,14 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
              return false;
      }
  }
@@ -82,9 +84,10 @@ diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
 +    }
 +}
 diff --git a/ggml/src/ggml-sycl/mmvq.hpp b/ggml/src/ggml-sycl/mmvq.hpp
+index 146a6c1..7358658 100644
 --- a/ggml/src/ggml-sycl/mmvq.hpp
 +++ b/ggml/src/ggml-sycl/mmvq.hpp
-@@ -73,6 +73,10 @@
+@@ -99,6 +99,10 @@ bool ggml_sycl_mul_mat_vec_q_glu_plain(
      int                stride_col_dst,       // floats between output columns in dst
      dpct::queue_ptr    stream);
  
