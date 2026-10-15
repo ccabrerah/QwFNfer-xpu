@@ -204,3 +204,7 @@ drawing prompt at xhigh, three samples each: v4 layout 53K (original 47K), M2 18
 
 Tag `v0.4.0` keeps every experimental switch. Removed since, with their measurements: `docs/dropped-features.md`. Every behaviour this fork adds is now behind a switch, default off; the launcher turns the adopted ones on. Verified against `v0.4.0`: greedy output identical on three prompts, replay NLL identical, decode speed equal (24.83 / 25.02 vs 24.99 / 25.17 tok/s), backend tests and the server smoke and stress checks all pass.
 
+## Upstream merge and llama.cpp rebase (2026-10-15)
+
+The engine is merged with upstream QwFNfer master (2026-10-03: Windows support, the io worker pool, io_uring fixes, CI, attached files) and the ggml-sycl series is rebased onto llama.cpp master `a0e6dc7` (2026-10-14); patch 23 is gone (llama.cpp has its own AVX2 Q2_0 dot product). Against the previous build: backend tests pass, decode speed equal, replay NLL over 8 texts +0.1% (within noise), server smoke and 3-session stress pass. Upstream SYCL work that overlaps this series or its ideas (grouped MoE GEMM, Q8_0 wide-load MMVQ, more fusions, sparse FA) is still to be compared.
+
