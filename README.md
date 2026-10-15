@@ -21,7 +21,7 @@ There is no other way to use this GPU on other similar engines, which makes us i
 
 ## On perf
 
-For the V4 quant (see recipe, a "Q3-level" set), on a Ryzen 5700, 32GB dual channel system ram, on a dedicated linux system with a B70 power limited to 120W you get:
+For the V4 quant (see recipe, a "Q3-level" set), on a Ryzen 5700, 32GB dual channel system ram, on a dedicated linux system with a B70 power limited to 120W you get (the box has run at 160 W since 2026-10-10: decode +5-11%, prefill +16-23%):
 
 * 30 TP decode
 * 400-500 prefill
@@ -83,8 +83,12 @@ prefix cache and vision unchanged. Configuration: [`docs/B70-config.md`](docs/B7
 | deterministic GPU arithmetic: oneDNN matmuls without split-K atomics and a radix top-k that emits in index order (ties to the lowest index), so two runs of the same prompt give bit-identical hidden states and identical greedy text | patches 26-27 (`GGML_SYCL_DNNL_DETERMINISTIC=1 GGML_SYCL_TOPK_DETERMINISTIC=1`) | reproducible runs; at 100K context decode +13% (the top-k no longer serialises on tied blocks), prefill -2.5% |
 | time-shared engine: up to N open requests take turns (a quantum each, parking at decode steps and between prefill passes, least-used session first), checkpointed through the prefix cache | server (`--timeshare N --quantum S --linger S`) | a short request behind a 100K prefill: first token 4 s instead of 174 s; parking exact; see [Two serving features](#two-serving-features-time-sharing-and-the-ram-prefix-cache) |
 | one-token expert kernels with no idle lanes: the five Q8_0 expert-down layers in the VRAM tier's SOA layout with their own MoE matvec (16-byte half blocks), and the IQ4_NL / Q2_0 expert kernels at 8 lanes per row (this model's 20- and 40-block rows left 38% / 17% of 16 lanes idle); greedy (temperature 0) sampling's argmax vectorized | patches 31-32 + engine (`QWFN_Q8_SOA=1 GGML_SYCL_IQ4_SOA_LPR=8 GGML_SYCL_Q2_LPR=8`), server | Q8_0 expert down 2.17 -> 0.8 ms, IQ4_NL 3.64 -> 3.0, Q2_0 gate/up 2.61 -> 2.4 ms per verify step; argmax 0.69 -> 0.03 ms per position; short-prompt decode +11% (34.0 -> 37.9 tok/s), agent turns at ~55K context +6.5% (30.9 -> 32.9 tok/s) |
+| expert promotions cheaper: the VRAM victim is copied aside on the device and read back to RAM on a second queue a layer later, so the compute queue carries only the upload (placement and output unchanged) | patch 35 (+33's side queue) + engine (`QWFN_PROMOTE_D2D`) | promotion settle 2.8 -> 1.7 ms per token, decode ~+1.5% |
+| warm start: the per-expert use counts persist across restarts (saved at shutdown and every few minutes) and the next start fills the VRAM and RAM tiers with the hot experts before the first request | engine (`QWFN_WARM_COUNTS=<file>`, the launcher keeps one per model) | first 500 tokens after a start 16 -> 27 tok/s, ~12 s saved per start, ~9 s of fill at load |
+| the restore after a streamed prompt pipelined: the next layer's batch is read while this one uploads | engine (inside `QWFN_LEND_RESTORE`) | 2.43 -> 2.0 s per streamed turn |
+| vision tower on the GPU | server (`--vision-gpu`) | a 12 MP photo's time to first token 278 -> 24 s; needs ~0.9-1.7 GB of VRAM while it encodes (prod runs `--vram 22` with it) |
 
-Every change is off by default in the patched ggml tree and checked with `test-backend-ops`; the details and the
+Every change is behind a switch and off by default, in the patched ggml tree (checked with `test-backend-ops`) and in the engine (off, it behaves as upstream's); `scripts/b70/qwfn-b70.sh` turns the adopted ones on. Switches that were built, measured and removed, with their numbers, are in [`docs/dropped-features.md`](docs/dropped-features.md) (all still in tag `v0.4.0`); the details and the
 rejected alternatives are in [`docs/B70-SYCL.md`](docs/B70-SYCL.md) and [`docs/B70-config.md`](docs/B70-config.md), and
 everything tried so far (adopted, rejected, and ideas not yet tried) in [`docs/B70-registry.md`](docs/B70-registry.md). Every command-line flag and environment variable: [`docs/PARAMETERS.md`](docs/PARAMETERS.md).
 
@@ -209,7 +213,7 @@ Linux 7.1 with the xe driver, oneAPI 2026.0, oneDNN built for SYCL. GPU power ca
 | dense overlay v2 (+5.7 GB) | attention, shared-expert and `ssm_out` tensors at Q5_K/Q6_K/Q8_0, `token_embd` Q8_0, `output` Q6_K, expert down Q8_0 on layers 2, 4, 30, 46, 47, layer-2 expert gate/up IQ3_XXS: fetched by HTTP range from [Unsloth's](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) UD-Q2_K_XL and UD-Q3_K_XL ([`docs/dense-overlay.md`](docs/dense-overlay.md)) |
 | vision (optional) | `mmproj-Qwen3.8-Flash-Next-BF16.gguf` |
 
-**Build.** llama.cpp `bbdd9f2` + `patches/ggml-sycl/01-21`, then the engine against it:
+**Build.** llama.cpp `bbdd9f2` + the `patches/ggml-sycl` series (01-35; the validated numbers were taken at 01-21), then the engine against it:
 
 ```sh
 scripts/b70/build-llama-sycl.sh ~/src/llama-b70
@@ -234,7 +238,8 @@ QWFN_B70_HEAD=<overlay dir>/v2/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00006.gg
 | tokenizer | `QWFN_VOCAB_MODEL=<GSQ-RCO dir>/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf` (needed with the overlay head) |
 | prefill | `GGML_SYCL_FA_ONEDNN=1 GGML_SYCL_ENABLE_MKL_FA=0 QWFN_DEV_MASK=1 QWFN_QSA_PACK=1 QWFN_LOCK_HOST=1 GGML_SYCL_FUSE_IDX=1` |
 | fusions | `GGML_SYCL_FUSE_HC=1 GGML_SYCL_FUSE_HC_DECODE=1 GGML_SYCL_FUSE_HC_GATE=1 GGML_SYCL_FUSE_SPARSE_DECODE=1 GGML_SYCL_TOPK_WG=1 GGML_SYCL_FUSE_HC_MIX=1 GGML_SYCL_FUSE_ADDCHAIN=1 GGML_SYCL_FUSE_MOESUM=1 GGML_SYCL_FUSE_CONV=1` |
-| decode | `KMP_BLOCKTIME=0 GGML_SYCL_MMVW=1 GGML_SYCL_SMALLK=1 GGML_SYCL_MOE_Q2W=1 QWFN_PREDICT_CUR2=1 QWFN_Q2_SOA=1 QWFN_IQ4_SOA=1 GGML_SYCL_Q8W=1 GGML_SYCL_Q8_REUSE=1 GGML_SYCL_Q8_DIRECT=1 GGML_SYCL_Q8_EPILOGUE=1 GGML_SYCL_Q8W_NCOLS=1 QWFN_LEND_RESTORE=1 QWFN_MTP_SHARED_CELLS=1 QWFN_PF_VRAM=1` |
+| decode | `KMP_BLOCKTIME=0 GGML_SYCL_MMVW=1 GGML_SYCL_SMALLK=1 GGML_SYCL_MOE_Q2W=1 QWFN_PREDICT_CUR2=1 QWFN_Q2_SOA=1 QWFN_IQ4_SOA=1 GGML_SYCL_Q8W=1 GGML_SYCL_Q8_REUSE=1 GGML_SYCL_Q8_DIRECT=1 GGML_SYCL_Q8_EPILOGUE=1 GGML_SYCL_Q8W_NCOLS=1 QWFN_LEND_RESTORE=1 QWFN_MTP_SHARED_CELLS=1 QWFN_PF_VRAM=1 QWFN_Q8_SOA=1 GGML_SYCL_IQ4_SOA_LPR=8 GGML_SYCL_Q2_LPR=8` |
+| since 2026-10-14 | `QWFN_PROMOTE_D2D=1 QWFN_WARM_COUNTS=~/.cache/qwfnfer/expert-counts-<head>.bin`; the fenced fork behaviours `QWFN_UPLOAD_SKIP=1 QWFN_DOWN_FOLD=1 QWFN_GRAPH_STASH=1 QWFN_LATE_NARROW=1 QWFN_HC_MEAN_MULTI=1 QWFN_PACK_MULTI=1 GGML_SYCL_MMID_SMALL_T=1 GGML_SYCL_TOPK_DIV_OUT=1 GGML_CPU_Q2_0_AVX2=1` (they were defaults before; with the switches off the engine and the backend behave as upstream's) |
 | host | memlock unlimited (`LimitMEMLOCK=infinity` under systemd) for `QWFN_LOCK_HOST`; a writable `$HOME` so the GPU compiler cache persists (the first request after a new build compiles the kernels) |
 | compute runtime | recommended: `NEOReadDebugKeys=1 EnableSharedSystemUsmSupport=0`. By default the runtime may route GPU copies from ordinary host memory through the kernel's shared virtual memory (xe SVM, device-private pages); a process killed in the middle of such a copy can leave the xe driver unable to unbind. Measured at no cost for this engine (interleaved starts, decode and prefill unchanged) |
 
@@ -263,8 +268,12 @@ Anthropic `input_image` blocks; the tower encodes each to `grid*w/16 * grid*h/4`
 tokens inserted at the image's position. The tower runs on the CPU by default
 (`--vision-threads`, defaults to physical cores), keeping its 0.9 GB out of the
 VRAM reserved for the expert tier; `--vision-gpu` moves it to the GPU backend
-(~18x faster encodes, measured 1.7 s vs 31.3 s for a 1400x1000 image) at the
-cost of ~1 GB VRAM - pair it with `--vram` one notch lower.
+(~18x faster encodes, measured 1.7 s vs 31.3 s for a 1400x1000 image; a 12 MP photo's time to
+first token 278 -> 24 s) at the cost of ~0.9 GB of VRAM for the weights plus an activation arena that grows with
+the image (+0.9 GB at 348 image tokens, +1.7 GB at 4,063) - pair it with `--vram` one notch lower. Production runs
+`--vram 22 --vision-gpu`; the worst case measured there (a 12 MP photo with a 116K-token document) left at most
+~0.5 GiB of the 32 GiB card: if the server ever logs an allocation failure, use `--vram 21`. Checked with the
+smoke test's three images and three concurrent sessions with an image among them.
 
 ## Acknowledgment
 
@@ -272,11 +281,11 @@ Built on [ggml](https://github.com/ggml-org/ggml) (quantized kernels, CUDA backe
 [Strata](https://github.com/Niko1221/Strata) by Niko1221, MIT: its paper and code showed what makes a draft head pay
 on a small GPU; its AVX2 Q2_0 row kernel is the model for patch 23, and its English/code draft vocabulary the base of
 ours. The engine itself is [QwFNfer](https://github.com/Apolog1ze-Dev/QwFNfer); this fork only adds the Intel
-work on top of it. Base weights: [GSQ-RCO Q2_0](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+work on top of it, and is merged with its master as of 2026-10-03 (Windows support, the io worker pool and io_uring fixes, CI, attached files: the Windows and CUDA paths are upstream's and not run on the B70). Base weights: [GSQ-RCO Q2_0](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
 by ISTA-DASLab. The SYCL backend is ggml's, built with Intel oneAPI and oneDNN.
 
 ## License
 
 [Apache License 2.0](LICENSE).
 
-Last updated: 2026-10-07
+Last updated: 2026-10-14
