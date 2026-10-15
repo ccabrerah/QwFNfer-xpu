@@ -52,11 +52,13 @@ and a long-context needle).
 | `14-hc-mix-fusions` | the hyper-connection mixer's SiLU as the one-token bf16/f16 matvec's epilogue (the stream mean it also fused is now llama.cpp's `DSV4_HC_PRE`, emitted by the engine under `QWFN_HC_PRE_OP`) | `GGML_SYCL_FUSE_HC_MIX=1` |
 | `15-decode-fusions` | chains of 2-4 ADDs as one kernel; the MoE weighted sum reading the expert rows in place (no CONT); the one-token DeltaNet conv (concat, state update, conv, SiLU) as one kernel | `GGML_SYCL_FUSE_ADDCHAIN=1`, `GGML_SYCL_FUSE_MOESUM=1`, `GGML_SYCL_FUSE_CONV=1` |
 | `17-iq4_nl-soa` | `GGML_TYPE_IQ4_NL_SOA`: IQ4_NL expert weights as [codes][scales] per slice (patch 09's layout; an iq4_nl block has q2_0's byte structure), converted on upload; the one-token MoE matvec reads a block's codes in one aligned 16-byte load and decodes them through a 256-entry table in local memory (code byte -> both nibbles' values). The stock IQ4_NL kernels are ALU-bound on the table lookup: `dpct::byte_level_permute` uses 64-bit variable shifts, which the GPU emulates. 2.75x the stock kernel (84 -> 30 us per matmul at 640 x 2560, 10 experts) | engine `QWFN_IQ4_SOA=1` |
+| `18-q8_0-wide-mmvq` | the one-token Q8_0 matvec over the reorder layout with a whole 32-value block per lane: the block's quants and the matching q8_1 activations as two 16-byte loads each (the reorder layout keeps them contiguous and 32-byte aligned), eight dp4a, one scale product; a row per sub-group. The stock kernel reads the quants as 2-byte pieces with two lanes per block, both loading the scale. -13% per call on the dense Q8_0 weights (24.8 -> 21.5 us, ~405 -> ~467 GB/s); 2 or 4 rows per sub-group (shared activation loads) gain nothing Since 2026-10-15 one token runs on llama.cpp's exact ESIMD kernel; this kernel serves patch 28's 2-4 columns | `GGML_SYCL_Q8W=1` |
 | `16-indexer-head-sum` | the sparse-attention indexer's per-head score sum at prefill (relu, permute, copy, sum_rows over 4 heads) as one kernel that reads the scores once, summing in sum_rows' own order (bit-identical) | `GGML_SYCL_FUSE_IDX=1` |
 
-Patches 18-21 and 28 (our Q8_0 matvec path) were dropped on 2026-10-15: llama.cpp's own Q8_0 ESIMD kernel on f32
-activations (#29186) is exact where ours quantized the activations, and decode with the draft head is ~5% faster on
-it; see [`dropped-features.md`](dropped-features.md).
+Patches 19-21 (q8_1 reuse, direct dispatch, SiLU epilogue: one-token Q8_0) were dropped on 2026-10-15: one token now
+runs on llama.cpp's own Q8_0 ESIMD kernel on f32 activations (#29186), exact where ours quantized the activations.
+Patches 18 and 28 (`GGML_SYCL_Q8W_NCOLS`: the MTP verify step's 2-4 columns on the wide kernel) stay: on upstream's
+path the verify step's layer graphs are ~6% slower; see [`dropped-features.md`](dropped-features.md).
 
 The measurements behind each are in the research repository's `docs/decode-fusion-plan.md`,
 `docs/hc-fusion-plan.md`, `docs/flash-attention-sycl.md` and `docs/outprod-the-real-bottleneck.md`.

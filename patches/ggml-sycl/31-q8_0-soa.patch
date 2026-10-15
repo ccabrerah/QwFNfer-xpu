@@ -197,10 +197,10 @@ index b66cff8..99f0e4a 100644
      }
      SYCL_CHECK(CHECK_TRY_ERROR(
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
-index a260f5c..13f6231 100644
+index d81c049..812037c 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -3249,6 +3249,86 @@ static void launch_mul_mat_vec_iq4_nl_soa_moe(
+@@ -3384,6 +3384,86 @@ static void launch_mul_mat_vec_iq4_nl_soa_moe(
      else                           go(std::integral_constant<int, WARP_SIZE / 4>{});
  }
  
@@ -287,7 +287,7 @@ index a260f5c..13f6231 100644
  static bool ggml_sycl_moe_q2w_enabled() {
      static const bool v = [] { const char * e = getenv("GGML_SYCL_MOE_Q2W"); return e && atoi(e) != 0; }();
      return v;
-@@ -3377,6 +3457,12 @@ bool ggml_sycl_mul_mat_vec_q_id(
+@@ -3512,6 +3592,12 @@ bool ggml_sycl_mul_mat_vec_q_id(
                  vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                  expert_weight_stride, dst_row_stride, src1_row_stride, stream);
              return true;

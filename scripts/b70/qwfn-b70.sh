@@ -21,6 +21,7 @@ export GGML_SYCL_FUSE_HC=1 GGML_SYCL_FUSE_HC_DECODE=1            # hyper-connect
 export KMP_BLOCKTIME=0 GGML_SYCL_MMVW=1 GGML_SYCL_SMALLK=1 GGML_SYCL_MOE_Q2W=1 QWFN_PREDICT_CUR2=1   # decode
 export QWFN_Q2_SOA=1 GGML_SYCL_FUSE_SPARSE_DECODE=1 GGML_SYCL_FUSE_HC_GATE=1                         # decode (patches 09-11)
 export QWFN_IQ4_SOA=1                                                                                # iq4_nl experts in VRAM as IQ4_NL_SOA (patch 17)
+export GGML_SYCL_Q8W=1 GGML_SYCL_Q8W_NCOLS=1                                                        # 2-4-column Q8_0 matvecs (the MTP verify step) on patch 18's wide kernel (patch 28); one token stays on llama.cpp's exact ESIMD kernel
 export GGML_SYCL_DMMV_NCOLS=1                                                                        # 2-4-column Q5_K/Q6_K matvecs through the ESIMD kernel (patch 24; the MTP verify step)
 export QWFN_LEND_RESTORE=1                                                                           # after a streamed prompt, read the lent layers' VRAM experts back before decode
 export QWFN_LEND_FIT=1                                                                               # a streamed prompt lends only what it needs, per layer: agent turns -1.2 s, replies after them faster

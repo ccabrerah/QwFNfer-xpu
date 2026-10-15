@@ -189,8 +189,8 @@ Extra arguments are appended to the server's command line (later values win).
 | `QWFN_HC_PRE_OP` | The hyper-connection mixer's sigmoid gate and stream mean as ggml's `DSV4_HC_PRE` (llama.cpp's own op, one kernel at every step width) instead of sigmoid, multiply and the mean (on in the launcher; replaces ggml-sycl patch 14's mean fusion). |
 | `QWFN_LIGHTNING_IDX=1\|2` | The sparse-attention indexer's block scores (relu per head, summed, plus the block bias) as ggml's `LIGHTNING_INDEXER` instead of a matmul and a head sum: no [blocks, heads, T] score tensor; the bias goes in as an F16 mask (+-1e9 become +-inf, the selection is unchanged) 1: decode and verify steps (on in the launcher: -21 us per attention layer graph, fewer launches); 2: prompt chunks too (slower there, +4-5 s on a 38K prompt, so prompts keep patch 16's head sum). |
 | `QWFN_LEND_FIT` / `QWFN_LEND_FIT_MARGIN_MB=N` | A streamed prompt pass lends the expert tier only what it needs: the work set sized to the pass's tokens and the lent VRAM taken per layer (the last layers first) until it covers the staging, the arenas and N MB (default 256); the other layers keep their VRAM experts through the prompt. |
-| `QWFN_VISION_FREE_MB=N` | Server, `--vision-gpu`: the free VRAM an image encode wants (default 2048); below it the encode borrows the difference from the expert tier (per layer with `QWFN_LEND_FIT`), as the image prompt's prefill does anyway. |
-| `QWFN_LEND_LOG` | One line per streamed pass: device free memory at its end, VRAM lent, and the work set / MoE / shared arena sizes. |
+| `QWFN_VISION_LEND_MB=N` | Server, `--vision-gpu`: an image encode first borrows N MB (default 2048; 0 = off) from the expert tier (per layer with `QWFN_LEND_FIT`), as the image prompt's prefill does anyway: after a long conversation the decode graphs hold the free VRAM. |
+| `QWFN_LEND_LOG` | One line per streamed pass: device free memory at its end (as the SYCL runtime reports it, which can overstate it: 2 GB+ reported with 0.68 GB free per the driver), VRAM lent, and the work set / MoE / shared arena sizes. |
 | `QWFN_NO_FUSE` | No graph-level GPU fusions. |
 | `QWFN_NO_INPLACE` | No in-place writes of layer outputs. |
 | `QWFN_NO_PACK` | No packed readback of routing results. |
@@ -256,6 +256,7 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_FUSE_CONV=1` | 15 | 1 | One-token DeltaNet conv as one kernel. |
 | `GGML_SYCL_FUSE_IDX=1` | 16 | 1 | Prefill indexer per-head score sum as one kernel (bit-identical). |
 | `GGML_SYCL_IQ4_SOA_LPR=16\|8\|4` | 17 | 8 | Force the IQ4_NL_SOA matvec's lanes per row. 8 on this model's 20-block expert-down rows: -17% against the default 16. |
+| `GGML_SYCL_Q8W=1` | 18 | 1 | The wide Q8_0 matvec kernel (a whole block per lane, 16-byte loads); one-token Q8_0 matmuls take it only where llama.cpp's dispatcher picks MMVQ (on the B70 it picks its exact ESIMD kernel). Needed by `GGML_SYCL_Q8W_NCOLS`. |
 | `GGML_SYCL_DMMV_NCOLS=1` | 24 | 1 | 2-4-column Q5_K/Q6_K matvecs through the ESIMD kernel (the MTP verify step). |
 | `GGML_SYCL_FUSE_SPARSE_PREFILL=1` | 25 | 1 | Long prompts: QSA attention gathered per query on DPAS (also changes the engine's graph order; =2 is the order only). |
 | `GGML_SYCL_SPF_MIN_KV=N` | 25 | 45056 | Below n_kv N the dense path runs. |
@@ -263,6 +264,7 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_SPF_CHECK=1` / `GGML_SYCL_SPF_DEBUG=1` | 25 | | Run dense and gathered and compare per layer / report where the matcher stops. |
 | `GGML_SYCL_DNNL_DETERMINISTIC=1` | 26 | 1 | oneDNN matmuls in deterministic mode (no split-K atomic accumulation): the same bits every run. |
 | `GGML_SYCL_TOPK_DETERMINISTIC=1` | 27 | 1 | Radix top-k emits in column order, ties to the lowest index, no atomics (the QSA indexer's block selection reproducible). With 26: bit-identical runs. |
+| `GGML_SYCL_Q8W_NCOLS=1` | 28 | 1 | 2-4-column Q8_0 matvecs (the MTP verify step) through patch 18's wide kernel, each weight block loaded once for all columns; needs `GGML_SYCL_Q8W`. A column's result equals the one-column kernel's. |
 | (no switch) | 30 | | CPY from Q2_0_SOA / IQ4_NL_SOA to the canonical blocks (used by `QWFN_PF_VRAM`). Patch 29 was tried and is not in the series. |
 | (no switch) | 31 | | Q8_0_SOA: the type, its conversions, dequantize and CPY, and the one-token MoE matvec (8 lanes per row for the 20-block expert-down rows: the widest with no idle lane). |
 | `GGML_SYCL_Q2_LPR=16\|8\|4` | 32 | 8 | Lanes per row of the one-token q2_0 MoE kernels (gate/up + SwiGLU fused, and the wide matvec); 8 on 40-block rows: -9% against 16. |

@@ -1046,17 +1046,15 @@ static bool render_content(server & S, const json & content, std::string & text,
             // activations and the runtime's scratch (~0.9 GB at 348 image tokens, ~1.7 GB at 4,063) come from free VRAM,
             // and after a long conversation the decode graphs hold most of the reserve (2026-10-15: out of device memory
             // at a 1400-px image after a 61K-token agent conversation, 33.56 of 34.24 GB in use, on the v33 stack too).
-            // Borrow what is missing from the expert tier -- per layer with QWFN_LEND_FIT -- under the engine lock; the
-            // image prompt's prefill lends anyway, and the engine takes the tier back before the next decode.
-            // QWFN_VISION_FREE_MB: the free VRAM an encode wants (default 2048).
-            if (!S.vis.on_cpu() && !S.vis.weights_on_host() && S.vis_backend) {
-                static const size_t want = (size_t) (getenv("QWFN_VISION_FREE_MB") ? atol(getenv("QWFN_VISION_FREE_MB")) : 2048) << 20;
-                size_t dfree = 0, dtotal = 0;
-                if (ggml_backend_dev_t d = ggml_backend_get_device(S.vis_backend)) ggml_backend_dev_memory(d, &dfree, &dtotal);
-                if (dfree < want) {
-                    S.eng.vram_lend_begin(want - dfree);
-                    fprintf(stderr, "[qwfn-server] image: %.0f MB of VRAM free, borrowed %.0f MB from the expert tier for the encode\n",
-                            dfree / 1e6, (want - dfree) / 1e6);
+            // So the encode borrows QWFN_VISION_LEND_MB (default 2048) from the expert tier -- per layer with
+            // QWFN_LEND_FIT -- under the engine lock; the image prompt's prefill lends anyway, and the engine takes the
+            // tier back before the next decode. Unconditionally: the SYCL free-memory query reported >= 2 GB free while
+            // the device had 0.68 GB, so it cannot decide this.
+            if (!S.vis.on_cpu() && !S.vis.weights_on_host()) {
+                static const size_t lend = (size_t) (getenv("QWFN_VISION_LEND_MB") ? atol(getenv("QWFN_VISION_LEND_MB")) : 2048) << 20;
+                if (lend) {
+                    S.eng.vram_lend_begin(lend);
+                    fprintf(stderr, "[qwfn-server] image: %zu MB borrowed from the expert tier for the encode\n", lend >> 20);
                 }
             }
             const bool ok_enc = S.vis.encode(img, pi.emb, pi.n_tok, gw, gh, err);

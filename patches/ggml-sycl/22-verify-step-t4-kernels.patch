@@ -51,10 +51,10 @@ index 486836a..50e5872 100644
  }
  
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
-index dd2f96d..a260f5c 100644
+index caa6eac..5777ced 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -3274,15 +3274,17 @@ template <int LPR, bool SOA>
+@@ -3334,15 +3334,17 @@ template <int LPR, bool SOA>
  static void mul_mat_vec_q2_0_moe_glu_wide(
      const void * __restrict__ vx_gate, const void * __restrict__ vx_up, const void * __restrict__ vy,
      float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev, const int ncols, const int nrows,
@@ -77,7 +77,7 @@ index dd2f96d..a260f5c 100644
  
      const int blocks_per_row = ncols / QK2_0;
      float g = 0.0f, u = 0.0f;
-@@ -3313,22 +3315,22 @@ bool ggml_sycl_moe_q2w_on() { return ggml_sycl_moe_q2w_enabled(); }
+@@ -3373,22 +3375,22 @@ bool ggml_sycl_moe_q2w_on() { return ggml_sycl_moe_q2w_enabled(); }
  void ggml_sycl_mul_mat_vec_q2_0_moe_glu(const void * vx_gate, const void * vx_up, const void * vy, const int32_t * ids_dev,
                                          float * dst_base, int ncols, int nrows, int n_experts_used,
                                          size_t stride_gate, size_t stride_up, size_t dst_row_stride, dpct::queue_ptr stream,

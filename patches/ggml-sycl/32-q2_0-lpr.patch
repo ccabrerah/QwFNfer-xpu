@@ -6,10 +6,10 @@ gate/up row here is 40 blocks: 16 lanes run 3 steps with 8 lanes idle in the las
 lanes per row (8: 5 full steps, 2 rows per sub-group) for tuning; the default is unchanged.
 
 diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
-index 13f6231..e73e007 100644
+index 812037c..0b3e3d6 100644
 --- a/ggml/src/ggml-sycl/mmvq.cpp
 +++ b/ggml/src/ggml-sycl/mmvq.cpp
-@@ -3046,6 +3046,11 @@ static void launch_mul_mat_vec_q_moe(
+@@ -3181,6 +3181,11 @@ static void launch_mul_mat_vec_q_moe(
  }
  
  
@@ -21,7 +21,7 @@ index 13f6231..e73e007 100644
  // ---- wide q2_0 MoE matvec (GGML_SYCL_MOE_Q2W=1), see scripts/box/moeq2w/apply_moeq2w.py ----
  // byte k of a q2_0 block holds elements 4k..4k+3 in bits 0-1, 2-3, 4-5, 6-7
  static __dpct_inline__ int q2_0_expand_byte(const uint32_t q) {
-@@ -3149,8 +3154,11 @@ static void launch_mul_mat_vec_q2_0_moe_wide(
+@@ -3284,8 +3289,11 @@ static void launch_mul_mat_vec_q2_0_moe_wide(
                  });
          });
      };
@@ -35,7 +35,7 @@ index 13f6231..e73e007 100644
  }
  
  // ---- IQ4_NL_SOA one-token MoE matvec (patch 17) ----
-@@ -3414,8 +3422,11 @@ void ggml_sycl_mul_mat_vec_q2_0_moe_glu(const void * vx_gate, const void * vx_up
+@@ -3549,8 +3557,11 @@ void ggml_sycl_mul_mat_vec_q2_0_moe_glu(const void * vx_gate, const void * vx_up
                  });
          });
      };
