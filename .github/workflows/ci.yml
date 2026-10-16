@@ -88,16 +88,18 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ runner.home }}/onednn-sycl
-          key: onednn-sycl-3.11.3-oneapi-2026.2-v1
+          key: onednn-sycl-3.11.3-intel-oneapi-2026.2-v2
       - name: oneDNN SYCL build (cache miss)
         if: steps.dnnl.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           source "$HOME/oneapi/setvars.sh" --force > /dev/null 2>&1
           git clone --depth 1 -b v3.11.3 https://github.com/uxlfoundation/oneDNN "$RUNNER_TEMP/oneDNN"
+          # GPU vendor INTEL: oneDNN defaults to NVIDIA SYCL kernels (needs CUDA on the
+          # runner, and GGML_SYCL_TARGET=INTEL wants Intel kernels - same as the box build).
           cmake -S "$RUNNER_TEMP/oneDNN" -B "$RUNNER_TEMP/oneDNN/build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
-            -DDNNL_CPU_RUNTIME=SYCL -DDNNL_GPU_RUNTIME=SYCL \
+            -DDNNL_CPU_RUNTIME=SYCL -DDNNL_GPU_RUNTIME=SYCL -DDNNL_GPU_VENDOR=INTEL \
             -DCMAKE_INSTALL_PREFIX="$HOME/onednn-sycl"
           cmake --build "$RUNNER_TEMP/oneDNN/build" -j "$(nproc)"
           cmake --install "$RUNNER_TEMP/oneDNN/build"
@@ -177,11 +179,15 @@ jobs:
       - name: "llama.cpp source (upstream, CPU: no SYCL, no Intel GPU)"
         run: |
           git init -q "$HOME/llama.cpp"
-          git -C "$HOME/llama.cpp" fetch -q --depth 1 https://github.com/ggml-org/llama.cpp "$LLAMA_SHA"
+          git -C "$HOME/llama.cpp" config core.autocrlf false
+          git -C "$HOME/llama.cpp" fetch -q --depth 1 https://github.com/ggml-org/llama.cpp "$env:LLAMA_SHA"
           git -C "$HOME/llama.cpp" checkout -q FETCH_HEAD
-          # --ignore-whitespace: Windows runners check out with core.autocrlf=true (CRLF working
-          # tree), and this patch's context is LF
-          git -C "$HOME/llama.cpp" apply --ignore-whitespace "$GITHUB_WORKSPACE/.github/scripts/soa-enums.patch"
+          # Windows runners check out the repo with core.autocrlf=true: the patch file arrives
+          # CRLF while the fetched tree is LF (autocrlf off above). Normalize, then apply.
+          $p = "$env:GITHUB_WORKSPACE\.github\scripts\soa-enums.patch"
+          (Get-Content $p -Raw) -replace "`r`n", "`n" | Set-Content -NoNewline -Encoding UTF8 $p
+          git -C "$HOME/llama.cpp" apply "$p"
+          if ($LASTEXITCODE) { exit 1 }
 
       # Cached ggml + llama build (CPU-only, Release, shared libs, all x86 CPU variants; upstream's
       # GGML_CPU_ALL_VARIANTS requires GGML_BACKEND_DL, the dll/dl backends loaded at runtime).

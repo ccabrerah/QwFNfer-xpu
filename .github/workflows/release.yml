@@ -173,11 +173,14 @@ jobs:
       - name: llama.cpp source
         run: |
           git init -q "$env:RUNNER_TEMP\llama.cpp"
+          git -C "$env:RUNNER_TEMP\llama.cpp" config core.autocrlf false
           git -C "$env:RUNNER_TEMP\llama.cpp" fetch -q --depth 1 https://github.com/ggml-org/llama.cpp $env:LLAMA_SHA
           git -C "$env:RUNNER_TEMP\llama.cpp" checkout -q FETCH_HEAD
-          # --ignore-whitespace: Windows runners check out with core.autocrlf=true (CRLF working
-          # tree), and this patch's context is LF
-          git -C "$env:RUNNER_TEMP\llama.cpp" apply --ignore-whitespace "$env:GITHUB_WORKSPACE\.github\scripts\soa-enums.patch"
+          # Windows runners check out the repo with core.autocrlf=true: the patch file arrives
+          # CRLF while the fetched tree is LF (autocrlf off above). Normalize, then apply.
+          $p = "$env:GITHUB_WORKSPACE\.github\scripts\soa-enums.patch"
+          (Get-Content $p -Raw) -replace "`r`n", "`n" | Set-Content -NoNewline -Encoding UTF8 $p
+          git -C "$env:RUNNER_TEMP\llama.cpp" apply "$p"
           if ($LASTEXITCODE) { exit 1 }
       - name: Cached portable ggml build
         id: ggml-cache
