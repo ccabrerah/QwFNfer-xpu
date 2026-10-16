@@ -1042,16 +1042,17 @@ static bool render_content(server & S, const json & content, std::string & text,
             pending_img pi;
             int gw = 0, gh = 0;
             const auto t0 = clk::now();
-            // On the CPU: no VRAM is borrowed from the expert tier for this. On the GPU (--vision-gpu) the encode's
-            // activations and the runtime's scratch (~0.9 GB at 348 image tokens, ~1.7 GB at 4,063) come from free VRAM,
-            // and after a long conversation the decode graphs hold most of the reserve (2026-10-15: out of device memory
-            // at a 1400-px image after a 61K-token agent conversation, 33.56 of 34.24 GB in use, on the v33 stack too).
-            // So the encode borrows QWFN_VISION_LEND_MB (default 2048) from the expert tier -- per layer with
-            // QWFN_LEND_FIT -- under the engine lock; the image prompt's prefill lends anyway, and the engine takes the
-            // tier back before the next decode. Unconditionally: the SYCL free-memory query reported >= 2 GB free while
-            // the device had 0.68 GB, so it cannot decide this.
-            if (!S.vis.on_cpu() && !S.vis.weights_on_host()) {
-                static const size_t lend = (size_t) (getenv("QWFN_VISION_LEND_MB") ? atol(getenv("QWFN_VISION_LEND_MB")) : 2048) << 20;
+            // On the CPU: no VRAM is borrowed from the expert tier for this. On the GPU (--vision-gpu) the tower's
+            // weights live in pinned host memory and are staged onto the device for each encode (~0.9 GB), next to its
+            // activations and the runtime's scratch (~0.9 GB at 348 image tokens, ~1.7 GB at 4,063), all from free VRAM;
+            // after a long conversation the decode graphs hold most of it (2026-10-15: out of device memory staging the
+            // weights for a 1400-px image after a 61K-token agent conversation, 33.56 of 34.24 GB in use, on the deployed
+            // v33 stack too). So the encode borrows QWFN_VISION_LEND_MB (default 3072) from the expert tier first -- per
+            // layer with QWFN_LEND_FIT -- under the engine lock; the image prompt's prefill lends anyway, and the engine
+            // takes the tier back before the next decode. Unconditionally: the SYCL free-memory query reported >= 2 GB
+            // free while the device had 0.68 GB, so it cannot decide this.
+            if (!S.vis.on_cpu()) {
+                static const size_t lend = (size_t) (getenv("QWFN_VISION_LEND_MB") ? atol(getenv("QWFN_VISION_LEND_MB")) : 3072) << 20;
                 if (lend) {
                     S.eng.vram_lend_begin(lend);
                     fprintf(stderr, "[qwfn-server] image: %zu MB borrowed from the expert tier for the encode\n", lend >> 20);
