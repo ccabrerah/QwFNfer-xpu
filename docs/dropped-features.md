@@ -112,7 +112,7 @@ launcher (`scripts/b70/qwfn-b70.sh`) turns on the adopted ones.
 
 - **What it did:** `hc_combine` emitted `ggml_dsv4_hc_post(block_out, residual, 2 sigmoid(inject), no comb)` -- the op
   llama.cpp's own qwen4exp graph uses (#28901, SYCL kernel #29132) -- instead of OUT_PROD + ADD.
-- **Data** (window ops, served layout with the draft head, per decode layer graph): recurrent 587 -> 593-611 us,
+- **Data** (served layout with the draft head, per decode layer graph): recurrent 587 -> 593-611 us,
   attention 885 -> 893-896 us, host launch 458 -> 469-474 us per graph; `test-backend-ops` DSV4_HC_POST 9/9.
 - **Why dropped:** upstream's op covers the product and the add only; our patches 04/06/11 fuse the gate (sigmoid,
   scale), the product, the add and the next mixer's RMS norm + gamma into one kernel, so emitting the op loses that
@@ -209,7 +209,7 @@ day (below).
   exact kernel); no other text moved like it.
 - **Why 18 and 28 came back:** with the draft head almost every step is a 2-column verify step, which upstream runs
   through a wide-load MMVQ on q8_1 activations (same accuracy as ours: ~1.1e-2 at 2 columns): layer graphs 623-627 /
-  918-920 us against 587-588 / 886-887 us on patch 28 (window hyb). The first measurement of upstream's path ("decode
+  918-920 us against 587-588 / 886-887 us on patch 28. The first measurement of upstream's path ("decode
   +5% with the draft head", 26.1-26.3 vs 24.6-25.0 tok/s) was expert-I/O noise: io 22.6-23.2 vs 26.5-31.5 s per 2,500
   tokens in those runs, while its layer graphs were already slower. With `GGML_SYCL_Q8W=1 GGML_SYCL_Q8W_NCOLS=1` and
   19-21 gone, one column gives upstream's bits (16/16 matrices) and two columns patch 28's (16/16).
@@ -222,7 +222,7 @@ day (below).
   one-token matvec, stays (patch 22 builds on it; upstream has no equivalent).
 - **Data when adopted:** part of patches 12-15's "~300 fewer kernels per token", layer graphs -8% together.
 - **Why dropped:** llama.cpp added `GGML_OP_DSV4_HC_PRE` (#28901, SYCL #29132): the gated mean in one kernel, at any
-  step width. The engine emits it under `QWFN_HC_PRE_OP` (kept, on in the launcher). Window ops (served layout with
+  step width. The engine emits it under `QWFN_HC_PRE_OP` (kept, on in the launcher). Measured (served layout with
   the draft head): decode layer graphs identical to the fusion's (recurrent 587-588 vs 587 us, attention 886-887 vs
   885 us); prefill dense graphs on a 38K prompt 27.0 / 26.3 s against 31.5 / 28.0 s, since the op also replaces the
   prefill's sigmoid, multiply, copy, three adds and scale; `test-backend-ops` DSV4_HC_PRE 18/18.
