@@ -129,26 +129,26 @@ jobs:
           path: ${{ runner.home }}/src/llama-b70
           key: ${{ steps.llama.outputs.cache-primary-key }}
 
-      - name: Engine: configure + build (core, tools, server)
+      - name: "Engine: configure + build (core, tools, server)"
         env:
           LLAMA_DIR: ${{ runner.home }}/src/llama-b70
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DLLAMA_CPP_ROOT="$LLAMA_DIR" -DLLAMA_CPP_BUILD="$LLAMA_DIR/build-sycl/bin"
           cmake --build build -j "$(nproc)"
-      - name: Engine: run tests
+      - name: "Engine: run tests"
         run: |
           ctest --test-dir build --output-on-failure
 
       # The console (the terminal client, src/console/) is a separate frontend with its own build
       # flags (NO_MTP=ON); it is not part of the engine. Enable these steps when the console's
       # sources (currently in the dev tree on the B70 box) are merged into this repo.
-      - name: Console: build
+      - name: "Console: build"
         if: ${{ false }}
         run: |
           cmake -S . -B build-console -DNO_MTP=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build build-console -j "$(nproc)"
-      - name: Console: run tests
+      - name: "Console: run tests"
         if: ${{ false }}
         run: |
           ctest --test-dir build-console --output-on-failure
@@ -174,7 +174,7 @@ jobs:
 
       # llama.cpp source: upstream ggml-org master at $LLAMA_SHA (the CPU path needs no Intel GPU,
       # no SYCL) plus the SOA enum shim so the engine's sources compile (see the header comment).
-      - name: llama.cpp source (upstream, CPU: no SYCL, no Intel GPU)
+      - name: "llama.cpp source (upstream, CPU: no SYCL, no Intel GPU)"
         run: |
           git init -q "$HOME/llama.cpp"
           git -C "$HOME/llama.cpp" fetch -q --depth 1 https://github.com/ggml-org/llama.cpp "$LLAMA_SHA"
@@ -210,7 +210,7 @@ jobs:
       # the prebuilt libs from LLAMA_CPP_BUILD (no llama.cpp recompile), and
       # compiles all engine + tools sources with cl.exe (no liburing on Windows;
       # IO is threaded)
-      - name: Engine: configure + build (core, tools, server)
+      - name: "Engine: configure + build (core, tools, server)"
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DLLAMA_CPP_ROOT="$env:HOME/llama.cpp" -DLLAMA_CPP_BUILD="$env:HOME/llama.cpp/build/bin"
@@ -218,17 +218,17 @@ jobs:
       # ctest is the verification: test-io and files-test are the engine's own tests (no GPU). There
       # is no --help in qwfn_server.cpp (the arg is a model path), so a CLI smoke test is not possible
       # without a model; the binary's presence is implied by the build.
-      - name: Engine: run tests
+      - name: "Engine: run tests"
         run: |
           ctest --test-dir build --output-on-failure
 
       # Console steps skipped (same as Linux). Enable when console sources are merged into repo.
-      - name: Console: build
+      - name: "Console: build"
         if: ${{ false }}
         run: |
           cmake -S . -B build-console -G Ninja -DNO_MTP=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build build-console
-      - name: Console: run tests
+      - name: "Console: run tests"
         if: ${{ false }}
         run: |
           ctest --test-dir build-console --output-on-failure
