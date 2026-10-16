@@ -88,18 +88,20 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ runner.home }}/onednn-sycl
-          key: onednn-sycl-3.11.3-intel-oneapi-2026.2-v2
+          key: onednn-sycl-3.11.3-cpu-oneapi-2026.2-v3
       - name: oneDNN SYCL build (cache miss)
         if: steps.dnnl.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           source "$HOME/oneapi/setvars.sh" --force > /dev/null 2>&1
           git clone --depth 1 -b v3.11.3 https://github.com/uxlfoundation/oneDNN "$RUNNER_TEMP/oneDNN"
-          # GPU vendor INTEL: oneDNN defaults to NVIDIA SYCL kernels (needs CUDA on the
-          # runner, and GGML_SYCL_TARGET=INTEL wants Intel kernels - same as the box build).
+          # GPU_RUNTIME=NONE: the runner has no Intel GPU and apt's oneAPI lacks the offline
+          # Intel-GPU kernel generator, so compiling GPU kernels here is pointless - the API
+          # ggml-sycl's GGML_SYCL_DNN code uses (dnnl::sycl_interop, SYCL CPU runtime) is
+          # present. The GPU kernels stay on the box build.
           cmake -S "$RUNNER_TEMP/oneDNN" -B "$RUNNER_TEMP/oneDNN/build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
-            -DDNNL_CPU_RUNTIME=SYCL -DDNNL_GPU_RUNTIME=SYCL -DDNNL_GPU_VENDOR=INTEL \
+            -DDNNL_CPU_RUNTIME=SYCL -DDNNL_GPU_RUNTIME=NONE \
             -DCMAKE_INSTALL_PREFIX="$HOME/onednn-sycl"
           cmake --build "$RUNNER_TEMP/oneDNN/build" -j "$(nproc)"
           cmake --install "$RUNNER_TEMP/oneDNN/build"
@@ -202,8 +204,8 @@ jobs:
       - name: Build ggml + llama.cpp (cache miss)
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          cmake -S "$HOME/llama.cpp" -B "$HOME/llama.cpp/build" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF \
+          cmake -S "$HOME/llama.cpp" -B "$HOME/llama.cpp/build" -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF `
             -DGGML_OPENMP=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_BACKEND_DL=ON
           cmake --build "$HOME/llama.cpp/build"
       - uses: actions/cache/save@v5
