@@ -93,7 +93,7 @@ jobs:
         if: steps.dnnl.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          source "$HOME/oneapi/setvars.sh" --force > /dev/null 2>&1
+          source "$HOME/oneapi/setvars.sh" --force > /dev/null 2>&1 || true
           git clone --depth 1 -b v3.11.3 https://github.com/uxlfoundation/oneDNN "$RUNNER_TEMP/oneDNN"
           # GPU_RUNTIME=NONE: the runner has no Intel GPU and apt's oneAPI lacks the offline
           # Intel-GPU kernel generator, so compiling GPU kernels here is pointless - the API
@@ -221,7 +221,7 @@ jobs:
       - name: "Engine: configure + build (core, tools, server)"
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
-            -DLLAMA_CPP_ROOT="$env:HOME/llama.cpp" -DLLAMA_CPP_BUILD="$env:HOME/llama.cpp/build/bin"
+            -DLLAMA_CPP_ROOT="$HOME/llama.cpp" -DLLAMA_CPP_BUILD="$HOME/llama.cpp/build/bin"
           cmake --build build
       # ctest is the verification: test-io and files-test are the engine's own tests (no GPU). There
       # is no --help in qwfn_server.cpp (the arg is a model path), so a CLI smoke test is not possible

@@ -22,7 +22,7 @@ else
   cd "$DIR"
   [ "$(git rev-parse HEAD)" = $SHA ] || { echo "$DIR is not at $SHA"; exit 1; }
 fi
-set +u; source "$ONEAPI" --force >/dev/null 2>&1; set -u
+set +u; source "$ONEAPI" --force >/dev/null 2>&1 || true; set -u
 cmake -S . -B build-sycl -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
   -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL -DGGML_SYCL_F16=ON -DGGML_SYCL_DNN=ON -DGGML_SYCL_GRAPH=ON -DDNNL_DIR="$DNNL_DIR" \
   -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON -DLLAMA_CURL=OFF
