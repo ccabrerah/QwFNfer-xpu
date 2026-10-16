@@ -43,7 +43,11 @@ concurrency:
 env:
   # the release this run publishes: the pushed tag, or a manual run's tag input; empty for none
   RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
-  LLAMA_SHA: ca1426903fabe9af26cd10c42034cb4bbd2e0e11   # Unsloth's llama.cpp, mtp/qwen4exp-nextn (README, "Building from source")
+  # ggml-org/llama.cpp master at this commit: the tree docs/BUILDING.md names and scripts/b70/build-llama-sycl.sh
+  # fetches (keep in sync with that script). The engine's sources name the SOA types, so each job below
+  # applies .github/scripts/soa-enums.patch to the fetched tree (declaring the enums is all a CPU/CUDA
+  # build needs; the SOA layout is Intel-SYCL-only and env-gated at runtime). See ci.yml's header comment.
+  LLAMA_SHA: a0e6dc7384edb8f5d927155e1d26c10b4a310e6d
   CUDA_ARCHS: "75;80;86;89;90;120"                      # Turing to Blackwell; in the cache keys as sm75-120
   GGML_FLAGS: >-
     -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF
@@ -97,8 +101,9 @@ jobs:
       - name: llama.cpp source
         run: |
           git init -q "$HOME/llama.cpp"
-          git -C "$HOME/llama.cpp" fetch -q --depth 1 https://github.com/unslothai/llama.cpp "$LLAMA_SHA"
+          git -C "$HOME/llama.cpp" fetch -q --depth 1 https://github.com/ggml-org/llama.cpp "$LLAMA_SHA"
           git -C "$HOME/llama.cpp" checkout -q FETCH_HEAD
+          git -C "$HOME/llama.cpp" apply "$GITHUB_WORKSPACE/.github/scripts/soa-enums.patch"
       # restore and save are separate steps so the build is kept the moment it exists, even when a
       # later step fails (the combined action saves only at the end of a successful job)
       - name: Cached portable ggml build
@@ -168,8 +173,12 @@ jobs:
       - name: llama.cpp source
         run: |
           git init -q "$env:RUNNER_TEMP\llama.cpp"
-          git -C "$env:RUNNER_TEMP\llama.cpp" fetch -q --depth 1 https://github.com/unslothai/llama.cpp $env:LLAMA_SHA
+          git -C "$env:RUNNER_TEMP\llama.cpp" fetch -q --depth 1 https://github.com/ggml-org/llama.cpp $env:LLAMA_SHA
           git -C "$env:RUNNER_TEMP\llama.cpp" checkout -q FETCH_HEAD
+          # --ignore-whitespace: Windows runners check out with core.autocrlf=true (CRLF working
+          # tree), and this patch's context is LF
+          git -C "$env:RUNNER_TEMP\llama.cpp" apply --ignore-whitespace "$env:GITHUB_WORKSPACE\.github\scripts\soa-enums.patch"
+          if ($LASTEXITCODE) { exit 1 }
       - name: Cached portable ggml build
         id: ggml-cache
         uses: actions/cache/restore@v5

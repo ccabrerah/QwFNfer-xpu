@@ -1,0 +1,28 @@
+# The enum half of patches/ggml-sycl/09-q2_0-soa.patch, 17-iq4_nl-soa.patch and 31-q8_0-soa.patch.
+#
+# The engine's sources name GGML_TYPE_Q2_0_SOA, GGML_TYPE_IQ4_NL_SOA and GGML_TYPE_Q8_0_SOA
+# (src/qwfn_expert_cache.h, src/qwfn_expert_cache.cpp), so an unpatched ggml.h does not compile
+# them -- that is why a CI that fetches a vanilla tree fails at qwfn_expert_cache.h:423.
+#
+# The SOA layout itself is Intel-SYCL only (its kernels live in the patches), and the engine's SOA
+# staging is env-gated (QWFN_Q2_SOA, QWFN_IQ4_SOA, QWFN_Q8_SOA): with none of those set, no tensor
+# of these types is ever created, so libggml (which knows types only up to 43) never sees one.
+# Declaring the enums is all a CPU/CUDA build needs to compile; it is not a layout change.
+#
+# Apply with: git -C <tree> apply <this file>. The context is ggml-org/llama.cpp master
+# (a0e6dc7384edb8f5d927155e1d26c10b4a310e6d, the commit docs/BUILDING.md names), where the enum
+# ends Q1_0=41, Q2_0=42, GGML_TYPE_COUNT=43.
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -430,7 +430,10 @@
+         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
+         GGML_TYPE_Q1_0    = 41,
+         GGML_TYPE_Q2_0    = 42,
+-        GGML_TYPE_COUNT   = 43,
++        GGML_TYPE_Q2_0_SOA = 43, // q2_0, each 2-D slice as [codes][scales]; SYCL only, never in files
++        GGML_TYPE_IQ4_NL_SOA = 44, // iq4_nl, same shape, 128-code blocks; SYCL only, never in files
++        GGML_TYPE_Q8_0_SOA = 45, // q8_0, each 2-D slice as [codes][scales]; SYCL only, never in files
++        GGML_TYPE_COUNT   = 46,
+     };
+ 
+     // [TAG_GGML_PREC]
