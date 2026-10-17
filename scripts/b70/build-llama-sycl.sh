@@ -26,8 +26,13 @@ fi
 # 'source ... || true' cannot catch an exit from a sourced file: run it in a subshell
 # and re-export what it set.
 set +u; eval "$(ONEAPI="$ONEAPI" bash -c 'source "$ONEAPI" --force >/dev/null 2>&1; export')"; set -u
+# ggml-sycl links oneMKL (MKL::MKL_SYCL::BLAS) and its CMake does find_package(MKL REQUIRED).
+# The apt oneAPI does not register its cmake configs system-wide, so point MKL_DIR at the
+# version directory setvars installed (mkl/<ver>/lib/cmake/mkl on the box and in CI).
+MKL_DIR=${MKL_DIR:-$(find "$(dirname "$(dirname "$ONEAPI")")/mkl" -name MKLConfig.cmake -print -quit 2>/dev/null | xargs -r dirname)}
+[ -n "$MKL_DIR" ] && echo "MKL_DIR: $MKL_DIR" || { echo "MKLConfig.cmake not found under $(dirname "$(dirname "$ONEAPI")")/mkl" >&2; exit 1; }
 cmake -S . -B build-sycl -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
-  -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL -DGGML_SYCL_F16=ON -DGGML_SYCL_DNN=ON -DGGML_SYCL_GRAPH=ON -DDNNL_DIR="$DNNL_DIR" \
+  -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL -DGGML_SYCL_F16=ON -DGGML_SYCL_DNN=ON -DGGML_SYCL_GRAPH=ON -DDNNL_DIR="$DNNL_DIR" -DMKL_DIR="$MKL_DIR" \
   -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON -DLLAMA_CURL=OFF
 cmake --build build-sycl -j "$(nproc)" --target ggml llama test-backend-ops
 echo "built: $DIR/build-sycl/bin"
