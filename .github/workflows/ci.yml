@@ -62,7 +62,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: /home/runner/oneapi
-          key: oneapi-2026.2-v1
+          key: oneapi-2026.2-v2
       - name: Intel oneAPI install (cache miss)
         if: steps.oneapi.outputs.cache-hit != 'true'
         run: |
@@ -72,7 +72,9 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
             | sudo tee /etc/apt/sources.list.d/oneAPI.list
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends intel-oneapi-compiler-dpcpp-cpp intel-oneapi-mkl intel-oneapi-tbb
+          # mkl-devel (not just mkl): the apt mkl package is runtime-only, and ggml-sycl's
+          # find_package(MKL) needs the cmake config that mkl-devel ships (MKLConfig.cmake).
+          sudo apt-get install -y --no-install-recommends intel-oneapi-compiler-dpcpp-cpp intel-oneapi-mkl intel-oneapi-mkl-devel intel-oneapi-tbb
           sudo mkdir -p "$HOME/oneapi"
           sudo cp -a /opt/intel/oneapi/. "$HOME/oneapi/"
           sudo chown -R "$(id -u):$(id -g)" "$HOME/oneapi"
