@@ -4,27 +4,28 @@ name: ci
 # checks out such a branch when it works on this repo, and a push there runs the same checks)
 # and manual runs from the Actions tab.
 # Every push to master must build: core engine, overlay/finetune tools, server, console.
-# The Windows job builds the path the Windows bundle ships: upstream llama.cpp on the CPU.
 # The Linux job builds the production path: this repo's patched ggml tree (patches/ggml-sycl,
 # built by scripts/b70/build-llama-sycl.sh with Intel oneAPI + oneDNN SYCL) and the engine against
-# it. GitHub runners have no GPU, so both jobs build the GPU code paths and run the tests that do
+# it. GitHub runners have no GPU, so the job builds the GPU code paths and runs the tests that do
 # not need one (test-io, files-test); the GPU tests (test-backend-ops, vtest) stay on the B70 box.
+# There is no Windows job: the engine's sources use POSIX APIs (unistd.h, mmap) that MSVC has no
+# equivalent for - the Windows engine build needs a port first, and until then Windows CI would
+# only check ggml, which the release workflow covers.
 #
 # Engine sources need two things from the ggml headers, and a vanilla tree gives neither:
 #   1. GGML_TYPE_DSV4_*  -- upstream has them; this workflow pins the commit docs/BUILDING.md
 #      names (see LLAMA_SHA). The old pin (ca14269..., Unsloth 2026-09-18) predates them.
-#   2. GGML_TYPE_{Q2_0,IQ4_NL,Q8_0}_SOA -- only this repo's patches add them. The Windows and
-#      release builds take the enum half via .github/scripts/soa-enums.patch: declaring the types
-#      is all a CPU/CUDA build needs, since the SOA layout is Intel-SYCL-only and the engine's
-#      SOA staging is env-gated (QWFN_Q2_SOA/QWFN_IQ4_SOA/QWFN_Q8_SOA), so the unpatched libggml
-#      never sees those types. The Linux job builds the real patched tree.
+#   2. GGML_TYPE_{Q2_0,IQ4_NL,Q8_0}_SOA -- only this repo's patches add them. The release builds
+#      take the enum half via .github/scripts/soa-enums.patch: declaring the types is all a CPU/CUDA
+#      build needs, since the SOA layout is Intel-SYCL-only and the engine's SOA staging is env-gated
+#      (QWFN_Q2_SOA/QWFN_IQ4_SOA/QWFN_Q8_SOA), so the unpatched libggml never sees those types. The
+#      Linux job builds the real patched tree.
 #
 # Caching (actions/cache, per repo/branch, 10 GB cap, 7-day LRU eviction; GitHub-hosted runners
 # do all this work -- nothing runs on your machine):
 #   Linux: Intel oneAPI (~1.2 GB compressed), the oneDNN SYCL install, and the patched ggml tree
 #          + SYCL build, keyed on the pinned SHA and the hash of patches/ggml-sycl. A cold Linux
 #          job runs oneAPI install + oneDNN build + ggml SYCL build; a warm one restores all three.
-#   Windows: the ggml build, keyed on the pinned SHA and the hash of .github/scripts/soa-enums.patch.
 # Bump the -vN suffix in a key to force that cache to rebuild.
 on:
   push:
@@ -60,7 +61,7 @@ jobs:
         id: oneapi
         uses: actions/cache/restore@v5
         with:
-          path: ${{ runner.home }}/oneapi
+          path: /home/runner/oneapi
           key: oneapi-2026.2-v1
       - name: Intel oneAPI install (cache miss)
         if: steps.oneapi.outputs.cache-hit != 'true'
@@ -78,7 +79,7 @@ jobs:
       - uses: actions/cache/save@v5
         if: steps.oneapi.outputs.cache-hit != 'true'
         with:
-          path: ${{ runner.home }}/oneapi
+          path: /home/runner/oneapi
           key: ${{ steps.oneapi.outputs.cache-primary-key }}
 
       # oneDNN with the SYCL runtimes, docs/BUILDING.md's recipe, installed (and cached) under the
@@ -87,13 +88,16 @@ jobs:
         id: dnnl
         uses: actions/cache/restore@v5
         with:
-          path: ${{ runner.home }}/onednn-sycl
-          key: onednn-sycl-3.11.3-cpu-oneapi-2026.2-v3
+          path: /home/runner/onednn-sycl
+          key: onednn-sycl-3.11.3-cpu-oneapi-2026.2-v4
       - name: oneDNN SYCL build (cache miss)
         if: steps.dnnl.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          source "$HOME/oneapi/setvars.sh" --force > /dev/null 2>&1 || true
+          # setvars.sh exits (killing the step's bash -e shell) on some component probes, and
+          # 'source ... || true' cannot catch an exit from a sourced file. Source it in a
+          # subshell and re-export what it set.
+          eval "$(ONEAPI="$HOME/oneapi/setvars.sh" bash -c 'source "$ONEAPI" --force >/dev/null 2>&1; export')"
           git clone --depth 1 -b v3.11.3 https://github.com/uxlfoundation/oneDNN "$RUNNER_TEMP/oneDNN"
           # GPU_RUNTIME=NONE: the runner has no Intel GPU and apt's oneAPI lacks the offline
           # Intel-GPU kernel generator, so compiling GPU kernels here is pointless - the API
@@ -108,7 +112,7 @@ jobs:
       - uses: actions/cache/save@v5
         if: steps.dnnl.outputs.cache-hit != 'true'
         with:
-          path: ${{ runner.home }}/onednn-sycl
+          path: /home/runner/onednn-sycl
           key: ${{ steps.dnnl.outputs.cache-primary-key }}
 
       # The production ggml tree: scripts/b70/build-llama-sycl.sh fetches $LLAMA_SHA, applies every
@@ -119,23 +123,23 @@ jobs:
         id: llama
         uses: actions/cache/restore@v5
         with:
-          path: ${{ runner.home }}/src/llama-b70
-          key: llama-v3-${{ env.LLAMA_SHA }}-sycl-${{ hashFiles('patches/ggml-sycl/*.patch') }}-v1
+          path: /home/runner/src/llama-b70
+          key: llama-v3-${{ env.LLAMA_SHA }}-sycl-${{ hashFiles('patches/ggml-sycl/*.patch') }}-v2
       - name: Patched ggml tree + SYCL build (scripts/b70/build-llama-sycl.sh, cache miss)
         if: steps.llama.outputs.cache-hit != 'true'
         env:
-          ONEAPI: ${{ runner.home }}/oneapi/setvars.sh
-          DNNL_DIR: ${{ runner.home }}/onednn-sycl/lib/cmake/dnnl
+          ONEAPI: /home/runner/oneapi/setvars.sh
+          DNNL_DIR: /home/runner/onednn-sycl/lib/cmake/dnnl
         run: scripts/b70/build-llama-sycl.sh "$HOME/src/llama-b70"
       - uses: actions/cache/save@v5
         if: steps.llama.outputs.cache-hit != 'true'
         with:
-          path: ${{ runner.home }}/src/llama-b70
+          path: /home/runner/src/llama-b70
           key: ${{ steps.llama.outputs.cache-primary-key }}
 
       - name: "Engine: configure + build (core, tools, server)"
         env:
-          LLAMA_DIR: ${{ runner.home }}/src/llama-b70
+          LLAMA_DIR: /home/runner/src/llama-b70
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DLLAMA_CPP_ROOT="$LLAMA_DIR" -DLLAMA_CPP_BUILD="$LLAMA_DIR/build-sycl/bin"
@@ -152,90 +156,6 @@ jobs:
         run: |
           cmake -S . -B build-console -DNO_MTP=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build build-console -j "$(nproc)"
-      - name: "Console: run tests"
-        if: ${{ false }}
-        run: |
-          ctest --test-dir build-console --output-on-failure
-
-  windows:
-    name: windows-x86_64
-    runs-on: windows-2022
-    timeout-minutes: 90
-
-    steps:
-      - uses: actions/checkout@v6
-
-      # MSVC environment for all bash steps (vcvars all: cl, link, lib, rc, mt, cl.exe in PATH)
-      - uses: ./.github/actions/windows-msvc-env
-        id: msvc-env
-
-      # cmake + ninja on PATH (both ship on the runner image, but not on PATH by default)
-      - name: CMake + Ninja
-        run: |
-          choco install ninja -y --no-progress
-          cmake --version
-          ninja --version
-
-      # llama.cpp source: upstream ggml-org master at $LLAMA_SHA (the CPU path needs no Intel GPU,
-      # no SYCL) plus the SOA enum shim so the engine's sources compile (see the header comment).
-      - name: "llama.cpp source (upstream, CPU: no SYCL, no Intel GPU)"
-        run: |
-          git init -q "$HOME/llama.cpp"
-          git -C "$HOME/llama.cpp" config core.autocrlf false
-          git -C "$HOME/llama.cpp" fetch -q --depth 1 https://github.com/ggml-org/llama.cpp "$env:LLAMA_SHA"
-          git -C "$HOME/llama.cpp" checkout -q FETCH_HEAD
-          # Windows runners check out the repo with core.autocrlf=true: the patch file arrives
-          # CRLF while the fetched tree is LF (autocrlf off above). Normalize, then apply.
-          $p = "$env:GITHUB_WORKSPACE\.github\scripts\soa-enums.patch"
-          (Get-Content $p -Raw) -replace "`r`n", "`n" | Set-Content -NoNewline -Encoding UTF8 $p
-          git -C "$HOME/llama.cpp" apply "$p"
-          if ($LASTEXITCODE) { exit 1 }
-
-      # Cached ggml + llama build (CPU-only, Release, shared libs, all x86 CPU variants; upstream's
-      # GGML_CPU_ALL_VARIANTS requires GGML_BACKEND_DL, the dll/dl backends loaded at runtime).
-      # Restore and save are separate steps so the build is kept the moment it exists, even when a
-      # later step fails (the combined action saves only at the end of a successful job).
-      - name: Cached ggml build
-        id: ggml-cache
-        uses: actions/cache/restore@v5
-        with:
-          path: ~/llama.cpp/build
-          key: llama-v3-${{ env.LLAMA_SHA }}-soa-${{ hashFiles('.github/scripts/soa-enums.patch') }}-cpu-release-dl-msvc${{ steps.msvc-env.outputs.msvc-version }}
-      - name: Build ggml + llama.cpp (cache miss)
-        if: steps.ggml-cache.outputs.cache-hit != 'true'
-        run: |
-          cmake -S "$HOME/llama.cpp" -B "$HOME/llama.cpp/build" -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF `
-            -DGGML_OPENMP=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_BACKEND_DL=ON
-          cmake --build "$HOME/llama.cpp/build"
-      - uses: actions/cache/save@v5
-        if: steps.ggml-cache.outputs.cache-hit != 'true'
-        with:
-          path: ~/llama.cpp/build
-          key: ${{ steps.ggml-cache.outputs.cache-primary-key }}
-
-      # Engine build: CMakeLists resolves headers from LLAMA_CPP_ROOT, links against
-      # the prebuilt libs from LLAMA_CPP_BUILD (no llama.cpp recompile), and
-      # compiles all engine + tools sources with cl.exe (no liburing on Windows;
-      # IO is threaded)
-      - name: "Engine: configure + build (core, tools, server)"
-        run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
-            -DLLAMA_CPP_ROOT="$HOME/llama.cpp" -DLLAMA_CPP_BUILD="$HOME/llama.cpp/build/bin"
-          cmake --build build
-      # ctest is the verification: test-io and files-test are the engine's own tests (no GPU). There
-      # is no --help in qwfn_server.cpp (the arg is a model path), so a CLI smoke test is not possible
-      # without a model; the binary's presence is implied by the build.
-      - name: "Engine: run tests"
-        run: |
-          ctest --test-dir build --output-on-failure
-
-      # Console steps skipped (same as Linux). Enable when console sources are merged into repo.
-      - name: "Console: build"
-        if: ${{ false }}
-        run: |
-          cmake -S . -B build-console -G Ninja -DNO_MTP=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-console
       - name: "Console: run tests"
         if: ${{ false }}
         run: |
