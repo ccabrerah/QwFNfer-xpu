@@ -89,7 +89,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: /home/runner/onednn-sycl
-          key: onednn-sycl-3.11.3-cpu-oneapi-2026.2-v4
+          key: onednn-sycl-3.11.3-sycl-oneapi-2026.2-v5
       - name: oneDNN SYCL build (cache miss)
         if: steps.dnnl.outputs.cache-hit != 'true'
         run: |
@@ -99,13 +99,14 @@ jobs:
           # subshell and re-export what it set.
           eval "$(ONEAPI="$HOME/oneapi/setvars.sh" bash -c 'source "$ONEAPI" --force >/dev/null 2>&1; export')"
           git clone --depth 1 -b v3.11.3 https://github.com/uxlfoundation/oneDNN "$RUNNER_TEMP/oneDNN"
-          # GPU_RUNTIME=NONE: the runner has no Intel GPU and apt's oneAPI lacks the offline
-          # Intel-GPU kernel generator, so compiling GPU kernels here is pointless - the API
-          # ggml-sycl's GGML_SYCL_DNN code uses (dnnl::sycl_interop, SYCL CPU runtime) is
-          # present. The GPU kernels stay on the box build.
+          # oneDNN's CMake hard-requires GPU runtime SYCL when CPU runtime is SYCL, so the GPU
+          # kernels compile here too: the apt oneAPI has igc, the same compiler the box runs.
+          # The runner has no GPU, which is fine - the kernels only compile, and the build
+          # takes a long time (hence the 240-minute timeout). Vendor is pinned to Intel: the
+          # default (NVIDIA) would need the CUDA toolkit.
           cmake -S "$RUNNER_TEMP/oneDNN" -B "$RUNNER_TEMP/oneDNN/build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
-            -DDNNL_CPU_RUNTIME=SYCL -DDNNL_GPU_RUNTIME=NONE \
+            -DDNNL_CPU_RUNTIME=SYCL -DDNNL_GPU_RUNTIME=SYCL -DDNNL_GPU_VENDOR=INTEL \
             -DCMAKE_INSTALL_PREFIX="$HOME/onednn-sycl"
           cmake --build "$RUNNER_TEMP/oneDNN/build" -j "$(nproc)"
           cmake --install "$RUNNER_TEMP/oneDNN/build"
