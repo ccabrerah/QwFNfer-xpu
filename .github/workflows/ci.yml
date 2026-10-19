@@ -144,12 +144,22 @@ jobs:
         env:
           LLAMA_DIR: /home/runner/src/llama-b70
         run: |
+          # The engine links the icx-built ggml shared libs, which drag in Intel runtime libs
+          # (libiomp5, libsvml, libirng, ...) from the oneAPI compiler lib dir. The system g++
+          # linker does not search there, so add it to LDFLAGS (and to the rpath for ctest).
+          IRL=$(ls -d "$HOME/oneapi/compiler/"*/lib | head -1)
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DLLAMA_CPP_ROOT="$LLAMA_DIR" -DLLAMA_CPP_BUILD="$LLAMA_DIR/build-sycl/bin"
+            -DLLAMA_CPP_ROOT="$LLAMA_DIR" -DLLAMA_CPP_BUILD="$LLAMA_DIR/build-sycl/bin" \
+            -DCMAKE_EXE_LINKER_FLAGS="-L$IRL -Wl,-rpath,$IRL"
           cmake --build build -j "$(nproc)"
       - name: "Engine: run tests"
+        env:
+          LLAMA_DIR: /home/runner/src/llama-b70
         run: |
-          ctest --test-dir build --output-on-failure
+          # ggml's shared libs need the Intel runtime libs at run time too (RUNPATH is not
+          # transitive), so put the oneAPI compiler lib dir on the loader path for ctest.
+          IRL=$(ls -d "$HOME/oneapi/compiler/"*/lib | head -1)
+          LD_LIBRARY_PATH="$IRL:$LLAMA_DIR/build-sycl/bin" ctest --test-dir build --output-on-failure
 
       # The console (the terminal client, src/console/) is a separate frontend with its own build
       # flags (NO_MTP=ON); it is not part of the engine. Enable these steps when the console's
