@@ -248,7 +248,11 @@ qwfn_opts(qwfn-gen)
 # Prompt-lookup drafter and policy: unit tests and an offline simulation (no model, no device).
 add_executable(qwfn-lookup-test tools/qwfn_lookup_test.cpp src/qwfn_lookup.cpp)
 target_include_directories(qwfn-lookup-test PRIVATE src)
-target_compile_options(qwfn-lookup-test PRIVATE -O2 -Wall -Wextra)
+if(MSVC)
+  target_compile_options(qwfn-lookup-test PRIVATE /O2 /W4)
+else()
+  target_compile_options(qwfn-lookup-test PRIVATE -O2 -Wall -Wextra)
+endif()
 
 add_executable(qwfn-train-predictor tools/qwfn_train_predictor.cpp)
 target_link_libraries(qwfn-train-predictor PRIVATE qwfn_core)
