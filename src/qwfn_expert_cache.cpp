@@ -7,8 +7,11 @@
 #include <chrono>
 #include <cstring>
 #include <thread>
+#ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
+#endif
+#include "qwfn_platform.h"
 
 namespace qwfn {
 
@@ -16,6 +19,34 @@ namespace {
 inline uint64_t xorshift(uint64_t & s) {
     s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s;
 }
+
+// The diagnostic read-backs (check_swap, tier_check) compare against the file through positioned
+// reads, so the fd must not move a shared file offset: pread on POSIX, and on Windows a
+// CreateFileW handle read with an OVERLAPPED offset (atomic the same way). The handle rides in
+// the int slot through intptr_t.
+#ifdef _WIN32
+#include <windows.h>
+int open_ro(const char * path) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
+    std::wstring w((size_t) n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, w.data(), n);
+    HANDLE h = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    return (int) (intptr_t) h;
+}
+ssize_t pread(int fd, void * buf, size_t n, off_t off) {
+    OVERLAPPED ov = {};
+    ov.Offset = (DWORD) off; ov.OffsetHigh = (DWORD) (off >> 32);
+    DWORD got = 0;
+    if (!ReadFile((HANDLE) (intptr_t) fd, buf, (DWORD) n, &got, &ov)) return -1;
+    return (ssize_t) got;
+}
+void close_fd(int fd) { CloseHandle((HANDLE) (intptr_t) fd); }
+#else
+int open_ro(const char * path) { return ::open(path, O_RDONLY); }
+ssize_t pread(int fd, void * buf, size_t n, off_t off) { return ::pread(fd, buf, n, off); }
+void close_fd(int fd) { ::close(fd); }
+#endif
 constexpr uint16_t SLOT_EMPTY = 0xFFFF;
 
 // Every VRAM tier allocation goes through here. The sizing below backs off until an
@@ -524,7 +555,7 @@ void expert_cache::check_swap(const pending_swap & sw) {
         static std::vector<int> fds;
         static uint64_t checked = 0, bad = 0;
         const auto & paths = hot_->shard_paths();
-        if (fds.empty()) for (const auto & path : paths) fds.push_back(::open(path.c_str(), O_RDONLY));
+        if (fds.empty()) for (const auto & path : paths) fds.push_back(open_ro(path.c_str()));
         std::vector<uint8_t> blk(lp.block_bytes), file;
         memcpy(blk.data(), slot_ptr(lp, (uint32_t) sw.to), lp.block_bytes);
         soa_to_file(lp, blk.data());
@@ -1537,7 +1568,7 @@ void expert_cache::tier_check(const char * when) {
     settle_promotions();
     uint64_t n = 0, bad = 0;
     std::vector<int> fds;
-    for (const auto & path : hot_->shard_paths()) fds.push_back(::open(path.c_str(), O_RDONLY));
+    for (const auto & path : hot_->shard_paths()) fds.push_back(open_ro(path.c_str()));
     std::vector<uint8_t> file;
     for (uint32_t il = 0; il < blk_.size(); il++) {
         layer_pool & lp = blk_[il];
@@ -1564,7 +1595,7 @@ void expert_cache::tier_check(const char * when) {
             n++; if (!ok) bad++;
         }
     }
-    for (int fd : fds) ::close(fd);
+    for (int fd : fds) close_fd(fd);
     fprintf(stderr, "[qwfn] tier check (%s): %llu VRAM experts compared with the file, %llu WRONG\n", when, (unsigned long long) n, (unsigned long long) bad);
 }
 
