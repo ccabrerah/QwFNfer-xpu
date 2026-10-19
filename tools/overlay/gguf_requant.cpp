@@ -28,6 +28,15 @@
 // same calls are a CreateFileW handle ridden in the int and ReadFile with an OVERLAPPED offset.
 #ifdef _WIN32
 #include <windows.h>
+// MSVC's <stdio.h> supplies both, guarded; declare them the same way when it has not.
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED
+using ssize_t = __int64;
+#endif
+#ifndef _OFF_T_DEFINED
+#define _OFF_T_DEFINED
+using off_t = __int64;
+#endif
 static int open_ro(const char * path) {
     int n = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
     std::wstring w((size_t) n, 0);
