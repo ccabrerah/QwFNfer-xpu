@@ -180,8 +180,11 @@ jobs:
           # the engine names the SOA types; a CUDA build needs the enum declarations only. The
           # checkout is CRLF on this runner, so strip carriage returns the same way the Linux
           # job's git-apply does.
+          # write to a file and apply it: piping a string to a native command in PowerShell
+          # encodes it as UTF-16, which git apply rejects.
           $patch = (Get-Content "$env:GITHUB_WORKSPACE\.github\scripts\soa-enums.patch" -Raw) -replace "`r", ""
-          $patch | git -C "$env:RUNNER_TEMP\llama.cpp" apply -
+          [IO.File]::WriteAllText("$env:RUNNER_TEMP\soa-enums.patch", $patch, (New-Object Text.UTF8Encoding $false))
+          git -C "$env:RUNNER_TEMP\llama.cpp" apply "$env:RUNNER_TEMP\soa-enums.patch"
           if ($LASTEXITCODE) { exit 1 }
       - name: Cached portable ggml build
         id: ggml-cache
