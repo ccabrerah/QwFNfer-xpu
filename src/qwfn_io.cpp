@@ -48,6 +48,39 @@ void * dio_alloc(size_t bytes) {
 
 void dio_free(void * p) { _aligned_free(p); }
 
+// --- host blocks ------------------------------------------------------------
+// The Windows side of the pinned-RAM tier. VirtualLock pins exactly, so unlike the
+// POSIX side there is no VmLck probe and no success-measured-not-assumed note; and
+// there is no Level Zero here, so the import step is skipped (imported stays false).
+bool host_lock_requested() {
+    static const bool on = [] { const char * e = getenv("QWFN_LOCK_HOST"); return e && *e && strcmp(e, "0") != 0; }();
+    return on;
+}
+
+bool host_block_alloc(host_block & b, size_t bytes, const char * what, bool huge_pages) {
+    const size_t align = huge_pages ? (2u << 20) : 4096u;
+    const size_t sz = (bytes + align - 1) / align * align;
+    void * p = VirtualAlloc(nullptr, sz, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!p) {
+        fprintf(stderr, "[qwfn] %s: %.2f GB of host memory unavailable (VirtualAlloc)\n", what, sz / 1e9);
+        return false;
+    }
+    if (huge_pages) VirtualAlloc(p, 0, MEM_LARGE_PAGES, PAGE_READWRITE);   // best effort, like madvise
+    b = host_block{};
+    b.p = p; b.bytes = sz;
+    b.locked = VirtualLock(p, sz) == sz;
+    fprintf(stderr, "[qwfn] %s: %.2f GB anonymous host memory, %s%s\n", what, sz / 1e9, b.locked ? "locked" : "NOT locked (VirtualLock)",
+            huge_pages ? ", large pages requested" : "");
+    return true;
+}
+
+void host_block_free(host_block & b) {
+    if (!b.p) return;
+    VirtualUnlock(b.p, b.bytes);
+    VirtualFree(b.p, 0, MEM_RELEASE);
+    b = host_block{};
+}
+
 // --- available memory ------------------------------------------------------
 // GlobalMemoryStatusEx's ullAvailPhys is the Windows analogue of
 // MemAvailable: what can be handed out without swapping to the pagefile.

@@ -1440,7 +1440,12 @@ int main(int argc, char ** argv) {
         }
         // The pool is ordinary host memory next to the pinned RAM tier; leave the
         // system some room rather than find out under the OOM killer.
+#ifdef _WIN32
+        MEMORYSTATUSEX msx; msx.dwLength = sizeof(msx); GlobalMemoryStatusEx(&msx);
+        const double phys = (double) msx.ullTotalPhys;
+#else
         const double phys = (double) sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE);
+#endif
         const double want = (double) cfg.ram_bytes + prefix_cache_gb * 1e9 + 4e9;
         if (want > phys) {
             fprintf(stderr, "--prefix-cache %.1f: with --ram %.1f it leaves less than 4 GB of the %.1f GB of RAM\n",
