@@ -297,8 +297,17 @@ int main(int argc, char ** argv) {
     if (!replay.empty()) n_gen = std::min<int>(n_gen, (int) replay.size());
     const auto t0 = std::chrono::steady_clock::now();
     double nll_sum = 0.0; int nll_n = 0;
+    // QWFN_HASH_DECODE=1 (diagnostic): FNV-1a over the bytes of every scored position's logits, in order. Two runs of
+    // the same replay agree bit for bit exactly when every logit of every position does (a kernel change that claims
+    // to be exact is checked against it).
+    static const bool hash_decode = getenv("QWFN_HASH_DECODE") != nullptr;
+    uint64_t logits_hash = 1469598103934665603ull;
     auto argmax = [&](const float * l) { return qwfn_argmax(l, eng.n_vocab()); };
     auto score  = [&](const float * l, int32_t tok) {   // -log softmax(l)[tok]
+        if (hash_decode) {
+            const unsigned char * b = (const unsigned char *) l;
+            for (size_t k = 0; k < (size_t) eng.n_vocab() * sizeof(float); k++) { logits_hash ^= b[k]; logits_hash *= 1099511628211ull; }
+        }
         float mx = l[0]; for (int64_t v = 1; v < eng.n_vocab(); v++) mx = std::max(mx, l[v]);
         double z = 0.0; for (int64_t v = 0; v < eng.n_vocab(); v++) z += std::exp((double) l[v] - mx);
         const double v = -((double) l[tok] - mx - std::log(z));
@@ -471,6 +480,7 @@ int main(int argc, char ** argv) {
         else fprintf(stderr, "cannot write %s\n", save_replay.c_str());
     }
     if (nll_n) printf("replay NLL: %.4f per token (ppl %.2f) over %d tokens\n", nll_sum / nll_n, std::exp(nll_sum / nll_n), nll_n);
+    if (hash_decode && nll_n) printf("decode logits hash: %016llx over %d positions\n", (unsigned long long) logits_hash, nll_n);
     if (eng.n_exp_skipped) printf("skipped experts: %llu (misses computed without)\n", (unsigned long long) eng.n_exp_skipped);
     if (eng.n_spec_l0) printf("layer-0 speculation: %llu calls, %.2f ms each\n", (unsigned long long) eng.n_spec_l0, 1e3 * eng.t_spec_l0 / eng.n_spec_l0);
     if (eng.t_mtp_pre + eng.t_mtp_moe + eng.t_mtp_post > 0)
