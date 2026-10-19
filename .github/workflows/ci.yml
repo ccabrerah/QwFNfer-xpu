@@ -8,9 +8,9 @@ name: ci
 # built by scripts/b70/build-llama-sycl.sh with Intel oneAPI + oneDNN SYCL) and the engine against
 # it. GitHub runners have no GPU, so the job builds the GPU code paths and runs the tests that do
 # not need one (test-io, files-test); the GPU tests (test-backend-ops, vtest) stay on the B70 box.
-# There is no Windows job: the engine's sources use POSIX APIs (unistd.h, mmap) that MSVC has no
-# equivalent for - the Windows engine build needs a port first, and until then Windows CI would
-# only check ggml, which the release workflow covers.
+# The Windows job (windows-2022, MSVC) builds the engine against the same pinned tree with the
+# CPU backend (the engine's Windows port - file mappings, unbuffered overlapped reads - is in the
+# sources) and runs the same checks: io tests, the synthetic-model tools, the console smoke test.
 #
 # Engine sources need two things from the ggml headers, and a vanilla tree gives neither:
 #   1. GGML_TYPE_DSV4_*  -- upstream has them; this workflow pins the commit docs/BUILDING.md
@@ -26,7 +26,7 @@ name: ci
 #   Linux: Intel oneAPI (~1.2 GB compressed), the oneDNN SYCL install, and the patched ggml tree
 #          + SYCL build, keyed on the pinned SHA and the hash of patches/ggml-sycl. A cold Linux
 #          job runs oneAPI install + oneDNN build + ggml SYCL build; a warm one restores all three.
-# Bump the -vN suffix in a key to force that cache to rebuild.
+  # Bump the -vN suffix in a key to force that cache to rebuild.
 on:
   push:
     branches: [master, "claude/**"]
@@ -39,6 +39,11 @@ env:
   # tree: the CPU/CUDA paths compile, link and run; only the Intel GPU kernels (patches/ggml-sycl)
   # stay out, and the Linux job gets them with the patch set.
   LLAMA_SHA: a0e6dc7384edb8f5d927155e1d26c10b4a310e6d
+  # The pinned tree, CPU/CUDA only: same flags for both jobs (the Windows job's). -DGGML_NATIVE=OFF
+  # keeps the build portable across runners.
+  LLAMA_CPU_FLAGS: >-
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF
+    -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF
 
 jobs:
   linux:
@@ -173,3 +178,96 @@ jobs:
         if: ${{ false }}
         run: |
           ctest --test-dir build-console --output-on-failure
+
+  windows:
+    name: windows-x86_64
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/windows-msvc-env
+      - name: Ninja
+        run: choco install ninja -y --no-progress
+      - name: llama.cpp source
+        run: |
+          git init -q "$env:RUNNER_TEMP\llama.cpp"
+          git -C "$env:RUNNER_TEMP\llama.cpp" fetch -q --depth 1 https://github.com/ggml-org/llama.cpp $env:LLAMA_SHA
+          git -C "$env:RUNNER_TEMP\llama.cpp" checkout -q FETCH_HEAD
+      - name: "Pinned tree: SOA enum declarations (soa-enums.patch)"
+        run: |
+          # the engine names the SOA types; a CPU build needs the enum declarations only. The
+          # checkout is CRLF on this runner, so strip carriage returns the same way the Linux
+          # job's git-apply does (a CRLF patch against a CRLF tree is not always a clean apply).
+          $patch = (Get-Content "$env:GITHUB_WORKSPACE\.github\scripts\soa-enums.patch" -Raw) -replace "`r", ""
+          $patch | git -C "$env:RUNNER_TEMP\llama.cpp" apply -
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Cached llama.cpp CPU build
+        id: llama-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ${{ runner.temp }}\llama-cpu\bin
+            ${{ runner.temp }}\llama-cpu\ggml\src\*.lib
+            ${{ runner.temp }}\llama-cpu\src\*.lib
+          key: ci-windows-llama-cpu-${{ env.LLAMA_SHA }}-v1
+      - name: llama.cpp CPU build (MSVC)
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        run: |
+          $flags = $env:LLAMA_CPU_FLAGS -split ' '
+          cmake -S "$env:RUNNER_TEMP\llama.cpp" -B "$env:RUNNER_TEMP\llama-cpu" -G Ninja @flags
+          if ($LASTEXITCODE) { exit 1 }
+          cmake --build "$env:RUNNER_TEMP\llama-cpu"
+          if ($LASTEXITCODE) { exit 1 }
+      - uses: actions/cache/save@v5
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ${{ runner.temp }}\llama-cpu\bin
+            ${{ runner.temp }}\llama-cpu\ggml\src\*.lib
+            ${{ runner.temp }}\llama-cpu\src\*.lib
+          key: ${{ steps.llama-cache.outputs.cache-primary-key }}
+      - name: Engine (MSVC)
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DLLAMA_CPP_ROOT=$env:RUNNER_TEMP\llama.cpp" "-DLLAMA_CPP_BUILD=$env:RUNNER_TEMP\llama-cpu\bin"
+          if ($LASTEXITCODE) { exit 1 }
+          cmake --build build
+          if ($LASTEXITCODE) { exit 1 }
+      - name: io tests (unbuffered overlapped reads on NTFS)
+        run: |
+          ctest --test-dir build --output-on-failure
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Synthetic model through the tools
+        run: |
+          python tools\make_synth_gguf.py synth.gguf
+          if ($LASTEXITCODE) { exit 1 }
+          build\qwfn-inspect.exe synth.gguf
+          if ($LASTEXITCODE) { exit 1 }
+          build\qwfn-iobench.exe synth.gguf --tokens 8 --ram 2
+          if ($LASTEXITCODE) { "qwfn-iobench exited with $LASTEXITCODE"; exit 1 }
+          $out = (cmd /c "build\qwfn-iobench.exe synth.gguf --tokens 8 --ram 1 2>&1") -join "`n"
+          if ($LASTEXITCODE -or $out -notmatch 'less than 1 GB') { $out; "qwfn-iobench with a refused RAM tier exited with $LASTEXITCODE"; exit 1 }
+          $out = (cmd /c "build\qwfn-server.exe 2>&1") -join "`n"
+          if ($out -notmatch 'usage: qwfn-server') { $out; throw 'qwfn-server does not start (missing DLL?)' }
+          # the usage exits 1, and the runner's wrapper ends the step with `exit $LASTEXITCODE`
+          exit 0
+      - name: Tiny model, the engine against llama.cpp
+        # no ~/.unsloth tree here: the tools take the ggml backends staged next to them
+        run: |
+          python .github\scripts\tiny_model_check.py build $env:RUNNER_TEMP
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Console API over a model cache
+        run: |
+          python -m py_compile tools\qwfn_console.py tools\qwfn_router.py tools\make_synth_gguf.py
+          if ($LASTEXITCODE) { exit 1 }
+          python .github\scripts\console_units.py
+          if ($LASTEXITCODE) { exit 1 }
+          $snap = "$env:RUNNER_TEMP\hf\models--unsloth--Qwen3.8-Flash-Next-GGUF\snapshots\0000000\UD-Q4_K_XL"
+          New-Item -ItemType Directory -Force $snap | Out-Null
+          Copy-Item synth.gguf "$snap\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00001.gguf"
+          $env:HF_HUB_CACHE = "$env:RUNNER_TEMP\hf"
+          $console = Start-Process python -ArgumentList 'tools\qwfn_console.py', '--port', '18090' -PassThru -NoNewWindow -RedirectStandardOutput console.log -RedirectStandardError console.err
+          python .github\scripts\console_smoke.py 18090
+          $rc = $LASTEXITCODE
+          Stop-Process -Id $console.Id -Force -ErrorAction SilentlyContinue
+          if ($rc) { Get-Content console.log, console.err; exit 1 }

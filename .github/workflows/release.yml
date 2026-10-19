@@ -1,7 +1,5 @@
-# The release bundle, built here: dist/qwfnfer-linux-x86_64-cuda.zip (scripts/package.sh),
-# x86_64 with NVIDIA CUDA. There is no Windows bundle: the engine's sources use POSIX APIs
-# (unistd.h, sys/mman.h in the weights loader and IO) that MSVC has no equivalent for, so the
-# Windows bundle needs a port of those files first.
+# The release bundles, built here: dist/qwfnfer-linux-x86_64-cuda.zip (scripts/package.sh) and
+# dist\qwfnfer-windows-x86_64-cuda.zip (scripts/package.ps1), both x86_64 with NVIDIA CUDA.
 #
 #   push a tag v*                      -> the zip is built and attached to the tag's release,
 #                                         which is created if it does not exist (a prerelease when
@@ -154,8 +152,87 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+  windows:
+    name: windows-x86_64-cuda
+    runs-on: windows-2022
+    timeout-minutes: 330
+    steps:
+      - name: Release tag
+        if: env.RELEASE_TAG != ''
+        shell: bash
+        run: |
+          echo "release $RELEASE_TAG"
+          echo "$RELEASE_TAG" | grep -Eq '^v[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.]+)?$' || { echo "not a release tag: $RELEASE_TAG" >&2; exit 1; }
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/windows-setup-cuda
+      - uses: ./.github/actions/windows-msvc-env
+      - name: Ninja
+        run: choco install ninja -y --no-progress
+      - name: llama.cpp source
+        run: |
+          git init -q "$env:RUNNER_TEMP\llama.cpp"
+          git -C "$env:RUNNER_TEMP\llama.cpp" fetch -q --depth 1 https://github.com/ggml-org/llama.cpp $env:LLAMA_SHA
+          git -C "$env:RUNNER_TEMP\llama.cpp" checkout -q FETCH_HEAD
+      - name: "Pinned tree: SOA enum declarations (soa-enums.patch)"
+        run: |
+          # the engine names the SOA types; a CUDA build needs the enum declarations only. The
+          # checkout is CRLF on this runner, so strip carriage returns the same way the Linux
+          # job's git-apply does.
+          $patch = (Get-Content "$env:GITHUB_WORKSPACE\.github\scripts\soa-enums.patch" -Raw) -replace "`r", ""
+          $patch | git -C "$env:RUNNER_TEMP\llama.cpp" apply -
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Cached portable ggml build
+        id: ggml-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ${{ runner.temp }}\ggml-build\bin
+            ${{ runner.temp }}\ggml-build\ggml\src\*.lib
+            ${{ runner.temp }}\ggml-build\src\*.lib
+          key: release-windows-ggml-${{ env.LLAMA_SHA }}-cuda13.4-sm75-120-v2
+      - name: Portable ggml build (scripts\package.ps1's header)
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        run: |
+          $flags = $env:GGML_FLAGS -split ' '
+          cmake -S "$env:RUNNER_TEMP\llama.cpp" -B "$env:RUNNER_TEMP\ggml-build" -G Ninja @flags "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS"
+          if ($LASTEXITCODE) { exit 1 }
+          cmake --build "$env:RUNNER_TEMP\ggml-build"
+          if ($LASTEXITCODE) { exit 1 }
+      - uses: actions/cache/save@v5
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ${{ runner.temp }}\ggml-build\bin
+            ${{ runner.temp }}\ggml-build\ggml\src\*.lib
+            ${{ runner.temp }}\ggml-build\src\*.lib
+          key: ${{ steps.ggml-cache.outputs.cache-primary-key }}
+      - name: Package
+        # Windows PowerShell 5.1, the one the script's header tells users to run it with
+        shell: powershell
+        run: |
+          $env:LLAMA_CPP_ROOT = "$env:RUNNER_TEMP\llama.cpp"
+          $env:GGML_LIBS = "$env:RUNNER_TEMP\ggml-build\bin"
+          if ($env:RELEASE_TAG) { $env:VERSION = $env:RELEASE_TAG }
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package.ps1
+          if ($LASTEXITCODE) { exit 1 }
+      - name: The zip, unpacked, on the CPU (.github\scripts\bundle_check.py)
+        # no NVIDIA driver on the runner, so ggml-cuda.dll does not load: the CPU variants run
+        run: |
+          cmake --build build-portable-win --target qwfn-gen qwfn-refdump qwfn-logits
+          if ($LASTEXITCODE) { exit 1 }
+          python .github\scripts\bundle_check.py dist\qwfnfer-windows-x86_64-cuda.zip build-portable-win "$env:RUNNER_TEMP\bundle-check"
+          if ($LASTEXITCODE) { exit 1 }
+      - uses: actions/upload-artifact@v6
+        with:
+          name: qwfnfer-windows-x86_64-cuda
+          path: dist/qwfnfer-windows-x86_64-cuda.zip
+          if-no-files-found: error
+          compression-level: 0
+
   publish:
-    needs: [linux]
+    needs: [linux, windows]
     if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
     runs-on: ubuntu-24.04
     permissions:
@@ -189,4 +266,4 @@ jobs:
             gh release create "$tag" --repo "$GITHUB_REPOSITORY" "${where[@]}" --title "QwFNfer $tag" --generate-notes "${notes[@]}" $pre
           fi
           gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber \
-            dist/qwfnfer-linux-x86_64-cuda.zip dist/SHA256SUMS
+            dist/qwfnfer-linux-x86_64-cuda.zip dist/qwfnfer-windows-x86_64-cuda.zip dist/SHA256SUMS
