@@ -20,11 +20,37 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <vector>
+
+// The round-trip reads are positioned (pread), so no shared file offset moves. On Windows the
+// same calls are a CreateFileW handle ridden in the int and ReadFile with an OVERLAPPED offset.
+#ifdef _WIN32
+#include <windows.h>
+static int open_ro(const char * path) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
+    std::wstring w((size_t) n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, w.data(), n);
+    HANDLE h = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    return (int) (intptr_t) h;
+}
+static ssize_t pread_ro(int fd, void * buf, size_t n, off_t off) {
+    OVERLAPPED ov = {};
+    ov.Offset = (DWORD) off; ov.OffsetHigh = (DWORD) (off >> 32);
+    DWORD got = 0;
+    if (!ReadFile((HANDLE) (intptr_t) fd, buf, (DWORD) n, &got, &ov)) return -1;
+    return (ssize_t) got;
+}
+using off_t = __int64;
+using ssize_t = __int64;
+#else
+#include <fcntl.h>
+#include <unistd.h>
+static int open_ro(const char * path) { return ::open(path, O_RDONLY); }
+static ssize_t pread_ro(int fd, void * buf, size_t n, off_t off) { return ::pread(fd, buf, n, off); }
+#endif
 
 static ggml_type target_type(const std::string & rule, const char * name, ggml_type type, int n_dims, int64_t ne0) {
     const std::string nm = name;
@@ -145,7 +171,7 @@ int main(int argc, char ** argv) {
         gguf_init_params p = { true, &meta };
         gguf_context * g = gguf_init_from_file(argv[s], p);
         if (!g) { fprintf(stderr, "cannot open %s\n", argv[s]); return 1; }
-        int fd = open(argv[s], O_RDONLY);
+        int fd = open_ro(argv[s]);
         if (fd < 0) { perror(argv[s]); return 1; }
         gin.push_back(g); tin.push_back(meta); fds.push_back(fd);
         for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
@@ -191,7 +217,7 @@ int main(int argc, char ** argv) {
             std::vector<uint8_t> src(in_slice);
             std::vector<float> f((size_t) (ne0 * ne1));
             for (int64_t e; (e = next++) < n_slices;) {
-                const ssize_t r = pread(fds[jb.shard], src.data(), in_slice, (off_t) (jb.in_off + e * in_slice));
+                const ssize_t r = pread_ro(fds[jb.shard], src.data(), in_slice, (off_t) (jb.in_off + e * in_slice));
                 if (r != (ssize_t) in_slice) { fail = true; return; }
                 to_float(src.data(), f.data(), ne0 * ne1);
                 if (rule == "mtpq2") q2_0_mse(f.data(), out.data() + e * out_slice, ne0 * ne1);
