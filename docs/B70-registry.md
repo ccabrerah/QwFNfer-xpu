@@ -222,3 +222,19 @@ The engine is merged with upstream QwFNfer master (2026-10-03: Windows support, 
 | `QWFN_PREDICT_CUR2` at 80K context | with 17.33 / 17.68 tok/s, without 16.55 / 17.04 (layer graphs 26.3 vs 28.4 s per 1,000 tokens) | **keep** (was open: misses cost more at long context, but it still wins) |
 | `--spec-depth 0` | 24.77 / 24.80 vs default 25.01 / 25.53 tok/s: without the layer-0 prefetch the expert I/O grows (26.9 vs 20.9 s per 2,500 tokens) | **keep the default** |
 | The slimmed stack end to end (2026-10-16, vs the deployed one, A-B-B-A through the server) | agent turns at 52-61K: prompt 14.14 -> 11.36 s, replies 28.2 -> 29.2 tok/s; 16-text NLL +0.03% (SE 0.18); soak 4 x (3-session stress + images) passes | ready to deploy |
+
+## The remaining decode levers sized (2026-10-19)
+
+Measured with diagnostic builds that are not part of the series: a ggml-sycl switch that runs every small "glue" span of
+a decode graph again (bit-identical outputs, so the slowdown is what those launches cost) or times every span, and an
+engine trace of every pass's routing plus both expert tiers' contents before and after each streamed prompt.
+
+| Experiment | Result | Status |
+|---|---|---|
+| What the small glue kernels cost (elementwise, norm, copy, gather, sort: ~1,300 launches per token), the decode replay as configured, 1,500 tokens, 8 interleaved arms | ~3.0 us of GPU time per glue launch, linear in reruns, replay NLL identical in every arm; all glue <= ~4 ms per token (~15% of a short-prompt token), far below the ~10 ms a kernel trace had suggested | a persistent megakernel is not worth it; targeted fusions of the most frequent glue could return ~1-2 ms per token (4-8%): idea |
+| What grows with context (short vs 60K prompt) | per call the lightning indexer 63 -> 130 us and the top-k selection 21 -> 64 us (both linear in context); the sparse decode attention flat beyond ~2K context | ~0.7 ms per token at 60K (~2-3%): low priority |
+| Seeding the expert tiers from an agent turn's prompt (its most used experts per layer forced into VRAM), replayed through the tier rule on 23 traced turns | no fewer misses (7.3-7.5 vs 7.4 per step), more RAM-served lookups; even an oracle seeded from the reply itself cuts misses only 13% at 64 experts per layer | rejected |
+| The lend after a streamed prompt | the lent layers come back refilled from the RAM tier first, and the restore of their former residents stops when the tier is full: 550-960 VRAM residents per turn replaced by colder ones, the reply's first ~20 steps see ~2x the misses | kept: the cost is ~0.2 s per 100-200-token reply; restoring every former resident would cost 0.4-0.6 s of time to first token |
+
+Conclusion: decode is within roughly 10-15% of what software can reach on this card without lighter weights or more host
+memory (the experts that miss VRAM come off the NVMe).
