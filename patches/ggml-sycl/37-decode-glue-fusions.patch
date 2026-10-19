@@ -1,0 +1,585 @@
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -75,6 +75,12 @@
+ static bool fuse_addchain_on() { static const bool v = fuse3_env("GGML_SYCL_FUSE_ADDCHAIN"); return v; }
+ static bool fuse_moesum_on()   { static const bool v = fuse3_env("GGML_SYCL_FUSE_MOESUM");   return v; }
+ static bool fuse_conv_on()     { static const bool v = fuse3_env("GGML_SYCL_FUSE_CONV");     return v; }
++// ---- decode glue fusions (patch 37): see glue_* below the view helper ----
++static bool fuse_scale_silu_on()     { static const bool v = fuse3_env("GGML_SYCL_FUSE_SCALE_SILU");     return v; }
++static bool fuse_gate_bcast_on()     { static const bool v = fuse3_env("GGML_SYCL_FUSE_GATE_BCAST");     return v; }
++static bool fuse_route_gather_on()   { static const bool v = fuse3_env("GGML_SYCL_FUSE_ROUTE_GATHER");   return v; }
++static bool fuse_predict_on()        { static const bool v = fuse3_env("GGML_SYCL_FUSE_PREDICT");        return v; }
++static bool fuse_addchain_views_on() { static const bool v = fuse3_env("GGML_SYCL_FUSE_ADDCHAIN_VIEWS"); return v; }
+ 
+ static bool f3_single(const ggml_cgraph * g, int k) {
+     return !(g->nodes[k]->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(g, k) == 1;
+@@ -2760,6 +2766,29 @@
+         });
+ }
+ 
++// GGML_SYCL_FUSE_SCALE_SILU: a SCALE and the SILU that reads it, one kernel (the hyper-connection mixers' 1/hc before
++// their SiLU). y = scale * x + bias as scale_f32 writes it, then op_silu(y); y is stored too unless the SILU writes in
++// place over the SCALE's output (scale_dst == silu_dst). Every buffer is indexed by the same element: in-place is safe.
++static void scale_silu_f32_sycl(const float * x, float * scale_dst, float * silu_dst, const float scale, const float bias,
++                                const int k, queue_ptr stream) {
++    const int  num_blocks  = (k + SYCL_SCALE_BLOCK_SIZE - 1) / SYCL_SCALE_BLOCK_SIZE;
++    const bool store_scale = scale_dst != silu_dst;
++    stream->parallel_for(
++        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_SCALE_BLOCK_SIZE),
++                          sycl::range<3>(1, 1, SYCL_SCALE_BLOCK_SIZE)),
++        [=](sycl::nd_item<3> item_ct1) {
++            const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) + item_ct1.get_local_id(2);
++            if (i >= k) {
++                return;
++            }
++            const float y = scale * x[i] + bias;
++            if (store_scale) {
++                scale_dst[i] = y;
++            }
++            silu_dst[i] = op_silu(y);
++        });
++}
++
+ 
+ static void sum_rows_f32_sycl(const float *x, float *dst, const int ncols,
+                               const int nrows, queue_ptr stream) {
+@@ -6739,8 +6768,210 @@
+ static bool ggml_sycl_is_view_or_noop(const ggml_tensor * t) {
+     return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
+            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
++}
++
++// ---- decode glue fusions (patch 37) ----
++// Small kernels of the decode layer graphs merged into their neighbour, each behind its own switch. A fused kernel writes
++// every output the kernels it replaces wrote (other readers see the same bytes) and evaluates the same expressions in the
++// same order, so the results are bit-identical; the merged nodes must be the next ones the compute loop would run.
++
++// The next node after k that the compute loop runs (not a view or no-op, flagged for compute), or -1.
++static int glue_next_computed(const ggml_cgraph * g, int k) {
++    for (int j = k + 1; j < g->n_nodes; j++) {
++        const ggml_tensor * n = g->nodes[j];
++        if (!ggml_sycl_is_view_or_noop(n) && (n->flags & GGML_TENSOR_FLAG_COMPUTE)) return j;
++    }
++    return -1;
++}
++
++static bool glue_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
++    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
++}
++
++// GGML_SYCL_FUSE_ADDCHAIN_VIEWS: f3_match_addchain's chain of 2-4 ADDs (each adds one more same-shape f32 operand to the
++// previous result, which has no other reader) also when view nodes sit between the ADDs, which f3_match_addchain (adjacent
++// nodes only) stops at. Same operands in the same order for f3_addchain; *last gets the last ADD's index.
++static int glue_addchain_match(const ggml_cgraph * g, int i, const float * ops[5], int * last) {
++    const ggml_tensor * a0 = g->nodes[i];
++    if (a0->op != GGML_OP_ADD || !f3_f32c(a0) || !f3_f32c(a0->src[0]) || !f3_f32c(a0->src[1])) return 0;
++    if (!ggml_are_same_shape(a0->src[0], a0) || !ggml_are_same_shape(a0->src[1], a0)) return 0;
++    ops[0] = (const float *) a0->src[0]->data; ops[1] = (const float *) a0->src[1]->data;
++    int L = 1, prev_i = i;
++    *last = i;
++    while (L < 4) {
++        const int j = glue_next_computed(g, prev_i);
++        if (j < 0) break;
++        const ggml_tensor * prev = g->nodes[prev_i], * a = g->nodes[j];
++        if (a->op != GGML_OP_ADD || !f3_f32c(a) || !ggml_are_same_shape(a, a0)) break;
++        const ggml_tensor * other = a->src[0] == prev ? a->src[1] : a->src[1] == prev ? a->src[0] : nullptr;
++        if (!other || other == prev || !f3_f32c(other) || !ggml_are_same_shape(other, a0)) break;
++        if (!f3_single(g, prev_i)) break;
++        ops[L + 1] = (const float *) other->data;
++        L++; prev_i = j; *last = j;
++    }
++    return L >= 2 ? L : 0;
+ }
+ 
++// GGML_SYCL_FUSE_SCALE_SILU: SCALE (f32) whose next node is a SILU of it.
++static bool glue_scale_silu_ok(const ggml_cgraph * g, int i) {
++    const ggml_tensor * sc = g->nodes[i];
++    if (sc->op != GGML_OP_SCALE || i + 1 >= g->n_nodes) return false;
++    const ggml_tensor * un = g->nodes[i + 1], * x = sc->src[0];
++    if (un->op != GGML_OP_UNARY || ggml_get_unary_op(un) != GGML_UNARY_OP_SILU || un->src[0] != sc || !(un->flags & GGML_TENSOR_FLAG_COMPUTE)) return false;
++    if (x->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 || un->type != GGML_TYPE_F32) return false;
++    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(sc) || !ggml_is_contiguous(un)) return false;
++    if (ggml_nelements(x) != ggml_nelements(sc) || ggml_nelements(un) != ggml_nelements(sc) || ggml_nelements(sc) >= INT32_MAX) return false;
++    // element i of every buffer is touched by work-item i only: x may be either output, the outputs may be one buffer
++    if (x->data != sc->data && glue_overlap(x, sc)) return false;
++    if (x->data != un->data && glue_overlap(x, un)) return false;
++    if (sc->data != un->data && glue_overlap(sc, un)) return false;
++    return true;
++}
++
++// GGML_SYCL_FUSE_GATE_BCAST: UNARY (sigmoid | silu | softplus) of a [1, rows...] f32 tensor whose next node is a MUL that
++// broadcasts it over the other operand's dim 0 (the shared expert's gate). A UNARY in place over its input is accepted
++// only as the MUL's sole input (its output is then not written: other work-items still read the input).
++static bool glue_gate_bcast_ok(const ggml_cgraph * g, int i) {
++    const ggml_tensor * un = g->nodes[i];
++    if (un->op != GGML_OP_UNARY || i + 1 >= g->n_nodes) return false;
++    const ggml_unary_op uop = ggml_get_unary_op(un);
++    if (uop != GGML_UNARY_OP_SIGMOID && uop != GGML_UNARY_OP_SILU && uop != GGML_UNARY_OP_SOFTPLUS) return false;
++    const ggml_tensor * mul = g->nodes[i + 1], * gx = un->src[0];
++    if (mul->op != GGML_OP_MUL || !(mul->flags & GGML_TENSOR_FLAG_COMPUTE)) return false;
++    if ((mul->src[0] == un) == (mul->src[1] == un)) return false;   // exactly one operand is the unary
++    const ggml_tensor * other = mul->src[0] == un ? mul->src[1] : mul->src[0];
++    if (gx->type != GGML_TYPE_F32 || un->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) return false;
++    if (!ggml_is_contiguous(gx) || !ggml_is_contiguous(un) || !ggml_is_contiguous(other) || !ggml_is_contiguous(mul)) return false;
++    if (gx->ne[0] != 1 || other->ne[0] < 2 || !ggml_are_same_shape(gx, un) || !ggml_are_same_shape(other, mul)) return false;
++    if (gx->ne[1] != other->ne[1] || gx->ne[2] != other->ne[2] || gx->ne[3] != other->ne[3]) return false;
++    if (un->data == gx->data && ggml_node_get_use_count(g, i) != 1) return false;
++    if (glue_overlap(mul, gx) || glue_overlap(mul, un) || (un->data != gx->data && glue_overlap(un, gx))) return false;
++    if (other->data != mul->data && glue_overlap(other, mul)) return false;
++    return true;
++}
++
++// GGML_SYCL_FUSE_ROUTE_GATHER, the in-graph MoE's residency lookups (decode and verify steps):
++//  (a) CONT of the routed ids (a strided view when a step has several positions) whose next node is a GET_ROWS of a
++//      [1, n] i32 table (the layer's VRAM slots) at those ids: one kernel writes the CONT and the gathered slots;
++//  (b) GET_ROWS of a [1, n] f32 table (the residency mask) whose next node is a MUL of it with the gate weights, same
++//      shape: one kernel writes the gathered mask and the product (operands in the MUL's order).
++// Returns the GET_ROWS (a) or MUL (b) index, or -1.
++static int glue_route_match_a(const ggml_cgraph * g, int i) {
++    const ggml_tensor * ct = g->nodes[i], * src = ct->src[0];
++    if (ct->op != GGML_OP_CONT || ct->type != GGML_TYPE_I32 || !src || src->type != GGML_TYPE_I32 || !ggml_is_contiguous(ct)) return -1;
++    if (src->ne[2] != 1 || src->ne[3] != 1 || !ggml_are_same_shape(src, ct) || src->nb[0] != sizeof(int32_t)) return -1;
++    const int j = glue_next_computed(g, i);
++    if (j < 0) return -1;
++    const ggml_tensor * gr = g->nodes[j], * tab = gr->src[0], * ids = gr->src[1];
++    const int64_t n = ggml_nelements(ct);
++    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_I32 || !ggml_is_contiguous(gr) || !tab || !ids) return -1;
++    if (tab->type != GGML_TYPE_I32 || !ggml_is_contiguous(tab) || tab->ne[0] != 1 || tab->ne[2] != 1 || tab->ne[3] != 1) return -1;
++    if (ids->type != GGML_TYPE_I32 || (ids != ct && (ids->view_src != ct || ids->view_offs != 0)) || !ggml_is_contiguous(ids) ||
++        ggml_nelements(ids) != n || ids->ne[0] != n) return -1;
++    if (gr->ne[0] != 1 || gr->ne[1] != n || gr->ne[2] != 1 || gr->ne[3] != 1 || n >= INT32_MAX) return -1;
++    if (glue_overlap(ct, src) || glue_overlap(ct, tab) || glue_overlap(gr, src) || glue_overlap(gr, tab) || glue_overlap(gr, ct)) return -1;
++    return j;
++}
++
++static void glue_route_a(dpct::queue_ptr q, const ggml_tensor * ct, ggml_tensor * gr) {
++    const ggml_tensor * src = ct->src[0], * tab = gr->src[0];
++    const int64_t n = ggml_nelements(ct), u = src->ne[0];
++    const char * sd = (const char *) src->data; const size_t s1 = src->nb[1];
++    const char * td = (const char *) tab->data; const size_t t1 = tab->nb[1];
++    int32_t * cd = (int32_t *) ct->data;
++    int32_t * od = (int32_t *) gr->data;
++    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(((n + 63) / 64) * 64), sycl::range<1>(64)), [=](sycl::nd_item<1> it) {
++        const int64_t e = it.get_global_id(0);
++        if (e >= n) return;
++        const int32_t id = *(const int32_t *) (sd + (e % u) * sizeof(int32_t) + (e / u) * s1);
++        cd[e] = id;
++        od[e] = *(const int32_t *) (td + (size_t) id * t1);
++    });
++}
++
++static int glue_route_match_b(const ggml_cgraph * g, int i, bool * gather_first) {
++    const ggml_tensor * gr = g->nodes[i], * tab = gr->src[0], * ids = gr->src[1];
++    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || !ggml_is_contiguous(gr) || !tab || !ids) return -1;
++    if (tab->type != GGML_TYPE_F32 || !ggml_is_contiguous(tab) || tab->ne[0] != 1 || tab->ne[2] != 1 || tab->ne[3] != 1) return -1;
++    const int64_t n = ggml_nelements(ids);
++    if (ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || ids->ne[0] != n || n >= INT32_MAX) return -1;
++    if (gr->ne[0] != 1 || gr->ne[1] != n || gr->ne[2] != 1 || gr->ne[3] != 1) return -1;
++    const int j = glue_next_computed(g, i);
++    if (j < 0) return -1;
++    const ggml_tensor * mul = g->nodes[j], * a = mul->src[0], * b = mul->src[1];
++    if (mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) || ggml_nelements(mul) != n || !a || !b) return -1;
++    if (!ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, mul)) return -1;
++    auto is_gather = [&](const ggml_tensor * t) { return t == gr || (t->view_src == gr && t->view_offs == 0 && ggml_is_contiguous(t)); };
++    if (is_gather(a) == is_gather(b)) return -1;   // exactly one operand is the gathered mask
++    *gather_first = is_gather(a);
++    const ggml_tensor * w = *gather_first ? b : a;
++    if (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w)) return -1;
++    if (glue_overlap(gr, ids) || glue_overlap(gr, tab) || glue_overlap(gr, w) || glue_overlap(mul, tab)) return -1;
++    // the MUL may take the ids' buffer once they are dead (the allocator does): exactly, element for element -- each
++    // work-item reads its id before it writes its product
++    if (glue_overlap(mul, ids) && !(mul->data == ids->data && ggml_nbytes(mul) == ggml_nbytes(ids))) return -1;
++    if (mul->data != w->data && glue_overlap(mul, w)) return -1;
++    if (mul->data != gr->data && glue_overlap(mul, gr)) return -1;
++    return j;
++}
++
++static void glue_route_b(dpct::queue_ptr q, ggml_tensor * gr, ggml_tensor * mul, bool gather_first) {
++    const ggml_tensor * tab = gr->src[0];
++    const int64_t n = ggml_nelements(gr);
++    const char *    td = (const char *) tab->data; const size_t t1 = tab->nb[1];
++    const int32_t * id = (const int32_t *) gr->src[1]->data;
++    const float *   wd = (const float *) (gather_first ? mul->src[1] : mul->src[0])->data;
++    float * gd = (float *) gr->data;
++    float * md = (float *) mul->data;
++    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(((n + 63) / 64) * 64), sycl::range<1>(64)), [=](sycl::nd_item<1> it) {
++        const int64_t e = it.get_global_id(0);
++        if (e >= n) return;
++        const float m = *(const float *) (td + (size_t) id[e] * t1);
++        const float w = wd[e];
++        gd[e] = m;
++        md[e] = gather_first ? m * w : w * m;
++    });
++}
++
++// GGML_SYCL_FUSE_PREDICT: the readers of a GGML_SYCL_TOPK_WG argsort's first-k view in the next-layer predictor -- a CPY
++// of the view to f32, then (a step of several positions) a CONT of it, then a GET_ROWS of the argsort's own input rows at
++// those ids -- when they are the next nodes the loop runs. Returns the GET_ROWS index, or -1.
++static int glue_predict_match(const ggml_cgraph * g, int i, int k, ggml_tensor ** cpy, ggml_tensor ** cont, ggml_tensor ** gr) {
++    const ggml_tensor * as = g->nodes[i], * x = as->src[0];
++    auto first_k_view = [&](const ggml_tensor * v) {
++        return v && v->op == GGML_OP_VIEW && v->view_src == as && v->view_offs == 0 && v->ne[0] == k && v->ne[1] == as->ne[1] &&
++               v->ne[2] == 1 && v->ne[3] == 1 && v->nb[0] == sizeof(int32_t) && v->nb[1] == as->nb[1];
++    };
++    int j = glue_next_computed(g, i);
++    if (j < 0) return -1;
++    ggml_tensor * c = g->nodes[j];
++    if (c->op != GGML_OP_CPY || !first_k_view(c->src[0]) || c->type != GGML_TYPE_F32 || !ggml_is_contiguous(c) ||
++        ggml_nelements(c) != (int64_t) k * as->ne[1]) return -1;
++    ggml_tensor * ct = nullptr;
++    j = glue_next_computed(g, j);
++    if (j < 0) return -1;
++    ggml_tensor * n2 = g->nodes[j];
++    if (n2->op == GGML_OP_CONT) {
++        if (!first_k_view(n2->src[0]) || n2->type != GGML_TYPE_I32 || !ggml_is_contiguous(n2) || !ggml_are_same_shape(n2, n2->src[0])) return -1;
++        ct = n2;
++        j = glue_next_computed(g, j);
++        if (j < 0) return -1;
++        n2 = g->nodes[j];
++    }
++    if (n2->op != GGML_OP_GET_ROWS || n2->type != GGML_TYPE_F32 || !ggml_is_contiguous(n2)) return -1;
++    if (ct ? n2->src[1] != ct : !first_k_view(n2->src[1])) return -1;
++    const ggml_tensor * r = n2->src[0];   // the argsort's input as [1, ncols, nrows]
++    if (!r || r->type != GGML_TYPE_F32 || r->data != x->data || r->ne[0] != 1 || r->ne[1] != x->ne[0] || r->ne[2] != x->ne[1] ||
++        r->ne[3] != 1 || r->nb[1] != sizeof(float) || r->nb[2] != x->nb[1]) return -1;
++    if (n2->ne[0] != 1 || n2->ne[1] != k || n2->ne[2] != as->ne[1] || n2->ne[3] != 1) return -1;
++    // outputs: distinct from each other and from the rows they are computed from
++    if (glue_overlap(c, x) || glue_overlap(n2, x) || glue_overlap(c, as) || glue_overlap(n2, as) || glue_overlap(c, n2)) return -1;
++    if (ct && (glue_overlap(ct, x) || glue_overlap(ct, as) || glue_overlap(ct, c) || glue_overlap(ct, n2))) return -1;
++    *cpy = c; *cont = ct; *gr = n2;
++    return j;
++}
++
+ // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
+ // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
+ // returns the number of following nodes to skip (0 = no fusion)
+@@ -6851,6 +7082,15 @@
+                 }
+             }
+             if (ok && k > 0 && found == ggml_node_get_use_count(cgraph, i)) {
++                ggml_tensor * pc = nullptr, * pt = nullptr, * pg = nullptr;
++                const int jp = fuse_predict_on() ? glue_predict_match(cgraph, i, k, &pc, &pt, &pg) : -1;
++                if (jp > 0) {
++                    ggml_sycl_topkwg_predict(sycl_ctx->stream(), (const float *) src->data, (int32_t *) node->data,
++                                             src->ne[0], src->ne[1], src->nb[1] / sizeof(float), k,
++                                             (float *) pc->data, pt ? (int32_t *) pt->data : nullptr, (float *) pg->data);
++                    i = jp;
++                    continue;
++                }
+                 ggml_sycl_topkwg_argsort(sycl_ctx->stream(), (const float *) src->data, (int32_t *) node->data,
+                                          src->ne[0], src->ne[1], src->nb[1] / sizeof(float), k);
+                 continue;
+@@ -6864,7 +7104,35 @@
+         }
+         if (node->op == GGML_OP_GET_ROWS && ggml_sycl_sparse_decode_attn_fused(*sycl_ctx, cgraph, i)) {
+             i += 8;
++            continue;
++        }
++        // decode glue fusions (patch 37)
++        if (node->op == GGML_OP_SCALE && fuse_scale_silu_on() && glue_scale_silu_ok(cgraph, i)) {
++            ggml_tensor * un = cgraph->nodes[i + 1];
++            float scale, bias;
++            memcpy(&scale, (float *) node->op_params + 0, sizeof(float));
++            memcpy(&bias,  (float *) node->op_params + 1, sizeof(float));
++            scale_silu_f32_sycl((const float *) node->src[0]->data, (float *) node->data, (float *) un->data, scale, bias,
++                                (int) ggml_nelements(node), sycl_ctx->stream());
++            i++;
+             continue;
++        }
++        if (node->op == GGML_OP_CONT && fuse_route_gather_on()) {
++            const int j = glue_route_match_a(cgraph, i);
++            if (j > 0) {
++                glue_route_a(sycl_ctx->stream(), node, cgraph->nodes[j]);
++                i = j;
++                continue;
++            }
++        }
++        if (node->op == GGML_OP_GET_ROWS && fuse_route_gather_on()) {
++            bool gather_first = false;
++            const int j = glue_route_match_b(cgraph, i, &gather_first);
++            if (j > 0) {
++                glue_route_b(sycl_ctx->stream(), node, cgraph->nodes[j], gather_first);
++                i = j;
++                continue;
++            }
+         }
+ #ifndef NDEBUG
+         assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
+@@ -6924,6 +7192,18 @@
+             i++;
+             continue;
+         }
++        // GGML_SYCL_FUSE_ADDCHAIN_VIEWS: the ADD chain also across view nodes (the f3 match below stops at them)
++        if (node->op == GGML_OP_ADD && fuse_addchain_on() && fuse_addchain_views_on()) {
++            const float * ops[5] = {};
++            int last_i = -1;
++            const int L = glue_addchain_match(cgraph, i, ops, &last_i);
++            if (L >= 2) {
++                ggml_tensor * last = cgraph->nodes[last_i];
++                f3_addchain(sycl_ctx->stream(), ops, L + 1, (float *) last->data, ggml_nelements(last));
++                i = last_i;
++                continue;
++            }
++        }
+         if (node->op == GGML_OP_ADD &&
+             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_ADD }, {})) {
+             ggml_sycl_op_add_add_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+@@ -6991,6 +7271,11 @@
+         if (node->op == GGML_OP_UNARY &&
+             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { ggml_get_unary_op(node) })) {
+             ggml_sycl_op_unary_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
++            i++;
++            continue;
++        }
++        if (node->op == GGML_OP_UNARY && fuse_gate_bcast_on() && glue_gate_bcast_ok(cgraph, i)) {
++            ggml_sycl_op_unary_mul_bcast0_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+             i++;
+             continue;
+         }
+--- a/ggml/src/ggml-sycl/element_wise.cpp
++++ b/ggml/src/ggml-sycl/element_wise.cpp
+@@ -1121,7 +1121,50 @@
+ 
+     dispatch_fused_unary_op(ggml_get_unary_op(unary_node), dispatch_op);
+ }
++
++// dst[i] = other[i] * op(g[i / n]) (operands in the MUL's order), and the UNARY's own output op(g[r]) for every row r
++// unless it is in place over g (the caller then makes sure the MUL is its only reader: other work-items still read g):
++// the op and the product rounded as the two kernels round them. Preconditions are the caller's; re-asserted here.
++void ggml_sycl_op_unary_mul_bcast0_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
++    scope_op_debug_print scope_dbg_print(__func__, mul_node, /*num_src=*/2);
+ 
++    const ggml_tensor * g = unary_node->src[0];
++    const bool unary_first = mul_node->src[0] == unary_node;
++    const ggml_tensor * other = unary_first ? mul_node->src[1] : mul_node->src[0];
++    GGML_ASSERT(other != unary_node);
++    GGML_ASSERT(g->type == GGML_TYPE_F32 && unary_node->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32 && mul_node->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(g) && ggml_is_contiguous(unary_node) && ggml_is_contiguous(other) && ggml_is_contiguous(mul_node));
++    GGML_ASSERT(g->ne[0] == 1 && ggml_are_same_shape(g, unary_node) && ggml_are_same_shape(other, mul_node));
++    GGML_ASSERT(g->ne[1] == other->ne[1] && g->ne[2] == other->ne[2] && g->ne[3] == other->ne[3]);
++
++    queue_ptr main_stream = ctx.stream();
++    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
++
++    const int64_t k = ggml_nelements(mul_node);
++    const int64_t n = mul_node->ne[0];
++    const float * gd = (const float *) g->data;
++    const float * od = (const float *) other->data;
++    float *       ud = unary_node->data == g->data ? nullptr : (float *) unary_node->data;
++    float *       dd = (float *) mul_node->data;
++    const size_t  num_blocks = ceil_div((size_t) k, (size_t) SYCL_GLU_BLOCK_SIZE);
++    const sycl::nd_range<1> range(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE), sycl::range<1>(SYCL_GLU_BLOCK_SIZE));
++
++    dispatch_fused_unary_op(ggml_get_unary_op(unary_node), [&](auto op) {
++        main_stream->parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++            const int64_t i = item_ct1.get_global_id(0);
++            if (i >= k) {
++                return;
++            }
++            const int64_t r = i / n;
++            const float   s = op(gd[r]);
++            dd[i] = unary_first ? s * od[i] : od[i] * s;
++            if (ud && i % n == 0) {
++                ud[r] = s;
++            }
++        });
++    });
++}
++
+ __dpct_inline__ float ggml_sycl_op_swiglu_oai_single(float x, float g, float alpha = 1.702f, float limit = 7.0f) {
+     x = sycl::fmin(x, limit);
+     g = sycl::fmax(sycl::fmin(g, limit), -limit);
+--- a/ggml/src/ggml-sycl/element_wise.hpp
++++ b/ggml/src/ggml-sycl/element_wise.hpp
+@@ -132,6 +132,10 @@
+ // fused UNARY(silu|sigmoid|softplus) + MUL; see ggml_sycl_can_fuse() for the accepted shapes
+ void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
+ 
++// GGML_SYCL_FUSE_GATE_BCAST: UNARY(silu|sigmoid|softplus) of a [1, rows...] f32 tensor and the MUL that broadcasts it
++// over the other operand's dim 0, as one kernel (the shared expert's gate); also writes the UNARY's own output
++void ggml_sycl_op_unary_mul_bcast0_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
++
+ // fused f32 ADD + UNARY(silu|sigmoid|softplus) + MUL with the bias and the scale broadcast
+ // over dim 0; see ggml_sycl_can_fuse() for the accepted shapes
+ void ggml_sycl_op_add_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * add_node,
+--- a/ggml/src/ggml-sycl/topkwg.cpp
++++ b/ggml/src/ggml-sycl/topkwg.cpp
+@@ -106,6 +106,38 @@
+     });
+ }
+ 
++// The next-layer predictor's tail as one kernel: the argsort's first k per row (lane 0 writes them, as above), then lane 0
++// copies them out as the graph's CPY (i32 -> f32), CONT and GET_ROWS of the row's own values would: x[row][id] read
++// again from the row, so a NaN comes out as GET_ROWS returns it (the selection saw it as -FLT_MAX).
++void ggml_sycl_topkwg_predict(dpct::queue_ptr stream, const float * x, int32_t * dst, int64_t ncols, int64_t nrows,
++                              int64_t x_row_stride, int k, float * ids_f32, int32_t * ids_i32, float * vals) {
++    const int wg = (int) ncols;
++    stream->submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<float, 1> sv(sycl::range<1>(2 * TOPKWG_MAX_SG), cgh);
++        sycl::local_accessor<int, 1>   si(sycl::range<1>(2 * TOPKWG_MAX_SG), cgh);
++        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) nrows * wg), sycl::range<1>(wg)),
++            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                const int64_t row = it.get_group(0);
++                const int lane = it.get_local_id(0);
++                const float * xr = x + row * x_row_stride;
++                float v = xr[lane];
++                if (sycl::isnan(v)) v = -FLT_MAX;
++                int32_t * d = dst + row * ncols;
++                wg_topk<false>(it, v, k, d, nullptr,
++                               sv.get_multi_ptr<sycl::access::decorated::no>().get(),
++                               si.get_multi_ptr<sycl::access::decorated::no>().get());
++                if (lane == 0) {   // the ids lane 0 itself wrote in wg_topk
++                    for (int j = 0; j < k; j++) {
++                        const int32_t id = d[j];
++                        ids_f32[row * k + j] = (float) id;
++                        if (ids_i32) ids_i32[row * k + j] = id;
++                        vals[row * k + j] = xr[id];
++                    }
++                }
++            });
++    });
++}
++
+ // The router: softmax over the row, the k best (ids, row stride ncols as the argsort tensor), their
+ // probabilities normalised by max(sum, clamp) when with_norm, times scale.
+ void ggml_sycl_topkwg_moe(dpct::queue_ptr stream, const float * logits, float * weights, int32_t * ids,
+--- a/ggml/src/ggml-sycl/topkwg.hpp
++++ b/ggml/src/ggml-sycl/topkwg.hpp
+@@ -6,6 +6,10 @@
+ bool ggml_sycl_topkwg_row_ok(int64_t ncols);
+ void ggml_sycl_topkwg_argsort(dpct::queue_ptr stream, const float * x, int32_t * dst, int64_t ncols, int64_t nrows,
+                               int64_t x_row_stride, int k);
++// GGML_SYCL_FUSE_PREDICT: ggml_sycl_topkwg_argsort, and in the same kernel what the graph copies out of the first k: the
++// ids as f32 (ids_f32, k per row), as i32 (ids_i32, may be null) and the row's values at them (vals, as GET_ROWS reads).
++void ggml_sycl_topkwg_predict(dpct::queue_ptr stream, const float * x, int32_t * dst, int64_t ncols, int64_t nrows,
++                              int64_t x_row_stride, int k, float * ids_f32, int32_t * ids_i32, float * vals);
+ void ggml_sycl_topkwg_moe(dpct::queue_ptr stream, const float * logits, float * weights, int32_t * ids,
+                           int64_t n_experts, int64_t n_rows, int k, bool with_norm, float clamp_val, float scale_val);
+ #endif
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4217,6 +4217,103 @@
+         ggml_set_name(out, "out");
+ 
+         return out;
++    }
++};
++
++// The decode layer graphs' glue that ggml-sycl patch 37 runs as merged kernels (GGML_SYCL_FUSE_SCALE_SILU,
++// _GATE_BCAST, _ROUTE_GATHER, _PREDICT, _ADDCHAIN_VIEWS), built in the engine's node order so the merges apply:
++//   scale_silu    silu(scale(x)) (the hyper-connection mixer), in place or not
++//   gate_inplace  sigmoid in place over a [1, T] gate, times a [n, T] tensor it broadcasts over (the shared expert)
++//   route         the in-graph MoE's lookups: CONT of the routed ids, GET_ROWS of an i32 slot table and of an f32 mask
++//                 at them, the mask times the gate weights
++//   predict       the next-layer predictor: argsort's first k copied to f32, CONT, GET_ROWS of the scores at them
++//   addchain      a chain of ADDs with view nodes between them
++struct test_decode_glue : public test_case {
++    const std::string pattern;
++    const int64_t n, T;
++    const bool variant;   // scale_silu: in place, nonzero bias; route / predict: the CONT even at T = 1; addchain: 4 ADDs
++
++    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "DECODE_GLUE"; }
++    bool run_whole_graph() override { return true; }
++    std::string vars() override { return VARS_TO_STR4(pattern, n, T, variant); }
++
++    test_decode_glue(std::string pattern, int64_t n, int64_t T, bool variant = false)
++        : pattern(std::move(pattern)), n(n), T(T), variant(variant) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        if (pattern == "scale_silu") {
++            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
++            ggml_set_name(x, "x");
++            ggml_tensor * s = variant ? ggml_scale_bias_inplace(ctx, x, 0.25f, 0.125f) : ggml_scale(ctx, x, 0.25f);
++            ggml_tensor * out = variant ? ggml_silu_inplace(ctx, s) : ggml_silu(ctx, s);
++            ggml_set_name(out, "out");
++            return out;
++        }
++        if (pattern == "gate_inplace") {
++            ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, T);
++            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
++            ggml_set_name(g, "g"); ggml_set_name(b, "b");
++            ggml_tensor * out = ggml_mul(ctx, b, ggml_sigmoid_inplace(ctx, g));
++            ggml_set_name(out, "out");
++            return out;
++        }
++        if (pattern == "route") {
++            const int64_t U = 10;
++            ggml_tensor * probs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
++            ggml_tensor * wts   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, U, T);
++            ggml_tensor * vslot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n);
++            ggml_tensor * vmask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n);
++            ggml_set_name(probs, "probs"); ggml_set_name(wts, "wts"); ggml_set_name(vslot, "vslot"); ggml_set_name(vmask, "vmask");
++            ggml_tensor * sel = ggml_argsort_top_k(ctx, probs, U);                  // [U, T], a view
++            ggml_tensor * slc = (T > 1 || variant) ? ggml_cont(ctx, sel) : sel;
++            ggml_tensor * sl1 = ggml_reshape_1d(ctx, slc, U * T);
++            ggml_tensor * slot = ggml_get_rows(ctx, vslot, sl1);                     // [1, U*T] i32
++            ggml_tensor * mask = ggml_get_rows(ctx, vmask, sl1);                     // [1, U*T] f32
++            ggml_tensor * slot_f = ggml_reshape_2d(ctx, ggml_cast(ctx, slot, GGML_TYPE_F32), U, T);
++            ggml_tensor * w = ggml_mul(ctx, ggml_reshape_3d(ctx, wts, 1, U, T), ggml_reshape_3d(ctx, mask, 1, U, T));
++            ggml_tensor * out = ggml_add(ctx, slot_f, ggml_reshape_2d(ctx, w, U, T));
++            ggml_set_name(out, "out");
++            return out;
++        }
++        if (pattern == "predict") {
++            const int64_t k = 16;
++            ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
++            ggml_tensor * pack   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k * T);
++            ggml_set_name(logits, "logits"); ggml_set_name(pack, "pack");
++            ggml_tensor * ids = ggml_argsort_top_k(ctx, logits, k);                  // [k, T], a view
++            ggml_tensor * c   = ggml_cpy(ctx, ids, pack);                            // i32 -> f32
++            ggml_tensor * idc = (T > 1 || variant) ? ggml_cont(ctx, ids) : ids;
++            ggml_tensor * sc  = ggml_get_rows(ctx, ggml_reshape_3d(ctx, logits, 1, n, T), idc);   // [1, k, T]
++            ggml_tensor * out = ggml_add(ctx, ggml_reshape_2d(ctx, c, k, T), ggml_reshape_2d(ctx, sc, k, T));
++            ggml_set_name(out, "out");
++            return out;
++        }
++        if (pattern == "addchain") {
++            ggml_tensor * x0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
++            ggml_tensor * x1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
++            ggml_tensor * zb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 3 * T);
++            ggml_set_name(x0, "x0"); ggml_set_name(x1, "x1"); ggml_set_name(zb, "zb");
++            auto zv = [&](int j) { return ggml_view_2d(ctx, zb, n, T, zb->nb[1], (size_t) j * T * zb->nb[1]); };
++            ggml_tensor * a = ggml_add(ctx, x0, x1);
++            a = ggml_add(ctx, a, zv(0));       // the view sits between the two ADDs
++            a = ggml_add(ctx, zv(1), a);       // the previous result as the second operand
++            if (variant) a = ggml_add(ctx, a, zv(2));
++            ggml_set_name(a, "out");
++            return a;
++        }
++        GGML_ABORT("unknown pattern %s", pattern.c_str());
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type == GGML_TYPE_I32) {   // the slot table: any values
++                std::vector<int32_t> v(ggml_nelements(t));
++                for (size_t i = 0; i < v.size(); i++) v[i] = (int32_t) ((i * 7919) % 251);
++                ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(int32_t));
++            } else {
++                init_tensor_uniform(t, -4.f, 4.f);
++            }
++        }
+     }
+ };
+ 
+@@ -9706,6 +9803,19 @@
+         }
+     }
+ 
++    // decode glue merged by ggml-sycl patch 37 (with its switches on)
++    for (int64_t T : { 1, 2, 3 }) {
++        test_cases.emplace_back(new test_decode_glue("scale_silu", 320, T));
++        test_cases.emplace_back(new test_decode_glue("scale_silu", 320, T, true));
++        test_cases.emplace_back(new test_decode_glue("gate_inplace", 2560, T));
++        test_cases.emplace_back(new test_decode_glue("route", 512, T));
++        test_cases.emplace_back(new test_decode_glue("route", 512, T, true));
++        test_cases.emplace_back(new test_decode_glue("predict", 512, T));
++        test_cases.emplace_back(new test_decode_glue("predict", 512, T, true));
++        test_cases.emplace_back(new test_decode_glue("addchain", 2560, T));
++        test_cases.emplace_back(new test_decode_glue("addchain", 2560, T, true));
++    }
++
+     // fused add + unary + mul: the delta-net alpha gate, bias and scale broadcast over dim 0
+     for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SOFTPLUS }) {
+         test_cases.emplace_back(new test_add_unary_mul(op, GGML_TYPE_F32, { 32, 7, 1, 1 }));

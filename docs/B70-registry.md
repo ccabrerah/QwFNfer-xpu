@@ -238,3 +238,21 @@ engine trace of every pass's routing plus both expert tiers' contents before and
 
 Conclusion: decode is within roughly 10-15% of what software can reach on this card without lighter weights or more host
 memory (the experts that miss VRAM come off the NVMe).
+
+## Decode glue fusions, round 1 (2026-10-19)
+
+From a dump of the decode layer graphs as ggml-sycl runs them (the span each loop pass launches): 63 kernel launches per
+recurrent layer and step at two positions, about 25 of them small glue. Patch 37 merges the glue common to every layer
+into its neighbours (switches in `docs/PARAMETERS.md`), each fused kernel writing every output the kernels it replaces
+wrote, with the same expressions in the same order.
+
+| Experiment | Result | Status |
+|---|---|---|
+| Exactness: decode logits hash over every position of a 300-token replay (VRAM tier frozen so expert placement does not depend on timing), draft head and plain | identical with each switch alone and all on; two base runs identical; `test-backend-ops -o DECODE_GLUE` 27/27 | exact |
+| Launches per layer and step at two positions | recurrent 63 -> 54, attention 89 -> 80, PLE layers 105 -> 95, draft head 75 -> 65 | -- |
+| Speed, short prompts through the server (same binaries, switches off / on / on / off, 6 requests per side) | layer graphs 30.04 -> 29.07 ms per step (every run inside 29.96-30.13 vs 29.00-29.16); decode 37.0 -> 38.0 tok/s | **adopted in the launcher** |
+| Speed at 53K context (the same 1,000 replayed tokens after a 52K prompt, off / on / on / off) | layer graphs 25.19 -> 24.71 s per 1,000 tokens (-1.9%); wall 14.9 -> 16.2 tok/s, most of it a lower expert-read wait not attributed to the patch | -- |
+
+A removed launch was worth ~1.9 us here, below the ~3 us a rerun of the same kernels costs. What is left of the glue
+(the DeltaNet conv and its state copies at two positions, the DeltaNet gates and gated norm, the late-fold weights copy,
+the routing ids' copy into the readback pack, the attention mask chain) is estimated at another 1.5-2%.

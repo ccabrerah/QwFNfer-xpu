@@ -270,6 +270,11 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_Q2_LPR=16\|8\|4` | 32 | 8 | Lanes per row of the one-token q2_0 MoE kernels (gate/up + SwiGLU fused, and the wide matvec); 8 on 40-block rows: -9% against 16. |
 | (no switch) | 33 | | `ggml_backend_sycl_init_side_queue`: a backend on its own in-order queue of the device (the side queue `QWFN_PROMOTE_D2D` reads back on). |
 | (no switch) | 35 | | `ggml_backend_sycl_copy_d2d_async`: a device-to-device copy queued on a backend's stream (for `QWFN_PROMOTE_D2D`). |
+| `GGML_SYCL_FUSE_SCALE_SILU=1` | 37 | 1 | A SCALE and the SILU that reads it (the hyper-connection mixers) as one kernel. |
+| `GGML_SYCL_FUSE_GATE_BCAST=1` | 37 | 1 | A sigmoid/silu/softplus of a [1, rows] gate and the MUL that broadcasts it (the shared expert's gate) as one kernel. |
+| `GGML_SYCL_FUSE_ROUTE_GATHER=1` | 37 | 1 | The in-graph MoE's lookups: the routed ids' CONT with the slot-table gather, and the mask gather with the gate-weight MUL, as one kernel each. |
+| `GGML_SYCL_FUSE_PREDICT=1` | 37 | 1 | With `GGML_SYCL_TOPK_WG`: the next-layer predictor's top-k with the CPY, CONT and GET_ROWS of its first k, as one kernel. |
+| `GGML_SYCL_FUSE_ADDCHAIN_VIEWS=1` | 37 | 1 | With `GGML_SYCL_FUSE_ADDCHAIN`: the ADD chain also when view nodes sit between its ADDs. |
 
 ## 6. Upstream ggml and runtime variables the launcher sets
 
