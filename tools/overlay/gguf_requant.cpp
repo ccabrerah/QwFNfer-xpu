@@ -43,8 +43,6 @@ static ssize_t pread_ro(int fd, void * buf, size_t n, off_t off) {
     if (!ReadFile((HANDLE) (intptr_t) fd, buf, (DWORD) n, &got, &ov)) return -1;
     return (ssize_t) got;
 }
-using off_t = __int64;
-using ssize_t = __int64;
 #else
 #include <fcntl.h>
 #include <unistd.h>
