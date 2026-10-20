@@ -15,7 +15,7 @@ Measurement notes that apply throughout:
 - **Quality** is natural-text NLL (lower is better) over 1,024 tokens after an 8K prompt, measured both through
   prefill and token by token through the decode path (the reference for the sparse attention).
 
-Last updated: 2026-10-13.
+Last updated: 2026-10-20.
 
 ## Adopted
 
@@ -121,7 +121,7 @@ above. Effort: S = a kernel, a switch or one measurement session, M = a few days
 | ~~Gated-delta-net writing its rollback snapshot itself at T=2~~ **tried 2026-10-05: exact, no measurable gain (see below)** | ~1 ms per verify step (36 x 3 MB copies and their kernels) | M | MTP | the state and its snapshot in one allocation, so the existing fused cache write applies |
 | Prefix cache on disk, kept across restarts *(Pennyroyal's HiCache/NIXL tier)* | a returning long conversation after a restart restores in ~1-2 s instead of a full prefill (~225 s at 100K); the RAM pool can shrink or spill parked sessions | M | when the process restarts mid-conversation | write each pool entry to NVMe in the background while idle; a namespace hash of everything that changes the bytes (weights, engine commit, ggml tree, KV type, context, head, draft vocabulary, determinism switches); byte-exact round trip through disk |
 | BF16 recurrent (gated-delta-net) state, F32 compute *(Pennyroyal)* | ~1% decode (113 MB/token less traffic); rollback snapshots and the 118 MB fixed part of every checkpoint halve | M | small | the GDN kernel loading/storing BF16 state; decode-only NLL and a 100K needle check |
-| Promotion settle one step later | the ~3 ms per step the per-layer promotion settle costs (a second queue alone did not overlap it): up to ~6% decode | M | yes | an event per layer after its promotions; settle layer L's at its next fetch instead of after its MoE |
+| ~~Promotion settle one step later~~ **tried 2026-10-20: exact, -0.2% (see Decode round 3 and `dropped-features.md`)** | the ~3 ms per step the per-layer promotion settle costs (a second queue alone did not overlap it): up to ~6% decode | M | yes | an event per layer after its promotions; settle layer L's at its next fetch instead of after its MoE |
 | Promotion reorder off the GPU | the SOA reorder kernel per promoted part: ~1-1.5 ms per verify step | M | yes | keep RAM slots in the device layout, so a promotion is a plain copy |
 | Staged Q8_0 experts through patch 31's kernel | ~0.3 ms per verify step (they still take the stock kernel) | S | yes | convert them to Q8_0_SOA in the staging upload |
 | IQ4_NL expert down closer to bandwidth | ~1 ms per verify step (now ~290 GB/s) | S-M | yes | more rows per work-group to amortize the LUT build, or the LUT in registers |
@@ -274,3 +274,21 @@ cell mask. Measured against round 1 on.
 Lesson: replay NLL does not separate a rounding change from a bug; the logits hash and a dump of what actually fused do.
 Left: the late-fold weights copy, the routing ids' copy into the readback pack, the DeltaNet beta sigmoid, the gated norm
 (its reduction order), the PLE conv.
+
+## Decode round 3 (2026-10-20)
+
+Three of the levers sized above, each behind its own switch on a branch and measured against rounds 1 + 2 on: the
+promotion settle after the next layer graph, the routing read queued behind the graph, and a verify step's matvecs
+of one input as one launch. Exactness: the decode logits hash over a 300-token replay, with promotions frozen
+(`--promote 0`) and, since two base runs gave the same hash, also with promotions on as served. Speed: 1,500 replayed
+tokens as served, 3 interleaved runs per arm, the sum of the engine's timed decode parts (base 36.40-36.47 s; wall
+time moves ~4 s between identical runs with the expert reads).
+
+| Experiment | Result | Status |
+|---|---|---|
+| Matvecs of one input as one launch (patch 39 + `QWFN_MMV_ADJACENT`). The groups that share an input sit far apart in the graph (a DeltaNet layer's qkv is node 39, its gate node 74); one concatenated weight in the engine would hand their consumers strided views at two positions, which need copy kernels of their own. So the engine adds each group next to each other and ggml-sycl runs adjacent q8_0 matvecs of one input as one launch | hash identical (draft head and plain, promotions off and on; the node order alone too); `DECODE_GLUE` 50/50, `MUL_MAT -p q8_0` 106/106 with it on. Loop passes per layer and step at two positions: recurrent 51 -> 49, attention 69 -> 66, PLE layers 92 -> 90; with the input quantization each merged matmul also drops, ~216 kernels fewer per verify step. Timed parts -0.8%, layer graphs 27.24 -> 26.89 s (-1.3%) | **adopted in the launcher** |
+| The promotion settle after the next layer graph (`QWFN_SETTLE_LATE`) | exact; settle 2.92 -> 0.18 s but layer graphs +2.65 s: the next graph's late fold needs the uploads either way. -0.2% | dropped (`dropped-features.md`) |
+| The routing read queued behind the layer graph (`QWFN_PACK_ASYNC`); skipping the read is not exact (it is how the host learns the routing) | exact; readback 1.01 -> 0.06 s, layer graphs +0.7-1.5 s: the cost was the copy, not the wait. ~0 | dropped (`dropped-features.md`) |
+
+bf16 and f32 matvecs at two positions run through oneDNN and are not merged. The software levers left are ~1% each:
+the rest of the glue, the indexer and its top-k at long context, the shared expert's gate + up + SwiGLU as one kernel.

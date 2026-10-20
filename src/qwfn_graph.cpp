@@ -9,6 +9,13 @@
 
 namespace qwfn {
 
+// QWFN_MMV_ADJACENT=1: a verify step's (2-4 positions) q8_0 projections of one input are added to the graph next to
+// each other, for ggml-sycl's one launch per group (GGML_SYCL_FUSE_MULTI_MMV, patch 39). The same ops in another order.
+static bool mmv_adjacent(int64_t T) {
+    static const bool on = getenv("QWFN_MMV_ADJACENT") != nullptr;
+    return on && T >= 2 && T <= 4;
+}
+
 ggml_tensor * graph_builder::W(const std::string & name) const {
     ggml_tensor * t = w_->get(name);
     if (!t && alt_) t = alt_->get(name);
@@ -162,6 +169,7 @@ ggml_tensor * graph_builder::deltanet(ggml_tensor * cur, int il) {
 
     ggml_tensor * qkv = ggml_mul_mat(ctx0, Wl(il, "attn_qkv.weight"),  cur);   // [10240, T]
     ggml_tensor * z   = ggml_mul_mat(ctx0, Wl(il, "attn_gate.weight"), cur);   // [ 6144, T]
+    if (gf_ && mmv_adjacent(T)) { ggml_build_forward_expand(gf_, qkv); ggml_build_forward_expand(gf_, z); }
 
     ggml_tensor * beta = ggml_mul_mat(ctx0, Wl(il, "ssm_beta.weight"), cur);   // [48, T]
     beta = ggml_sigmoid(ctx0, ggml_reshape_4d(ctx0, beta, 1, n_v_heads, T, 1));
@@ -587,6 +595,9 @@ graph_builder::qsa_proj graph_builder::sparse_attn_decode_proj(ggml_tensor * cur
     p.qg    = ggml_mul_mat(ctx0, Wl(il, "attn_q.weight"), cur);           // [2*hd*nh, T]
     p.k     = ggml_mul_mat(ctx0, Wl(il, "attn_k.weight"), cur);           // [kv_dim, T]
     p.v     = ggml_mul_mat(ctx0, Wl(il, "attn_v.weight"), cur);           // [kv_dim, T]
+    if (gf_ && mmv_adjacent(cur->ne[1])) {
+        ggml_build_forward_expand(gf_, p.qg); ggml_build_forward_expand(gf_, p.k); ggml_build_forward_expand(gf_, p.v);
+    }
     if (!inp_pos) return p;
     // Row-wise norms and per-token rope: the same values as the one-position calls, in one kernel each.
     const int64_t T = cur->ne[1], hd = hp_->n_embd_head_k, nh = hp_->n_head, nh_kv = hp_->n_head_kv;

@@ -1,7 +1,9 @@
 # Dropped features
 
 Switches, code paths and ggml-sycl patches that were built, measured and then removed to keep the fork's custom
-surface small. Every one of them is still in the tree at tag **`v0.4.0`** (2026-10-14); revive from there.
+surface small. Every one of them up to 2026-10-15 is still in the tree at tag **`v0.4.0`** (2026-10-14) or at the
+commit its entry names; revive from there. Later entries that never reached the tree (built and measured on a branch,
+then deleted) say so and describe the code closely enough to write it again.
 
 Read this before building something new on the decode or prefill path: if an idea matches an entry here, start
 from its numbers instead of measuring it again under another name. All measurements are on an Arc Pro B70 (32 GB,
@@ -124,6 +126,59 @@ launcher (`scripts/b70/qwfn-b70.sh`) turns on the adopted ones.
   matmul) to the MTP verify step's 2-4 positions (on in the launcher since 2026-10-11).
 - **Why dropped:** `QWFN_HC_PRE_OP` (kept, on in the launcher) emits llama.cpp's DSV4_HC_PRE, which does the gate
   and the mean in one kernel at every step width, so the matmul form is no longer built when it is on.
+
+### `QWFN_SETTLE_LATE` -- a layer's promotion settle moved past the next layer graph (2026-10-20, never merged)
+
+- **What it did:** with `QWFN_PROMOTE_D2D`, decode settles each layer's promotions right after the layer's MoE
+  (`expert_cache::settle_promotions_layer`): it waits on the compute queue for this layer's promotion uploads (pinned
+  RAM -> VRAM, ~140 us each) and the victims' staging copies, then releases the RAM slots the uploads read, maps the
+  victims into their RAM slots, queues their read-backs on the side queue and lands the previous layer's. The switch
+  skipped that call and ran the same bookkeeping without the wait (`settle_promotions_landed()`) one layer later, in
+  the next layer's decode pass after its graph had been waited for and its routing read back, before its fetch: every
+  copy still pending had been queued on the same in-order queue before that graph, so it had landed. The last
+  layer's promotions settled after layer 0 of the next step, or in any full settle (prompt passes, lends, vision,
+  shutdown). Without D2D it was the plain `settle_promotions()`.
+- **Data** (1,500 replayed tokens as served -- draft head, promotions on --, 3 interleaved runs per arm in one GPU
+  window; the sum of the engine's timed decode parts, 36.40-36.47 s in the base runs): promotion settle 2.92 -> 0.18 s,
+  layer graphs 27.24 -> 29.85-29.91 s, net -0.2% (36.42 -> 36.34 s). Next to `GGML_SYCL_FUSE_MULTI_MMV` (kept):
+  -1.1% against -0.8% for that alone. Exact: the decode logits hash over 300 replayed tokens with promotions on
+  equalled the base's (15,526 promotions in each run; two base runs gave the same hash), and `QWFN_SWAP_CHECK`
+  compared 20,480 read-backs with the file, 0 wrong.
+- **The first placement was slower, and why:** settled right after the next graph's wait, before its routing read,
+  the victims' read-backs (an expert each, ~1.9 MB) went onto the side queue just ahead of the layer's blocking read of the
+  routing pack, which then waited behind them: host-to-device and device-to-host copies share one copy engine here.
+  Readback 1.01 -> 4.17 s per 1,500 tokens. Anything queued on the side queue must stay out of the way of the
+  per-layer routing read.
+- **Why it failed:** the experts promoted during layer L's fetch are computed in layer L+1's graph (the "late fold"),
+  so their uploads are on the critical path whoever waits for them: of the 2.74 s of host settle wait removed, 2.65 s
+  reappeared as layer-graph time. Only the host's own round trip (one sync and the bookkeeping per layer with
+  promotions) left the critical path.
+- **Don't redo as:** an event per layer, a settle at the layer's next fetch, or the uploads on a second queue
+  (`QWFN_PROMOTE_SIDE` above): each moves the same wait. What could pay is fewer bytes or less work on that path (the
+  per-part SOA reorder kernel after each upload, or RAM slots kept in the device layout so a promotion is a plain
+  copy), not a later wait.
+
+### `QWFN_PACK_ASYNC` -- the decode routing read queued behind the layer graph (2026-10-20, never merged)
+
+- **What it did:** after a replayed decode layer graph the host waits for the graph (`ggml_backend_synchronize`) and
+  then reads the readback pack -- the layer output, the routing weights and expert ids, the predictor's next-layer ids
+  and scores: T x (n_embd + 2 x n_expert_used + 2 x 16) floats, ~10 KB per position -- with a blocking
+  `ggml_backend_tensor_get`, a second round trip. The switch allocated a pinned copy of the pack next to the CPU
+  partial's pinned staging and queued the pack's device-to-host copy on the compute queue right behind the graph
+  (`ggml_backend_tensor_get_async`), so the one wait covered both; the unpacking then read the pinned copy. Graphs
+  built in the same step (first build, a new T) kept the old path.
+- **What the idea first asked for, and why not:** skipping the routing read when every expert of the layer was in
+  VRAM. The host learns that only from the routing it reads, so a skip cannot be exact: the CPU partial and the
+  fetch need the ids. Only the second round trip could go.
+- **Data** (same window and method as above): readback 1.01 -> 0.06 s per 1,500 tokens, layer graphs +0.7-1.5 s
+  alone (28.06-28.79 vs 27.31-27.37 s in the first window); on top of the other two packages -1.2% against -1.1%
+  without it, inside the runs' spread. Exact (logits hash identical, draft head and plain).
+- **Why it failed:** the blocking read cost the copy, not the extra wait. A ~20 KB device-to-host transfer at a
+  two-position step takes ~25 us (1.01 s over ~40,000 reads), most of it fixed latency, queued behind the graph or
+  not; the round trip it saved did not show above the runs' spread.
+- **Not tried:** the pack written by the graph's last kernel straight into host-visible memory (no copy at all); it
+  would move the transfer into that kernel's writes over PCIe, and it changes a ggml backend contract (graph outputs
+  in device memory).
 
 ## ggml-sycl patches and backend switches
 

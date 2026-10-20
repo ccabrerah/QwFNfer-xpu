@@ -1,0 +1,268 @@
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -85,6 +85,8 @@
+ static int  fuse_conv_t_mode()       { static const int  v = [] { const char * e = getenv("GGML_SYCL_FUSE_CONV_T"); const int m = e ? atoi(e) : 0; return m == 1 || m == 2 ? m : 0; }(); return v; }
+ static bool fuse_pool_on()           { static const bool v = fuse3_env("GGML_SYCL_FUSE_POOL");           return v; }
+ static bool fuse_mask_on()           { static const bool v = fuse3_env("GGML_SYCL_FUSE_MASK");           return v; }
++// ---- decode: matvecs of one input in one launch (patch 39) ----
++static bool fuse_multi_mmv_on()      { static const bool v = fuse3_env("GGML_SYCL_FUSE_MULTI_MMV");      return v; }
+ 
+ static bool f3_single(const ggml_cgraph * g, int k) {
+     return !(g->nodes[k]->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(g, k) == 1;
+@@ -7230,8 +7232,70 @@
+             for (int64_t e = it.get_local_id(0); e < n; e += GLUE_MASK_WG) od[e] = res[e];
+         });
+     });
++}
++
++// GGML_SYCL_FUSE_MULTI_MMV (patch 39): two or three MUL_MATs, the next ones the loop runs, of reordered Q8_0 weights with
++// the same K that read the same 2-4 activation columns (the engine puts a layer's projections of one input next to
++// each other). Each would take the same path alone (no DMMV, MMVQ over the reorder layout, patch 28's 2-4-column
++// kernel): the activations are quantized once, as ggml_sycl_op_mul_mat quantizes them for each, and one launch computes
++// every weight's rows as its own launch does. Two launches fewer per extra weight.
++static bool glue_mmv_one(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const ggml_tensor * src1) {
++    if (dst->op != GGML_OP_MUL_MAT || dst->src[1] != src1 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) return false;
++    const ggml_tensor * src0 = dst->src[0];
++    if (!src0 || src0->type != GGML_TYPE_Q8_0 || !src0->extra || !ggml_is_contiguous(src0) || src0->ne[2] != 1 || src0->ne[3] != 1 ||
++        src0->ne[0] != src1->ne[0] || src0->ne[0] % QK8_0 != 0 || dst->ne[0] != src0->ne[1] || dst->ne[1] != src1->ne[1] ||
++        dst->ne[2] != 1 || dst->ne[3] != 1) return false;
++    if (ggml_backend_buffer_is_sycl_split(src0->buffer) || ggml_backend_buffer_is_sycl_split(dst->buffer)) return false;
++    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) return false;
++    // the path ggml_sycl_mul_mat takes for it alone
++    if (g_ggml_sycl_prioritize_dmmv || can_use_dequantize_mul_mat_vec(src0, src1, dst) || !can_use_mul_mat_vec_q(src0, src1, dst)) return false;
++    return should_reorder_tensor(ctx, dst) && ggml_sycl_supports_reorder_mmvq(src0->type);
+ }
+ 
++static int glue_mmv_match(ggml_backend_sycl_context & ctx, const ggml_cgraph * g, int i, int idx[3]) {
++    ggml_tensor * a = g->nodes[i];
++    const ggml_tensor * src1 = a->src[1];
++    if (!src1 || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || src1->ne[1] < 2 || src1->ne[1] > 4 ||
++        src1->ne[2] != 1 || src1->ne[3] != 1 || ggml_backend_buffer_is_sycl_split(src1->buffer)) return 0;
++    if (!ggml_sycl_q8w_multi_enabled() || !glue_mmv_one(ctx, a, src1)) return 0;
++    int n = 1;
++    idx[0] = i;
++    for (int j = i; n < 3;) {
++        j = glue_next_computed(g, j);
++        if (j < 0 || !glue_mmv_one(ctx, g->nodes[j], src1)) break;
++        idx[n++] = j;
++    }
++    if (n < 2) return 0;
++    // every output disjoint from the input (read again by each weight's quantization in the separate launches) and
++    // from the other outputs
++    for (int k = 0; k < n; k++) {
++        if (glue_overlap(g->nodes[idx[k]], src1)) return 0;
++        for (int l = k + 1; l < n; l++) if (glue_overlap(g->nodes[idx[k]], g->nodes[idx[l]])) return 0;
++    }
++    return n;
++}
++
++static bool glue_mmv_run(ggml_backend_sycl_context & ctx, ggml_cgraph * g, const int * idx, int n) {
++    const ggml_tensor * src1 = g->nodes[idx[0]]->src[1];
++    ggml_sycl_q8w_multi m{};
++    m.n = n;
++    for (int k = 0; k < n; k++) {
++        ggml_tensor * d = g->nodes[idx[k]];
++        opt_for_reorder(&ctx, d->src[0], src1, d, mul_mat_algo::MMVQ);   // as the separate launch would; a no-op once done
++        const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(d->src[0]->extra);
++        if (!extra || !extra->optimized_feature.reorder) return false;   // nothing launched: the nodes run on their own
++        m.vx[k]    = d->src[0]->data;
++        m.dst[k]   = (float *) d->data;
++        m.nrows[k] = (int) d->src[0]->ne[1];
++    }
++    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1];
++    const int64_t padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
++    const dpct::queue_ptr stream = ctx.stream();
++    ggml_sycl_pool_alloc<char> q8(ctx.pool(), (size_t) ne11 * padded * sizeof(block_q8_1) / QK8_1);
++    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) src1->data, q8.get(), (int) ne10, (int) ne11, (int) padded, stream);
++    return ggml_sycl_mul_mat_vec_q8w_multi(m, q8.get(), (int) ne10, (int) ne11, (int) (padded * sizeof(block_q8_1) / QK8_1), stream);
++}
++
+ // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
+ // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
+ // returns the number of following nodes to skip (0 = no fusion)
+@@ -7601,6 +7665,15 @@
+             continue;
+         }
+ 
++        if (node->op == GGML_OP_MUL_MAT && fuse_multi_mmv_on()) {
++            int idx[3];
++            const int n = glue_mmv_match(*sycl_ctx, cgraph, i, idx);
++            if (n >= 2 && glue_mmv_run(*sycl_ctx, cgraph, idx, n)) {
++                i = idx[n - 1];
++                continue;
++            }
++        }
++
+         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
+             i += 2;
+             continue;
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -1372,6 +1372,97 @@
+         });
+ }
+ 
++// GGML_SYCL_FUSE_MULTI_MMV (patch 39): patch 28's kernel over the rows of two or three weights in one launch. Global
++// row r belongs to weight k when off[k] <= r < off[k + 1] and is that weight's row r - off[k]; from there the body is
++// patch 28's, character for character (the same loads, per-column accumulation and sub-group reduction), with the
++// weight's own base, row count and output.
++template <int NC>
++static void reorder_mul_mat_vec_q8_0_q8_1_wide_ncols_multi_sycl(const ggml_sycl_q8w_multi & m, const void * vy, const int ncols,
++                                                                const int stride_col_y_bytes, dpct::queue_ptr stream) {
++    GGML_ASSERT(ncols % QK8_0 == 0);
++    constexpr int sg_per_wg = 8;
++    const int     nb        = ncols / QK8_0;
++    struct wts { const void * vx[3]; float * dst[3]; int nrows[3]; int off[4]; } w{};
++    int total = 0;
++    for (int k = 0; k < 3; k++) {
++        w.off[k] = total;
++        if (k < m.n) { w.vx[k] = m.vx[k]; w.dst[k] = m.dst[k]; w.nrows[k] = m.nrows[k]; total += m.nrows[k]; }
++    }
++    w.off[3] = total;
++    for (int k = m.n; k < 3; k++) w.off[k] = total;   // unused weights start past the last row
++    const int n_wg = ceil_div(total, sg_per_wg);
++    stream->parallel_for(
++        sycl::nd_range<1>(sycl::range<1>((size_t) n_wg * sg_per_wg * WARP_SIZE), sycl::range<1>(sg_per_wg * WARP_SIZE)),
++        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++            const sycl::sub_group sg   = it.get_sub_group();
++            const int             grow = (int) it.get_group(0) * sg_per_wg + (int) sg.get_group_linear_id();
++            if (grow >= w.off[3]) {
++                return;   // the whole sub-group shares the row
++            }
++            const int     k      = grow < w.off[1] ? 0 : grow < w.off[2] ? 1 : 2;
++            const int     row    = grow - w.off[k];
++            const int     nrows  = w.nrows[k];
++            const void *  vx     = w.vx[k];
++            float *       dst    = w.dst[k];
++            const size_t  d_base = (size_t) ncols * nrows;   // scales follow all quants: [qs0|...|qsN][d0|...|dN]
++            const int         lane = sg.get_local_linear_id();
++            const int8_t *    xq   = (const int8_t *) vx + (size_t) row * nb * QK8_0;
++            const ggml_half * xd   = (const ggml_half *) ((const char *) vx + d_base) + (size_t) row * nb;
++            float             sum[NC];
++#pragma unroll
++            for (int c = 0; c < NC; c++) {
++                sum[c] = 0.0f;
++            }
++#pragma unroll 2
++            for (int i = lane; i < nb; i += WARP_SIZE) {
++                const sycl::int4 * xv = (const sycl::int4 *) (xq + (size_t) i * QK8_0);
++                const sycl::int4   x0 = xv[0], x1 = xv[1];
++                const float        dx = static_cast<float>(xd[i]);
++#pragma unroll
++                for (int c = 0; c < NC; c++) {
++                    const char *        vyc = (const char *) vy + (size_t) c * stride_col_y_bytes;
++                    const sycl::int4 *  yv  = (const sycl::int4 *) ((const int8_t *) vyc + (size_t) i * QK8_1);
++                    const sycl::half2 * yds = (const sycl::half2 *) (vyc + ncols);
++                    const sycl::int4    y0 = yv[0], y1 = yv[1];
++                    int                 sq = 0;
++#pragma unroll
++                    for (int j = 0; j < 4; j++) {
++                        sq = dpct::dp4a(x0[j], y0[j], sq);
++                    }
++#pragma unroll
++                    for (int j = 0; j < 4; j++) {
++                        sq = dpct::dp4a(x1[j], y1[j], sq);
++                    }
++                    sum[c] += dx * static_cast<float>(yds[i][0]) * sq;
++                }
++            }
++#pragma unroll
++            for (int c = 0; c < NC; c++) {
++                const float r = sycl::reduce_over_group(sg, sum[c], sycl::plus<float>());
++                if (lane == 0) {
++                    dst[(size_t) c * nrows + row] = r;
++                }
++            }
++        });
++}
++
++bool ggml_sycl_q8w_multi_enabled() {
++    return ggml_sycl_q8w_enabled() && ggml_sycl_q8w_ncols_enabled();
++}
++
++bool ggml_sycl_mul_mat_vec_q8w_multi(const ggml_sycl_q8w_multi & m, const void * vy, int ncols, int ncols_dst,
++                                     int stride_col_y_bytes, dpct::queue_ptr stream) {
++    if (!ggml_sycl_q8w_multi_enabled() || m.n < 2 || m.n > 3 || ncols % QK8_0 != 0) {
++        return false;
++    }
++    switch (ncols_dst) {
++        case 2: reorder_mul_mat_vec_q8_0_q8_1_wide_ncols_multi_sycl<2>(m, vy, ncols, stride_col_y_bytes, stream); return true;
++        case 3: reorder_mul_mat_vec_q8_0_q8_1_wide_ncols_multi_sycl<3>(m, vy, ncols, stride_col_y_bytes, stream); return true;
++        case 4: reorder_mul_mat_vec_q8_0_q8_1_wide_ncols_multi_sycl<4>(m, vy, ncols, stride_col_y_bytes, stream); return true;
++        default: return false;
++    }
++}
++
+ template <int ncols_dst>
+ static void reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols(
+         const void * vx, const void * vy, float * dst,
+--- a/ggml/src/ggml-sycl/mmvq.hpp
++++ b/ggml/src/ggml-sycl/mmvq.hpp
+@@ -63,6 +63,20 @@
+     size_t             src1_row_stride,
+     dpct::queue_ptr    stream);
+ 
++// GGML_SYCL_FUSE_MULTI_MMV (patch 39): up to three reordered Q8_0 weights with the same K against the same 2-4
++// quantized activation columns (vy, quantize_and_reorder_q8_1_soa), one launch of patch 28's wide kernel over all their
++// rows. Each row is computed as the one-weight launch computes it. Returns false when the wide kernel is not enabled
++// (GGML_SYCL_Q8W and GGML_SYCL_Q8W_NCOLS) or the shape is not served; nothing is launched then.
++struct ggml_sycl_q8w_multi {
++    const void * vx[3];      // the weights' data (reorder layout)
++    float *      dst[3];     // their outputs, [nrows, ncols_dst] contiguous
++    int          nrows[3];
++    int          n;          // 2 or 3
++};
++bool ggml_sycl_q8w_multi_enabled();
++bool ggml_sycl_mul_mat_vec_q8w_multi(const ggml_sycl_q8w_multi & m, const void * vy, int ncols, int ncols_dst,
++                                     int stride_col_y_bytes, dpct::queue_ptr stream);
++
+ // Fused dense-FFN GEMV: writes glu(gate . y, up . y) instead of the two mat-vec results.
+ // vx / vgate must share shape, stride and reorder layout. Returns false if unhandled.
+ bool ggml_sycl_mul_mat_vec_q_glu_reorder(
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4239,6 +4239,8 @@
+     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "DECODE_GLUE"; }
+     bool run_whole_graph() override { return true; }
+     std::string vars() override { return VARS_TO_STR4(pattern, n, T, variant); }
++    // multi_mmv: the reference quantizes the activations its own way (as test_mul_mat's q8_0 cases)
++    double max_nmse_err() override { return pattern == "multi_mmv" ? 5e-4 : 1e-7; }
+ 
+     test_decode_glue(std::string pattern, int64_t n, int64_t T, bool variant = false)
+         : pattern(std::move(pattern)), n(n), T(T), variant(variant) {}
+@@ -4349,6 +4351,23 @@
+             ggml_tensor * dpos = ggml_sub(ctx, cp, ggml_reshape_2d(ctx, np, 1, T));
+             ggml_tensor * ok   = ggml_step(ctx, ggml_scale_bias(ctx, dpos, -1.0f, 0.5f));
+             ggml_tensor * out  = ggml_cast(ctx, ggml_scale_bias(ctx, ok, 1000.0f, -1000.0f), GGML_TYPE_F16);
++            ggml_set_name(out, "out");
++            return out;
++        }
++        if (pattern == "multi_mmv") {   // patch 39: q8_0 projections of one input next to each other (3, or 2 with variant)
++            const int64_t rows[3] = { 96, 32, 64 };
++            const int     nw      = variant ? 2 : 3;
++            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
++            ggml_set_name(x, "x");
++            ggml_tensor * y[3] = {};
++            for (int k = 0; k < nw; k++) {
++                ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n, rows[k]);
++                ggml_set_name(w, k == 0 ? "w0" : k == 1 ? "w1" : "w2");
++                y[k] = ggml_mul_mat(ctx, w, x);
++            }
++            // collected right-nested: the graph runs the matvecs next to each other, then the collecting concats
++            ggml_tensor * out = y[nw - 1];
++            for (int k = nw - 2; k >= 0; k--) out = ggml_concat(ctx, y[k], out, 0);
+             ggml_set_name(out, "out");
+             return out;
+         }
+@@ -9874,6 +9893,11 @@
+     }
+     test_cases.emplace_back(new test_decode_glue("mask", 2052, 4));   // 8208 elements: one work-group
+     test_cases.emplace_back(new test_decode_glue("mask", 5000, 4));   // over GLUE_MASK_MAX: not fused
++    for (int64_t T : { 1, 2, 3, 4 }) {   // patch 39 (T = 1 is not fused: the one-column kernel)
++        test_cases.emplace_back(new test_decode_glue("multi_mmv", 256, T));
++        test_cases.emplace_back(new test_decode_glue("multi_mmv", 256, T, true));
++    }
++    test_cases.emplace_back(new test_decode_glue("multi_mmv", 2560, 2));
+ 
+     // fused add + unary + mul: the delta-net alpha gate, bias and scale broadcast over dim 0
+     for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SOFTPLUS }) {
