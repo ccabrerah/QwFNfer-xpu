@@ -3,14 +3,13 @@
 
 **All the fun of running qwen38-flash-next fast, but on the Intel ARC**
 
-An engine for running qwen38-flash-next as fast as possible on a B70. A derivative of the [QwFNfer](https://github.com/Apolog1ze-Dev/QwFNfer) engine that adds B70 support and miscellaneour QoL functionality for usage as your main LLM provider.
+An engine for running qwen38-flash-next as fast as possible on a B70. A derivative of the [QwFNfer](https://github.com/Apolog1ze-Dev/QwFNfer) engine that adds B70 support and miscellaneous QoL functionality for usage as your main (local) LLM provider.
 
 In a nutshell:
 
-* Uses custom kernels and has engine work that improves performance over a direct port.
-* Meant for single 32GB B70 GPU, 32GB system ram machines. The not-really-poor-neither-rich man's AI workstation.
+* Uses custom kernels and has engine work that improves performance over a direct port. These are tuned for B70's layout and architecture.
+* Meant for single 32GB B70 GPU, 32GB system ram machines.
 * Adds timesharing and supports quickly resuming multiple sessions as a mitigation for single prompt processing.
-* Incorporates optimizations coming from multiple inspirations from other engines and CUDA paths.
 
 **New here?** [`docs/BUILDING.md`](docs/BUILDING.md) (build the engine, download and prepare the model), then
 [`docs/RUNNING.md`](docs/RUNNING.md) (the command line, the knobs worth tuning, the power cap).
@@ -19,14 +18,16 @@ In a nutshell:
 
 There is no other way to use this GPU on other similar engines, which makes us infinite% faster than the competition.
 
+True answer: It is, it attempts to be as fast as possible for the target architecture, multiple options have been attempted and measured, with the winners incorporated into the engine.
+
 ## On perf
 
 For the V4 quant (see recipe, a "Q3-level" set), on a Ryzen 5700, 32GB dual channel system ram, on a dedicated linux system with a B70 power limited to 120W you get (the box has run at 160 W since 2026-10-10: decode +5-11%, prefill +16-23%):
 
-* 30 TP decode
-* 400-500 prefill
+* 30 TPS decode up to 150k or so context
+* Around 500 TPS prefill
 
-A weaker "Q2 level" quant gets you to 40TPS, but with a noticeable downgrade on inference.
+A weaker "Q2 level" quant gets you to 40TPS, but with a **noticeable downgrade** on inference.
 
 ## Major improvements
 
