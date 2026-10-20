@@ -280,6 +280,12 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_FUSE_POOL=1` | 38 | 1 | The sparse-attention indexer's mean pool (the CONTs of its strided slices, their ADDs and the SCALE) as one kernel. |
 | `GGML_SYCL_FUSE_MASK=1` | 38 | 1 | The cell mask (SUB of n_past, SCALE, STEP, SCALE, CPY to f16) as one kernel, one work-group: every read before any write, since its output may reuse the cell positions' memory. Up to 16,384 cells x positions. |
 | `GGML_SYCL_FUSE_MULTI_MMV=1` | 39 | 1 | Two or three Q8_0 matvecs of 2-4 columns that read the same input and run one after the other (the engine's `QWFN_MMV_ADJACENT` puts them there) as one launch of patch 28's kernel: the input quantized once, each row computed as the separate launch computes it (bit-identical). |
+| `GGML_SYCL_MMID_SOA_T=1` | 40 | 1 | With `GGML_SYCL_MMID_SMALL_T`: a MUL_MAT_ID of 2-4 tokens over Q8_0_SOA / IQ4_NL_SOA experts (the MoE down projections, the late fold) as one quantization of every token's rows and one launch, instead of both per token. Each row computed as the one-token kernel computes it (bit-identical). |
+| `GGML_SYCL_FUSE_MULTI_MMV_GLU=1` | 40 | 1 | With `GGML_SYCL_FUSE_MULTI_MMV`: when the two merged matvecs are a SWIGLU's gate and up (the shared expert) and only it reads them, the same launch writes silu(gate) * up; the two products never reach memory (bit-identical). |
+| `GGML_SYCL_LIDX_DECODE=1` | 40 | 1 | The sparse-attention indexer (LIGHTNING_INDEXER) at 1-4 queries with f16 keys: one sub-group per key row for every query (the row read once instead of once per query), 32-bit indexing; each score computed as the stock kernel computes it (bit-identical). 15,000 blocks x 2 queries: 63 -> 43 us. |
+| `GGML_SYCL_TOPK_SCAN=1` | 40 | 1 | With `GGML_SYCL_TOPK_DETERMINISTIC`: the radix top-k emits in contiguous column chunks per sub-group with one work-group exchange per row (four work-group collectives per 1,024 columns before); the same indices in the same order. k 513 of 15,000 x 2 rows: 54 -> 22 us. |
+| `GGML_SYCL_FUSE_MOESUM_W=1` | 40 | 1 | With `GGML_SYCL_FUSE_MOESUM`: the late fold's gate weights (a strided view the graph gathers with a CONT) read in place by the MoE sum; the CONT launches nothing. |
+| `GGML_SYCL_FUSE_PACK_IDS=1` | 40 | 1 | With `GGML_SYCL_FUSE_ROUTE_GATHER`: the routed ids' f32 copy into the readback pack written by the route-gather kernel instead of a later CPY, when nothing between reads or writes the pack or the ids. |
 
 ## 6. Upstream ggml and runtime variables the launcher sets
 

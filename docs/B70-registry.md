@@ -292,3 +292,22 @@ time moves ~4 s between identical runs with the expert reads).
 
 bf16 and f32 matvecs at two positions run through oneDNN and are not merged. The software levers left are ~1% each:
 the rest of the glue, the indexer and its top-k at long context, the shared expert's gate + up + SwiGLU as one kernel.
+
+## Decode round 4 (2026-10-20)
+
+The three levers left after round 3, as patch 40 with six switches, measured against v37 (rounds 1-3 on). Exactness as
+in round 3 (the decode logits hash: promotions frozen, plain decode, promotions on); speed as the sum of the engine's
+timed decode parts over 1,500 replayed tokens (3 interleaved runs per arm) and over 1,000 replayed tokens after a 52K
+prompt (2 per arm).
+
+| Experiment | Result | Status |
+|---|---|---|
+| A fused IQ4_NL gate + up + SwiGLU for the routed experts | not built: only layer 2 has IQ4_NL gate/up (the others are Q2_0, one launch since patch 08), ~14 launches per step | -- |
+| The expert down projections at two positions: a quantization and a launch per token (`GGML_SYCL_MMID_SMALL_T`) -> one each (`GGML_SYCL_MMID_SOA_T`), plus the shared expert's SwiGLU inside patch 39's launch (`_FUSE_MULTI_MMV_GLU`) | exact; -0.8% (layer graphs -1.0%) | **adopted in the launcher** |
+| The indexer at 1-4 queries (`GGML_SYCL_LIDX_DECODE`) and the deterministic top-k's emit (`GGML_SYCL_TOPK_SCAN`) | exact; per call at 15,000 blocks x 2 queries: indexer 63 -> 43 us, top-k (k 513) 54 -> 22 us; short -0.2%, 52K -1.1% (layer graphs -1.5%) | **adopted in the launcher** |
+| The late fold's weights CONT and the routed ids' copy into the readback pack folded into the kernels that read them (`_FUSE_MOESUM_W`, `_FUSE_PACK_IDS`) | exact; -0.4% (layer graphs -0.6%) | **adopted in the launcher** |
+| All six | short -1.3% (layer graphs -1.7%), 52K -2.1% (layer graphs -3.0%); `test-backend-ops` DECODE_GLUE 75/75, LIGHTNING_INDEXER 222/222, TOP_K 539/539 | -- |
+
+The indexer is still ~7x off its bandwidth bound at long context (43 us for 3.8 MB of keys): keeping the stock kernel's
+per-score order (a 16-lane reduction per head) is what keeps it bit-identical.
+

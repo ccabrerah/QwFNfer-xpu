@@ -41,6 +41,7 @@ export GGML_SYCL_TOPK_WG=1 GGML_SYCL_FUSE_HC_MIX=1 GGML_SYCL_FUSE_ADDCHAIN=1 GGM
 export GGML_SYCL_FUSE_SCALE_SILU=1 GGML_SYCL_FUSE_GATE_BCAST=1 GGML_SYCL_FUSE_ROUTE_GATHER=1 GGML_SYCL_FUSE_PREDICT=1 GGML_SYCL_FUSE_ADDCHAIN_VIEWS=1   # decode glue as merged kernels (patch 37, bit-identical): layer graphs -3%
 export GGML_SYCL_FUSE_CONV_T=1 GGML_SYCL_FUSE_POOL=1 GGML_SYCL_FUSE_MASK=1                                     # decode glue, round 2 (patch 38, bit-identical): layer graphs -2.3%
 export GGML_SYCL_FUSE_MULTI_MMV=1 QWFN_MMV_ADJACENT=1                                              # a verify step's q8_0 projections of one input as one launch (patch 39 + the engine's node order, bit-identical): layer graphs -1.3%
+export GGML_SYCL_MMID_SOA_T=1 GGML_SYCL_FUSE_MULTI_MMV_GLU=1 GGML_SYCL_LIDX_DECODE=1 GGML_SYCL_TOPK_SCAN=1 GGML_SYCL_FUSE_MOESUM_W=1 GGML_SYCL_FUSE_PACK_IDS=1   # decode round 4 (patch 40, bit-identical): short -1.3%, 52K context -2.1%
 # The MTP draft head (docs/B70-config.md, "MTP"): QWFN_B70_MTP = the head (its experts in Q2_0, all on the device),
 # QWFN_B70_DRAFT_VOCAB = the token ids it may draft (optional). One draft per step, no layer-0 prefetch pass, and the
 # expert tier one GB smaller for the head.

@@ -1,0 +1,908 @@
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -87,6 +87,11 @@ static bool fuse_pool_on()           { static const bool v = fuse3_env("GGML_SYC
+ static bool fuse_mask_on()           { static const bool v = fuse3_env("GGML_SYCL_FUSE_MASK");           return v; }
+ // ---- decode: matvecs of one input in one launch (patch 39) ----
+ static bool fuse_multi_mmv_on()      { static const bool v = fuse3_env("GGML_SYCL_FUSE_MULTI_MMV");      return v; }
++// ---- decode round 4 (patch 40): verify-step MoE matvecs, the shared expert's GLU, the late fold's weights, the pack ids ----
++static bool fuse_multi_mmv_glu_on()  { static const bool v = fuse3_env("GGML_SYCL_FUSE_MULTI_MMV_GLU");  return v; }
++static bool mmid_soa_t_on()          { static const bool v = fuse3_env("GGML_SYCL_MMID_SOA_T");          return v; }
++static bool fuse_moesum_w_on()       { static const bool v = fuse3_env("GGML_SYCL_FUSE_MOESUM_W");       return v; }
++static bool fuse_pack_ids_on()       { static const bool v = fuse3_env("GGML_SYCL_FUSE_PACK_IDS");       return v; }
+ 
+ static bool f3_single(const ggml_cgraph * g, int k) {
+     return !(g->nodes[k]->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(g, k) == 1;
+@@ -127,6 +132,7 @@ static void f3_addchain(dpct::queue_ptr q, const float * const ops_in[5], int n_
+ 
+ // MoE weighted sum: CONT at i -> the MUL_MAT that reads it, or -1
+ static ggml_tensor * g_moesum_pending[8];
++static const ggml_tensor * g_moesum_wview[8];   // GGML_SYCL_FUSE_MOESUM_W: the weights' view the sum reads instead of w, or null
+ static int g_moesum_n = 0;
+ static bool f3_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+     const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
+@@ -160,7 +166,9 @@ static int f3_match_moesum(const ggml_cgraph * g, int i) {
+     }
+     return -1;
+ }
+-static void f3_moesum(dpct::queue_ptr q, const ggml_tensor * m) {
++static void f3_moesum_wview(dpct::queue_ptr q, const ggml_tensor * m, const ggml_tensor * wv);
++static void f3_moesum(dpct::queue_ptr q, const ggml_tensor * m, const ggml_tensor * wv = nullptr) {
++    if (wv) { f3_moesum_wview(q, m, wv); return; }
+     const ggml_tensor * D = m->src[0]->src[0]->src[0]->src[0];   // reshape -> cont -> permute -> D
+     const ggml_tensor * w = m->src[1];
+     const float * dd = (const float *) D->data; const float * wd = (const float *) w->data; float * out = (float *) m->data;
+@@ -5928,6 +5936,35 @@ static bool ggml_sycl_mmid_small_t_on() {
+     return on;
+ }
+ 
++// GGML_SYCL_MMID_SOA_T=1 (patch 40): with GGML_SYCL_MMID_SMALL_T, a MUL_MAT_ID of 2-4 tokens over Q8_0_SOA or IQ4_NL_SOA
++// experts (the MoE down projections, the late fold) as one quantization of every token's rows and one launch, instead of
++// both per token. Each row is quantized as the per-token call quantizes it (q8_1 blocks are per row) and each output
++// row is computed by the one-token kernel's arithmetic. False (nothing queued) for anything else.
++static bool ggml_sycl_mul_mat_id_soa_t(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                                       const ggml_tensor * ids, ggml_tensor * dst) {
++    if (src0->type != GGML_TYPE_Q8_0_SOA && src0->type != GGML_TYPE_IQ4_NL_SOA) return false;
++    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], T = src1->ne[2], n_ids = ids->ne[0];
++    if (T < 2 || T > 4 || src1->ne[3] != 1) return false;
++    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1)) return false;
++    if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0 || (ne11 != 1 && ne11 != n_ids)) return false;
++    if (ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) || ids->nb[1] % sizeof(int32_t) != 0 ||
++        ids->ne[1] != T || ids->ne[2] != 1) return false;
++    if (dst->nb[0] != sizeof(float) || dst->ne[0] != src0->ne[1] || dst->ne[1] != n_ids || dst->ne[2] != T) return false;
++    if (src0->type == GGML_TYPE_Q8_0_SOA ? (ne10 % QK8_0 != 0 || ((uintptr_t) src0->data | src0->nb[2]) % 16 != 0) : ne10 % QK4_NL != 0) return false;
++    // the per-token path quantizes for the reorder kernel when the weights carry the reorder flag (never for these types)
++    const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
++    if (extra && extra->optimized_feature.reorder) return false;
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3, " : 2-4 tokens, one quantization and one launch");
++    const int    padded = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
++    const size_t qrow   = (size_t) padded * sizeof(block_q8_1) / QK8_1;
++    const queue_ptr stream = ctx.stream();
++    ggml_sycl_pool_alloc<char> q8(ctx.pool(), (size_t) (ne11 * T) * qrow);
++    quantize_row_q8_1_sycl<quantize_q8_1>((const float *) src1->data, q8.get(), (int) ne10, (int) (ne11 * T), padded, stream);
++    return ggml_sycl_mul_mat_vec_q_id_soa_t(src0->type, src0->data, q8.get(), (const int32_t *) ids->data, (float *) dst->data,
++        (int) ne10, (int) src0->ne[1], (int) n_ids, (int) T, (int) (ids->nb[1] / sizeof(int32_t)),
++        src0->nb[2], dst->nb[1], dst->nb[2], ne11 == 1 ? 0 : qrow, (size_t) ne11 * qrow, stream);
++}
++
+ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+                                  ggml_tensor *dst) try {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
+@@ -5948,6 +5985,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+             return;
+         }
+     } else if (ggml_sycl_mmid_small_t_on() && ne12 <= 8 && ids->ne[1] == ne12 && ne13 == 1 && ids->ne[2] == 1) {
++        if (mmid_soa_t_on() && ggml_sycl_mul_mat_id_soa_t(ctx, src0, src1, ids, dst)) {
++            return;
++        }
+         // GGML_SYCL_MMID_SMALL_T=1, few tokens (e.g. a speculative decoding verify): run the fused kernel on each token view, so ids stay on the device
+         // the fused checks do not depend on the token: all tokens take this path, or the first one declines
+         bool ok = true;
+@@ -6795,6 +6835,53 @@ static bool glue_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+     return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+ }
+ 
++// GGML_SYCL_FUSE_MOESUM_W (patch 40): f3_moesum with the weights read where the CONT feeding w would have read them: wv is
++// [1, n, T], weight k of token t at k * nb1 + t * nb2. The same products summed in the same order.
++static void f3_moesum_wview(dpct::queue_ptr q, const ggml_tensor * m, const ggml_tensor * wv) {
++    const ggml_tensor * D = m->src[0]->src[0]->src[0]->src[0];   // reshape -> cont -> permute -> D
++    const float * dd = (const float *) D->data; const float * wd = (const float *) wv->data; float * out = (float *) m->data;
++    const int64_t E = D->ne[0], n = D->ne[1], T = D->ne[2];
++    const int64_t d1 = D->nb[1] / 4, d2 = D->nb[2] / 4, wk = wv->nb[1] / 4, w2 = wv->nb[2] / 4;
++    const int64_t tot = E * T;
++    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(((tot + 255) / 256) * 256), sycl::range<1>(256)), [=](sycl::nd_item<1> it) {
++        const int64_t i = it.get_global_id(0);
++        if (i >= tot) return;
++        const int64_t e = i % E, t = i / E;
++        float acc = 0.0f;
++        for (int64_t k = 0; k < n; k++) acc += dd[e + k * d1 + t * d2] * wd[k * wk + t * w2];
++        out[i] = acc;
++    });
++}
++
++// GGML_SYCL_FUSE_MOESUM_W (patch 40): the CONT at i gathers, from a strided view, the weights of a MoE sum the loop has
++// deferred (the late fold's: a view of the host-written weights): its single reader is the RESHAPE that is that sum's w.
++// Returns the pending slot, the sum then reading the view itself; -1 when anything between could change the view or the
++// sum's output overlaps it.
++static int glue_moesum_w_match(const ggml_cgraph * g, int i) {
++    const ggml_tensor * c = g->nodes[i], * v = c->src[0];
++    if (c->op != GGML_OP_CONT || !v || c->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32 || !f3_single(g, i)) return -1;
++    if (v->ne[0] != 1 || v->ne[3] != 1 || v->nb[1] % sizeof(float) != 0 || v->nb[2] % sizeof(float) != 0 || !v->data) return -1;
++    for (int k = 0; k < g_moesum_n; k++) {
++        const ggml_tensor * m = g_moesum_pending[k], * w = m->src[1];
++        if (g_moesum_wview[k] || w->op != GGML_OP_RESHAPE || w->src[0] != c) continue;
++        // f3_match_moesum checked w [n, 1, T] against D: the view holds the same n x T values in the same order
++        if (v->ne[1] != w->ne[0] || v->ne[2] != w->ne[2]) return -1;
++        int jm = -1, jr = -1;
++        for (int j = i + 1; j < g->n_nodes; j++) {
++            if (g->nodes[j] == w) jr = j;
++            if (g->nodes[j] == m) { jm = j; break; }
++        }
++        if (jm < 0 || jr < 0 || !f3_single(g, jr)) return -1;
++        if (glue_overlap(m, v)) return -1;
++        for (int j = i + 1; j < jm; j++) {
++            const ggml_tensor * n = g->nodes[j];
++            if (n->data && ggml_nbytes(n) && !ggml_sycl_is_view_or_noop(n) && glue_overlap(n, v)) return -1;
++        }
++        return k;
++    }
++    return -1;
++}
++
+ // GGML_SYCL_FUSE_ADDCHAIN_VIEWS: f3_match_addchain's chain of 2-4 ADDs (each adds one more same-shape f32 operand to the
+ // previous result, which has no other reader) also when view nodes sit between the ADDs, which f3_match_addchain (adjacent
+ // nodes only) stops at. Same operands in the same order for f3_addchain; *last gets the last ADD's index.
+@@ -6896,6 +6983,52 @@ static void glue_route_a(dpct::queue_ptr q, const ggml_tensor * ct, ggml_tensor
+     });
+ }
+ 
++// GGML_SYCL_FUSE_PACK_IDS (patch 40): the CPY of the same routed ids (the same view node the route gather's CONT reads)
++// into an f32 tensor, later in the graph (the engine's readback pack): written by the route gather's kernel instead,
++// when nothing between reads or writes the copy's destination or writes the ids. Returns the CPY's index, or -1.
++static const ggml_tensor * g_glue_skip[8];   // nodes a fused kernel has already done; the loop passes over them
++static int g_glue_skip_n = 0;
++static int glue_pack_ids_match(const ggml_cgraph * g, int i, int j) {
++    const ggml_tensor * ct = g->nodes[i], * src = ct->src[0];
++    const int64_t n = ggml_nelements(ct);
++    if (g_glue_skip_n >= 8) return -1;
++    for (int k = j + 1; k < g->n_nodes; k++) {
++        const ggml_tensor * c = g->nodes[k];
++        if (c->op != GGML_OP_CPY || c->src[0] != src) continue;
++        const ggml_tensor * d = c->src[1];
++        if (!d || d->type != GGML_TYPE_F32 || !ggml_is_contiguous(d) || ggml_nelements(d) != n || c->data != d->data) return -1;
++        if (!(c->flags & GGML_TENSOR_FLAG_COMPUTE) || glue_overlap(d, src) || glue_overlap(d, ct) || glue_overlap(d, g->nodes[j]) ||
++            glue_overlap(d, g->nodes[j]->src[0])) return -1;
++        // between the route gather and the copy: no reader or writer of the destination, no writer of the ids
++        for (int l = i + 1; l < k; l++) {
++            const ggml_tensor * n2 = g->nodes[l];
++            if (ggml_sycl_is_view_or_noop(n2)) continue;
++            if (n2->data && ggml_nbytes(n2) && (glue_overlap(n2, d) || glue_overlap(n2, src))) return -1;
++            for (int s = 0; s < GGML_MAX_SRC; s++) if (n2->src[s] && n2->src[s]->data && glue_overlap(n2->src[s], d)) return -1;
++        }
++        return k;
++    }
++    return -1;
++}
++
++static void glue_route_a_pack(dpct::queue_ptr q, const ggml_tensor * ct, ggml_tensor * gr, const ggml_tensor * cpy) {
++    const ggml_tensor * src = ct->src[0], * tab = gr->src[0];
++    const int64_t n = ggml_nelements(ct), u = src->ne[0];
++    const char * sd = (const char *) src->data; const size_t s1 = src->nb[1];
++    const char * td = (const char *) tab->data; const size_t t1 = tab->nb[1];
++    int32_t * cd = (int32_t *) ct->data;
++    int32_t * od = (int32_t *) gr->data;
++    float *   pd = (float *) cpy->src[1]->data;
++    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(((n + 63) / 64) * 64), sycl::range<1>(64)), [=](sycl::nd_item<1> it) {
++        const int64_t e = it.get_global_id(0);
++        if (e >= n) return;
++        const int32_t id = *(const int32_t *) (sd + (e % u) * sizeof(int32_t) + (e / u) * s1);
++        cd[e] = id;
++        od[e] = *(const int32_t *) (td + (size_t) id * t1);
++        pd[e] = (float) id;
++    });
++}
++
+ static int glue_route_match_b(const ggml_cgraph * g, int i, bool * gather_first) {
+     const ggml_tensor * gr = g->nodes[i], * tab = gr->src[0], * ids = gr->src[1];
+     if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || !ggml_is_contiguous(gr) || !tab || !ids) return -1;
+@@ -7275,6 +7408,41 @@ static int glue_mmv_match(ggml_backend_sycl_context & ctx, const ggml_cgraph * g
+     return n;
+ }
+ 
++// GGML_SYCL_FUSE_MULTI_MMV_GLU (patch 40): the two matmuls glue_mmv_match found are the gate and up of the GLU the loop runs
++// next (swiglu in the split form, halves not swapped), each read only by it: returns the GLU's index, else -1.
++static int glue_mmv_glu_match(const ggml_cgraph * g, const int idx[2]) {
++    const int j = glue_next_computed(g, idx[1]);
++    if (j < 0) return -1;
++    const ggml_tensor * glu = g->nodes[j], * a = g->nodes[idx[0]], * b = g->nodes[idx[1]];
++    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) return -1;
++    const ggml_tensor * gate = glu->src[0], * up = glu->src[1];
++    if (!gate || !up || !((gate == a && up == b) || (gate == b && up == a))) return -1;
++    if (glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || !ggml_are_same_shape(glu, gate) || !ggml_are_same_shape(gate, up)) return -1;
++    if (gate->src[0]->ne[1] != up->src[0]->ne[1]) return -1;
++    for (int k = 0; k < 2; k++) if (!f3_single(g, idx[k])) return -1;
++    return j;
++}
++
++static bool glue_mmv_glu_run(ggml_backend_sycl_context & ctx, ggml_cgraph * g, const int idx[2], int jglu) {
++    ggml_tensor * glu = g->nodes[jglu];
++    ggml_tensor * gate = g->nodes[idx[0]] == glu->src[0] ? g->nodes[idx[0]] : g->nodes[idx[1]];
++    ggml_tensor * up   = gate == g->nodes[idx[0]] ? g->nodes[idx[1]] : g->nodes[idx[0]];
++    const ggml_tensor * src1 = gate->src[1];
++    for (ggml_tensor * d : { gate, up }) {
++        opt_for_reorder(&ctx, d->src[0], src1, d, mul_mat_algo::MMVQ);   // as the separate launch would; a no-op once done
++        const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(d->src[0]->extra);
++        if (!extra || !extra->optimized_feature.reorder) return false;   // nothing launched: the nodes run on their own
++    }
++    scope_op_debug_print scope_dbg_print(__func__, glu, /*num_src=*/2, " : q8_0 gate + up + swiglu, one launch");
++    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1];
++    const int64_t padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
++    const dpct::queue_ptr stream = ctx.stream();
++    ggml_sycl_pool_alloc<char> q8(ctx.pool(), (size_t) ne11 * padded * sizeof(block_q8_1) / QK8_1);
++    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) src1->data, q8.get(), (int) ne10, (int) ne11, (int) padded, stream);
++    return ggml_sycl_mul_mat_vec_q8w_glu(gate->src[0]->data, up->src[0]->data, q8.get(), (float *) glu->data, (int) ne10,
++                                         (int) gate->src[0]->ne[1], (int) ne11, (int) (padded * sizeof(block_q8_1) / QK8_1), stream);
++}
++
+ static bool glue_mmv_run(ggml_backend_sycl_context & ctx, ggml_cgraph * g, const int * idx, int n) {
+     const ggml_tensor * src1 = g->nodes[idx[0]]->src[1];
+     ggml_sycl_q8w_multi m{};
+@@ -7372,6 +7540,7 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
+ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+     ggml_sycl_set_main_device(sycl_ctx->device);
+     g_moesum_n = 0;   // apply_fuse3.py: no CONT skip survives a graph
++    g_glue_skip_n = 0;
+ 
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+@@ -7381,6 +7550,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+             continue;
+         }
++        if (g_glue_skip_n > 0) {   // done by an earlier fused kernel (patch 40)
++            int hit = -1;
++            for (int k = 0; k < g_glue_skip_n; k++) if (g_glue_skip[k] == node) hit = k;
++            if (hit >= 0) { g_glue_skip[hit] = g_glue_skip[--g_glue_skip_n]; continue; }
++        }
+ 
+         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
+         if (nodes_to_skip != 0) {
+@@ -7462,7 +7636,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+         if (node->op == GGML_OP_CONT && fuse_route_gather_on()) {
+             const int j = glue_route_match_a(cgraph, i);
+             if (j > 0) {
+-                glue_route_a(sycl_ctx->stream(), node, cgraph->nodes[j]);
++                const int jc = fuse_pack_ids_on() ? glue_pack_ids_match(cgraph, i, j) : -1;
++                if (jc > 0) {
++                    GGML_SYCL_DEBUG("[SYCL][OP] pack_ids: %s written by the route gather\n", cgraph->nodes[jc]->name);
++                    glue_route_a_pack(sycl_ctx->stream(), node, cgraph->nodes[j], cgraph->nodes[jc]);
++                    g_glue_skip[g_glue_skip_n++] = cgraph->nodes[jc];
++                } else {
++                    glue_route_a(sycl_ctx->stream(), node, cgraph->nodes[j]);
++                }
+                 i = j;
+                 continue;
+             }
+@@ -7565,14 +7746,24 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+         }
+         if (node->op == GGML_OP_CONT && fuse_moesum_on() && g_moesum_n < 8) {
+             const int j = f3_match_moesum(cgraph, i);
+-            if (j > 0) { g_moesum_pending[g_moesum_n++] = cgraph->nodes[j]; continue; }   // the matmul reads D itself
++            if (j > 0) { g_moesum_wview[g_moesum_n] = nullptr; g_moesum_pending[g_moesum_n++] = cgraph->nodes[j]; continue; }   // the matmul reads D itself
++        }
++        if (node->op == GGML_OP_CONT && fuse_moesum_w_on() && g_moesum_n > 0) {
++            const int k = glue_moesum_w_match(cgraph, i);
++            if (k >= 0) {   // the sum reads the weights' view itself
++                GGML_SYCL_DEBUG("[SYCL][OP] moesum_w: %s read in place by the MoE sum\n", node->name);
++                g_moesum_wview[k] = node->src[0];
++                continue;
++            }
+         }
+         if (node->op == GGML_OP_MUL_MAT && g_moesum_n > 0) {
+             int hit = -1;
+             for (int k = 0; k < g_moesum_n; k++) if (g_moesum_pending[k] == node) hit = k;
+             if (hit >= 0) {
+-                f3_moesum(sycl_ctx->stream(), node);
+-                g_moesum_pending[hit] = g_moesum_pending[--g_moesum_n];
++                f3_moesum(sycl_ctx->stream(), node, g_moesum_wview[hit]);
++                --g_moesum_n;
++                g_moesum_pending[hit] = g_moesum_pending[g_moesum_n];
++                g_moesum_wview[hit]   = g_moesum_wview[g_moesum_n];
+                 continue;
+             }
+         }
+@@ -7668,6 +7859,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+         if (node->op == GGML_OP_MUL_MAT && fuse_multi_mmv_on()) {
+             int idx[3];
+             const int n = glue_mmv_match(*sycl_ctx, cgraph, i, idx);
++            const int jglu = n == 2 && fuse_multi_mmv_glu_on() ? glue_mmv_glu_match(cgraph, idx) : -1;
++            if (jglu > 0 && glue_mmv_glu_run(*sycl_ctx, cgraph, idx, jglu)) {
++                i = jglu;
++                continue;
++            }
+             if (n >= 2 && glue_mmv_run(*sycl_ctx, cgraph, idx, n)) {
+                 i = idx[n - 1];
+                 continue;
+--- a/ggml/src/ggml-sycl/lightning-indexer.cpp
++++ b/ggml/src/ggml-sycl/lightning-indexer.cpp
+@@ -144,6 +144,69 @@ static void lightning_indexer_f32_sycl(
+         });
+ }
+ 
++// GGML_SYCL_LIDX_DECODE=1 (patch 40): decode and verify steps (1-4 queries, one stream, F16 keys, 128-wide heads). One
++// sub-group per key row scores it against every query, so the row is read once instead of once per query, and the
++// indexing is 32-bit (the kernel above divides 64-bit integers per row, which the GPU emulates). Per (query, key) the
++// arithmetic is the kernel above's: the lane's 8 products in the same order, the same sub-group reduction, the heads'
++// relu * weight added on lane 0 in head order, then the mask.
++static void lightning_indexer_decode_f16_sycl(
++        const char * q, const char * k, const char * w, const char * m, float * dst,
++        int n_embd, int n_head, int n_batch, int n_kv,
++        size_t nbq1, size_t nbq2, size_t nbk2, size_t nbw1, size_t nbm1, size_t nb1,
++        queue_ptr stream) {
++    constexpr int LANES = WARP_SIZE;
++    constexpr int ELEMS_PER_LANE = 8;
++    constexpr int ROWS_PER_BLOCK = 4;
++    constexpr int BLOCK_SIZE = ROWS_PER_BLOCK * LANES;
++    const int n_blocks = (n_kv + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
++    const size_t dst_b = nb1 / sizeof(float);
++
++    stream->parallel_for(
++        sycl::nd_range<1>(sycl::range<1>((size_t) n_blocks * BLOCK_SIZE), sycl::range<1>(BLOCK_SIZE)),
++        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++            const int lane = (int) item.get_local_id(0) % LANES;
++            const int i_kv = (int) item.get_group(0) * ROWS_PER_BLOCK + (int) item.get_local_id(0) / LANES;
++            if (i_kv >= n_kv) {
++                return;   // the whole sub-group shares the row
++            }
++            const sycl::half * k_row = (const sycl::half *) (k + (size_t) i_kv * nbk2);
++            float k_local[ELEMS_PER_LANE];
++#pragma unroll
++            for (int j = 0; j < ELEMS_PER_LANE; ++j) {
++                k_local[j] = static_cast<float>(k_row[lane*ELEMS_PER_LANE + j]);
++            }
++            for (int i_batch = 0; i_batch < n_batch; ++i_batch) {
++                const char  * q_base = q + (size_t) i_batch * nbq2;
++                const float * w_base = (const float *) (w + (size_t) i_batch * nbw1);
++                float score = 0.0f;
++                for (int h = 0; h < n_head; ++h) {
++                    const float * q_row = (const float *) (q_base + (size_t) h * nbq1);
++                    float dot = 0.0f;
++#pragma unroll
++                    for (int j = 0; j < ELEMS_PER_LANE; ++j) {
++                        const int i = lane*ELEMS_PER_LANE + j;
++                        if (i < n_embd) {   // always true (128 = 16 x 8); kept so the sum has the kernel above's shape
++                            dot += q_row[i] * k_local[j];
++                        }
++                    }
++                    dot = sycl::reduce_over_group(item.get_sub_group(), dot, sycl::plus<float>());
++                    if (lane == 0) {
++                        score += sycl::max(dot, 0.0f) * w_base[h];
++                    }
++                }
++                if (lane == 0) {
++                    const sycl::half * m_base = (const sycl::half *) (m + (size_t) i_batch * nbm1);
++                    dst[(size_t) i_kv + (size_t) i_batch * dst_b] = score + static_cast<float>(m_base[i_kv]);
++                }
++            }
++        });
++}
++
++static bool lightning_indexer_decode_on() {
++    static const bool on = [] { const char * e = getenv("GGML_SYCL_LIDX_DECODE"); return e && atoi(e) != 0; }();
++    return on;
++}
++
+ void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
+     const ggml_tensor * q = dst->src[0];
+@@ -183,6 +246,18 @@ void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor
+ 
+     GGML_ASSERT(n_embd == WARP_SIZE * 8);
+ 
++    if (lightning_indexer_decode_on() && k->type == GGML_TYPE_F16 && n_stream == 1 && nem3 == 1 && n_batch >= 1 &&
++        n_batch <= 4 && n_kv <= INT32_MAX && n_head <= INT32_MAX) {
++        GGML_SYCL_DEBUG("[SYCL][OP] lightning_indexer: decode kernel (%lld queries, %lld keys)\n", (long long) n_batch, (long long) n_kv);
++        lightning_indexer_decode_f16_sycl(
++                (const char *) q->data, (const char *) k->data,
++                (const char *) w->data, (const char *) m->data, (float *) dst->data,
++                (int) n_embd, (int) n_head, (int) n_batch, (int) n_kv,
++                nbq1, nbq2, nbk2, nbw1, nbm1, nb1,
++                ctx.stream());
++        return;
++    }
++
+     lightning_indexer_f32_sycl(
+             (const char *) q->data, (const char *) k->data,
+             (const char *) w->data, (const char *) m->data, (float *) dst->data,
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -1446,6 +1446,93 @@ static void reorder_mul_mat_vec_q8_0_q8_1_wide_ncols_multi_sycl(const ggml_sycl_
+         });
+ }
+ 
++// GGML_SYCL_FUSE_MULTI_MMV_GLU (patch 40): patch 28's per-row body, as a function for the GLU form below; the same loads,
++// per-column accumulation and sub-group reduction. Every lane gets the column sums.
++template <int NC>
++static __dpct_inline__ void q8w_ncols_row(const void * vx, const void * vy, const int ncols, const int nrows, const int row,
++                                          const int stride_col_y_bytes, const sycl::sub_group & sg, float res[NC]) {
++    const int         nb     = ncols / QK8_0;
++    const size_t      d_base = (size_t) ncols * nrows;   // scales follow all quants: [qs0|...|qsN][d0|...|dN]
++    const int         lane   = sg.get_local_linear_id();
++    const int8_t *    xq     = (const int8_t *) vx + (size_t) row * nb * QK8_0;
++    const ggml_half * xd     = (const ggml_half *) ((const char *) vx + d_base) + (size_t) row * nb;
++    float             sum[NC];
++#pragma unroll
++    for (int c = 0; c < NC; c++) {
++        sum[c] = 0.0f;
++    }
++#pragma unroll 2
++    for (int i = lane; i < nb; i += WARP_SIZE) {
++        const sycl::int4 * xv = (const sycl::int4 *) (xq + (size_t) i * QK8_0);
++        const sycl::int4   x0 = xv[0], x1 = xv[1];
++        const float        dx = static_cast<float>(xd[i]);
++#pragma unroll
++        for (int c = 0; c < NC; c++) {
++            const char *        vyc = (const char *) vy + (size_t) c * stride_col_y_bytes;
++            const sycl::int4 *  yv  = (const sycl::int4 *) ((const int8_t *) vyc + (size_t) i * QK8_1);
++            const sycl::half2 * yds = (const sycl::half2 *) (vyc + ncols);
++            const sycl::int4    y0 = yv[0], y1 = yv[1];
++            int                 sq = 0;
++#pragma unroll
++            for (int j = 0; j < 4; j++) {
++                sq = dpct::dp4a(x0[j], y0[j], sq);
++            }
++#pragma unroll
++            for (int j = 0; j < 4; j++) {
++                sq = dpct::dp4a(x1[j], y1[j], sq);
++            }
++            sum[c] += dx * static_cast<float>(yds[i][0]) * sq;
++        }
++    }
++#pragma unroll
++    for (int c = 0; c < NC; c++) {
++        res[c] = sycl::reduce_over_group(sg, sum[c], sycl::plus<float>());
++    }
++}
++
++// GGML_SYCL_FUSE_MULTI_MMV_GLU (patch 40): a GLU's gate and up weights (same rows, reorder layout) against the same 2-4
++// quantized columns: one sub-group computes row r of the gate, then row r of the up, each as patch 28's kernel computes
++// it, and writes the GLU kernel's silu(gate) * up per column. The two products never reach memory.
++template <int NC>
++static void reorder_mul_mat_vec_q8_0_q8_1_wide_ncols_glu_sycl(const void * vx_gate, const void * vx_up, const void * vy, float * dst,
++                                                              const int ncols, const int nrows, const int stride_col_y_bytes,
++                                                              dpct::queue_ptr stream) {
++    GGML_ASSERT(ncols % QK8_0 == 0);
++    constexpr int sg_per_wg = 8;
++    const int     n_wg      = ceil_div(nrows, sg_per_wg);
++    stream->parallel_for(
++        sycl::nd_range<1>(sycl::range<1>((size_t) n_wg * sg_per_wg * WARP_SIZE), sycl::range<1>(sg_per_wg * WARP_SIZE)),
++        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++            const sycl::sub_group sg  = it.get_sub_group();
++            const int             row = (int) it.get_group(0) * sg_per_wg + (int) sg.get_group_linear_id();
++            if (row >= nrows) {
++                return;   // the whole sub-group shares the row
++            }
++            float g[NC], u[NC];
++            q8w_ncols_row<NC>(vx_gate, vy, ncols, nrows, row, stride_col_y_bytes, sg, g);
++            q8w_ncols_row<NC>(vx_up,   vy, ncols, nrows, row, stride_col_y_bytes, sg, u);
++            if (sg.get_local_linear_id() == 0) {
++#pragma unroll
++                for (int c = 0; c < NC; c++) {
++                    dst[(size_t) c * nrows + row] = op_silu(g[c]) * u[c];
++                }
++            }
++        });
++}
++
++bool ggml_sycl_mul_mat_vec_q8w_glu(const void * vx_gate, const void * vx_up, const void * vy, float * dst, int ncols, int nrows,
++                                   int ncols_dst, int stride_col_y_bytes, dpct::queue_ptr stream) {
++    if (!ggml_sycl_q8w_multi_enabled() || ncols % QK8_0 != 0) {
++        return false;
++    }
++    switch (ncols_dst) {
++        case 2: reorder_mul_mat_vec_q8_0_q8_1_wide_ncols_glu_sycl<2>(vx_gate, vx_up, vy, dst, ncols, nrows, stride_col_y_bytes, stream); return true;
++        case 3: reorder_mul_mat_vec_q8_0_q8_1_wide_ncols_glu_sycl<3>(vx_gate, vx_up, vy, dst, ncols, nrows, stride_col_y_bytes, stream); return true;
++        case 4: reorder_mul_mat_vec_q8_0_q8_1_wide_ncols_glu_sycl<4>(vx_gate, vx_up, vy, dst, ncols, nrows, stride_col_y_bytes, stream); return true;
++        default: return false;
++    }
++}
++
+ bool ggml_sycl_q8w_multi_enabled() {
+     return ggml_sycl_q8w_enabled() && ggml_sycl_q8w_ncols_enabled();
+ }
+@@ -3563,6 +3650,187 @@ static void launch_mul_mat_vec_q8_0_soa_moe(
+     else                           go(std::integral_constant<int, WARP_SIZE / 4>{});
+ }
+ 
++// ---- GGML_SYCL_MMID_SOA_T (patch 40): the two SOA MoE matvecs above for 2-4 tokens in one launch ----
++// Work-group row y = token * n_ids + expert slot: the expert id, the quantized input row and the output row are that
++// token's (where the one-token launch for that token finds them); from there each body is the one-token kernel's.
++template <int LPR>
++static void mul_mat_vec_iq4_nl_soa_moe_t(
++    const void * __restrict__ vx_base, const void * __restrict__ vy_base,
++    float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
++    const int ncols, const int nrows, const int n_ids, const int ids_tok_stride,
++    const size_t expert_weight_stride, const size_t dst_row_stride, const size_t dst_tok_stride,
++    const size_t src1_row_stride, const size_t y_tok_stride,
++    const sycl::nd_item<3> & it, uint16_t * lut) {
++    constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
++    const int pair       = it.get_group(1);
++    const int tok        = pair / n_ids;
++    const int expert_idx = pair - tok * n_ids;
++    const int i02        = ids_dev[(size_t) tok * ids_tok_stride + expert_idx];
++    const int lane       = it.get_local_id(2);
++    const int row        = (it.get_group(2) * it.get_local_range(1) + it.get_local_id(1)) * ROWS_PER_SG + lane / LPR;
++    const int t          = lane % LPR;
++    {
++        const int lid = it.get_local_linear_id(), nl = (int) it.get_local_range().size();
++        for (int i = lid; i < 256; i += nl)
++            lut[i] = (uint16_t) ((uint8_t) kvalues_iq4nl[i & 0xf] | ((uint16_t) (uint8_t) kvalues_iq4nl[i >> 4] << 8));
++        sycl::group_barrier(it.get_group());
++    }
++
++    const uint8_t *    slice = (const uint8_t *) vx_base + (size_t) i02 * expert_weight_stride;
++    const block_q8_1 * y     = (const block_q8_1 *) ((const char *) vy_base + (size_t) tok * y_tok_stride + (size_t) expert_idx * src1_row_stride);
++    float *            dst   = (float *) ((char *) dst_base + (size_t) tok * dst_tok_stride + (size_t) expert_idx * dst_row_stride);
++
++    const int bpr = ncols / QK4_NL;
++    const sycl::half * scales = (const sycl::half *) (slice + (size_t) nrows * bpr * 16);
++    float acc = 0.0f;
++    if (row < nrows) {
++        for (int b = t; b < bpr; b += LPR) {
++            const size_t blk = (size_t) row * bpr + b;
++            const sycl::uint4 q = *(const sycl::uint4 *) (slice + blk * 16);
++            const int * u = (const int *) y[b].qs;
++            int sumi = 0;
++            const uint32_t qw[4] = { q.x(), q.y(), q.z(), q.w() };
++#pragma unroll
++            for (int k = 0; k < 4; k++) {
++                int vx, vy;
++                uint32_t x = 0, yv = 0;
++#pragma unroll
++                for (int j = 0; j < 4; j++) {
++                    const uint32_t e = lut[(qw[k] >> (8 * j)) & 0xff];
++                    x |= (e & 0xffu) << (8 * j); yv |= (e >> 8) << (8 * j);
++                }
++                vx = (int) x; vy = (int) yv;
++                sumi = dpct::dp4a(vx, u[k], sumi);
++                sumi = dpct::dp4a(vy, u[k + 4], sumi);
++            }
++            acc += (float) scales[blk] * (float) y[b].ds[0] * (float) sumi;
++        }
++    }
++#pragma unroll
++    for (int mask = LPR / 2; mask > 0; mask >>= 1) {
++        acc += dpct::permute_sub_group_by_xor(it.get_sub_group(), acc, mask);
++    }
++    if (row < nrows && t == 0) {
++        dst[row] = acc;
++    }
++}
++
++template <int LPR>
++static void mul_mat_vec_q8_0_soa_moe_t(
++    const void * __restrict__ vx_base, const void * __restrict__ vy_base,
++    float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
++    const int ncols, const int nrows, const int n_ids, const int ids_tok_stride,
++    const size_t expert_weight_stride, const size_t dst_row_stride, const size_t dst_tok_stride,
++    const size_t src1_row_stride, const size_t y_tok_stride,
++    const sycl::nd_item<3> & it) {
++    constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
++    const int pair       = it.get_group(1);
++    const int tok        = pair / n_ids;
++    const int expert_idx = pair - tok * n_ids;
++    const int i02        = ids_dev[(size_t) tok * ids_tok_stride + expert_idx];
++    const int lane       = it.get_local_id(2);
++    const int row        = (it.get_group(2) * it.get_local_range(1) + it.get_local_id(1)) * ROWS_PER_SG + lane / LPR;
++    const int t          = lane % LPR;
++
++    const uint8_t *    slice = (const uint8_t *) vx_base + (size_t) i02 * expert_weight_stride;
++    const block_q8_1 * y     = (const block_q8_1 *) ((const char *) vy_base + (size_t) tok * y_tok_stride + (size_t) expert_idx * src1_row_stride);
++    float *            dst   = (float *) ((char *) dst_base + (size_t) tok * dst_tok_stride + (size_t) expert_idx * dst_row_stride);
++
++    const int bpr = ncols / QK8_0;
++    const sycl::half * scales = (const sycl::half *) (slice + (size_t) nrows * bpr * QK8_0);
++    float acc = 0.0f;
++    if (row < nrows) {
++        const uint8_t * rq = slice + (size_t) row * bpr * QK8_0;
++        for (int c = t; c < 2 * bpr; c += LPR) {
++            const int b = c >> 1, h = c & 1;
++            const sycl::uint4 q = *(const sycl::uint4 *) (rq + (size_t) c * 16);
++            const int * u = (const int *) y[b].qs + 4 * h;
++            int sumi = 0;
++            sumi = dpct::dp4a((int) q.x(), u[0], sumi);
++            sumi = dpct::dp4a((int) q.y(), u[1], sumi);
++            sumi = dpct::dp4a((int) q.z(), u[2], sumi);
++            sumi = dpct::dp4a((int) q.w(), u[3], sumi);
++            acc += (float) scales[(size_t) row * bpr + b] * (float) y[b].ds[0] * (float) sumi;
++        }
++    }
++#pragma unroll
++    for (int mask = LPR / 2; mask > 0; mask >>= 1) {
++        acc += dpct::permute_sub_group_by_xor(it.get_sub_group(), acc, mask);
++    }
++    if (row < nrows && t == 0) {
++        dst[row] = acc;
++    }
++}
++
++bool ggml_sycl_mul_mat_vec_q_id_soa_t(enum ggml_type src0_type, const void * vx_base, const void * vy, const int32_t * ids_dev,
++                                      float * dst_base, int ncols, int nrows, int n_ids, int n_tok, int ids_tok_stride,
++                                      size_t expert_weight_stride, size_t dst_row_stride, size_t dst_tok_stride,
++                                      size_t src1_row_stride, size_t y_tok_stride, dpct::queue_ptr stream) {
++    constexpr int SG_PER_WG = 4;
++    if (n_ids < 1 || n_tok < 1) {
++        return false;
++    }
++    const unsigned n_pairs = (unsigned) n_ids * (unsigned) n_tok;
++    if (src0_type == GGML_TYPE_IQ4_NL_SOA) {
++        if (ncols % QK4_NL != 0) {
++            return false;
++        }
++        // lanes per row as launch_mul_mat_vec_iq4_nl_soa_moe chooses them
++        const int bpr = ncols / QK4_NL;
++        static const int lpr_env = [] { const char * e = getenv("GGML_SYCL_IQ4_SOA_LPR"); return e ? atoi(e) : 0; }();
++        const int lpr = lpr_env ? lpr_env : bpr >= WARP_SIZE ? WARP_SIZE : bpr >= WARP_SIZE / 2 ? WARP_SIZE / 2 : WARP_SIZE / 4;
++        auto go = [&](auto lpr_tag) {
++            constexpr int LPR = decltype(lpr_tag)::value;
++            constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
++            const int n_sg = (nrows + ROWS_PER_SG - 1) / ROWS_PER_SG;
++            const sycl::range<3> block_nums(1, n_pairs, (unsigned) ((n_sg + SG_PER_WG - 1) / SG_PER_WG));
++            const sycl::range<3> block_dims(1, SG_PER_WG, WARP_SIZE);
++            stream->submit([&](sycl::handler & cgh) {
++                sycl::local_accessor<uint16_t, 1> lut(sycl::range<1>(256), cgh);
++                cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
++                    [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                        uint16_t * l = lut.get_multi_ptr<sycl::access::decorated::no>().get();
++                        mul_mat_vec_iq4_nl_soa_moe_t<LPR>(vx_base, vy, dst_base, ids_dev, ncols, nrows, n_ids, ids_tok_stride,
++                            expert_weight_stride, dst_row_stride, dst_tok_stride, src1_row_stride, y_tok_stride, item, l);
++                    });
++            });
++        };
++        if (lpr >= WARP_SIZE)          go(std::integral_constant<int, WARP_SIZE>{});
++        else if (lpr >= WARP_SIZE / 2) go(std::integral_constant<int, WARP_SIZE / 2>{});
++        else                           go(std::integral_constant<int, WARP_SIZE / 4>{});
++        return true;
++    }
++    if (src0_type == GGML_TYPE_Q8_0_SOA) {
++        // 16-byte loads: every slice must start 16-byte aligned (as ggml_sycl_mul_mat_vec_q_id requires)
++        if (ncols % QK8_0 != 0 || ((uintptr_t) vx_base | expert_weight_stride) % 16 != 0) {
++            return false;
++        }
++        // lanes per row as launch_mul_mat_vec_q8_0_soa_moe chooses them
++        const int chunks = 2 * (ncols / QK8_0);
++        const int lpr = chunks % WARP_SIZE == 0 ? WARP_SIZE : chunks % (WARP_SIZE / 2) == 0 ? WARP_SIZE / 2
++                                          : chunks % (WARP_SIZE / 4) == 0 ? WARP_SIZE / 4 : WARP_SIZE;
++        auto go = [&](auto lpr_tag) {
++            constexpr int LPR = decltype(lpr_tag)::value;
++            constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
++            const int n_sg = (nrows + ROWS_PER_SG - 1) / ROWS_PER_SG;
++            const sycl::range<3> block_nums(1, n_pairs, (unsigned) ((n_sg + SG_PER_WG - 1) / SG_PER_WG));
++            const sycl::range<3> block_dims(1, SG_PER_WG, WARP_SIZE);
++            stream->submit([&](sycl::handler & cgh) {
++                cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
++                    [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                        mul_mat_vec_q8_0_soa_moe_t<LPR>(vx_base, vy, dst_base, ids_dev, ncols, nrows, n_ids, ids_tok_stride,
++                            expert_weight_stride, dst_row_stride, dst_tok_stride, src1_row_stride, y_tok_stride, item);
++                    });
++            });
++        };
++        if (lpr >= WARP_SIZE)          go(std::integral_constant<int, WARP_SIZE>{});
++        else if (lpr >= WARP_SIZE / 2) go(std::integral_constant<int, WARP_SIZE / 2>{});
++        else                           go(std::integral_constant<int, WARP_SIZE / 4>{});
++        return true;
++    }
++    return false;
++}
++
+ static bool ggml_sycl_moe_q2w_enabled() {
+     static const bool v = [] { const char * e = getenv("GGML_SYCL_MOE_Q2W"); return e && atoi(e) != 0; }();
+     return v;
+--- a/ggml/src/ggml-sycl/mmvq.hpp
++++ b/ggml/src/ggml-sycl/mmvq.hpp
+@@ -77,6 +77,21 @@ bool ggml_sycl_q8w_multi_enabled();
+ bool ggml_sycl_mul_mat_vec_q8w_multi(const ggml_sycl_q8w_multi & m, const void * vy, int ncols, int ncols_dst,
+                                      int stride_col_y_bytes, dpct::queue_ptr stream);
+ 
++// GGML_SYCL_FUSE_MULTI_MMV_GLU (patch 40): a GLU's gate and up (reordered Q8_0, the same rows and K) against the same 2-4
++// quantized columns (vy as for ggml_sycl_mul_mat_vec_q8w_multi), one launch writing silu(gate) * up to dst ([nrows,
++// ncols_dst] contiguous); each product as patch 28's kernel computes it. Returns false when not served (nothing launched).
++bool ggml_sycl_mul_mat_vec_q8w_glu(const void * vx_gate, const void * vx_up, const void * vy, float * dst, int ncols, int nrows,
++                                   int ncols_dst, int stride_col_y_bytes, dpct::queue_ptr stream);
++
++// GGML_SYCL_MMID_SOA_T (patch 40): ggml_sycl_mul_mat_vec_q_id over Q8_0_SOA / IQ4_NL_SOA experts for n_tok tokens in one
++// launch. vy holds every token's q8_1 rows (token t, expert slot e at t * y_tok_stride + e * src1_row_stride), ids_dev is
++// [n_ids, n_tok] with ids_tok_stride ids between tokens, the output row (t, e) is at t * dst_tok_stride + e * dst_row_stride.
++// Per row the arithmetic is the one-token kernel's. Returns false (nothing launched) for any other type or layout.
++bool ggml_sycl_mul_mat_vec_q_id_soa_t(enum ggml_type src0_type, const void * vx_base, const void * vy, const int32_t * ids_dev,
++                                      float * dst_base, int ncols, int nrows, int n_ids, int n_tok, int ids_tok_stride,
++                                      size_t expert_weight_stride, size_t dst_row_stride, size_t dst_tok_stride,
++                                      size_t src1_row_stride, size_t y_tok_stride, dpct::queue_ptr stream);
++
+ // Fused dense-FFN GEMV: writes glu(gate . y, up . y) instead of the two mat-vec results.
+ // vx / vgate must share shape, stride and reorder layout. Returns false if unhandled.
+ bool ggml_sycl_mul_mat_vec_q_glu_reorder(
+--- a/ggml/src/ggml-sycl/topk-radix.cpp
++++ b/ggml/src/ggml-sycl/topk-radix.cpp
+@@ -51,6 +51,7 @@ static void top_k_radix_select_f32(
+     const int       ncols,
+     const int       k,
+     const bool      deterministic,
++    const bool      scan_emit,
+     uint32_t *      slm,
+     const sycl::nd_item<1> & item_ct1
+ ) {
+@@ -138,6 +139,61 @@ static void top_k_radix_select_f32(
+     // grabs. The winners above the pivot come out in index order, and among pivot-equal columns (ties) the
+     // lowest indices win: the same indices in the same order every run. With the atomics, which tied columns
+     // fill the last slots, and the order of all of them, depend on lane timing.
++    // GGML_SYCL_TOPK_SCAN=1 (patch 40): the same output as the tile loop below, with one work-group exchange per row in
++    // place of four collectives per tile of block_size columns. Sub-group s owns the contiguous columns
++    // [s * chunk, (s + 1) * chunk): it counts its winners, an exclusive prefix over the sub-groups' counts gives each
++    // chunk the place of its first winner, then the chunk emits in column order with sub-group scans. A column above the
++    // pivot lands at the number of such columns before it, and pivot-equal columns fill the tail in column order up to
++    // `need`: the tile loop's positions exactly. The histogram's SLM is free past the passes and holds the counts.
++    if (deterministic && scan_emit) {
++        const auto sg    = item_ct1.get_sub_group();
++        const int  sgs   = (int) sg.get_local_linear_range();
++        const int  n_sg  = (int) sg.get_group_linear_range();
++        const int  s     = (int) sg.get_group_linear_id();
++        const int  lane  = (int) sg.get_local_linear_id();
++        const int  chunk = ((ncols + n_sg - 1) / n_sg + sgs - 1) / sgs * sgs;
++        const int  c0    = s * chunk;
++        const int  c1    = sycl::min(ncols, c0 + chunk);
++        uint32_t n_gt = 0, n_eq = 0;
++        for (int col = c0 + lane; col < c1; col += sgs) {
++            const uint32_t kp = top_k_radix_key(src[col]) & mask;
++            n_gt += kp > prefix;
++            n_eq += kp == prefix;
++        }
++        n_gt = sycl::reduce_over_group(sg, n_gt, sycl::plus<uint32_t>());
++        n_eq = sycl::reduce_over_group(sg, n_eq, sycl::plus<uint32_t>());
++        uint32_t * cnt = hist;   // [0, n_sg): above the pivot, [n_sg, 2 n_sg): equal to it
++        if (lane == 0) {
++            cnt[s]        = n_gt;
++            cnt[n_sg + s] = n_eq;
++        }
++        item_ct1.barrier(sycl::access::fence_space::local_space);
++        if (tid == 0) {
++            uint32_t a = 0, b = 0;
++            for (int i = 0; i < n_sg; i++) {
++                const uint32_t ga = cnt[i], eb = cnt[n_sg + i];
++                cnt[i] = a; cnt[n_sg + i] = b;
++                a += ga; b += eb;
++            }
++        }
++        item_ct1.barrier(sycl::access::fence_space::local_space);
++        uint32_t run_gt = cnt[s], run_eq = cnt[n_sg + s];
++        for (int base = c0; base < c1; base += sgs) {
++            const int col = base + lane;
++            uint32_t gt = 0, eq = 0;
++            if (col < c1) {
++                const uint32_t kp = top_k_radix_key(src[col]) & mask;
++                gt = kp > prefix; eq = kp == prefix;
++            }
++            const uint32_t ex_gt = sycl::exclusive_scan_over_group(sg, gt, sycl::plus<uint32_t>());
++            const uint32_t ex_eq = sycl::exclusive_scan_over_group(sg, eq, sycl::plus<uint32_t>());
++            if (gt) dst_idx[run_gt + ex_gt] = col;
++            if (eq && run_eq + ex_eq < need) dst_idx[base_eq + run_eq + ex_eq] = col;
++            run_gt += sycl::reduce_over_group(sg, gt, sycl::plus<uint32_t>());
++            run_eq += sycl::reduce_over_group(sg, eq, sycl::plus<uint32_t>());
++        }
++        return;
++    }
+     if (deterministic) {
+         const auto grp = item_ct1.get_group();
+         uint32_t run_gt = 0, run_eq = 0;   // winners emitted by earlier tiles (uniform across the group)
+@@ -176,6 +232,11 @@ static bool top_k_radix_deterministic() {
+     return on;
+ }
+ 
++static bool top_k_radix_scan_emit() {
++    static const bool on = [] { const char * e = getenv("GGML_SYCL_TOPK_SCAN"); return e && atoi(e) != 0; }();
++    return on;
++}
++
+ static void top_k_radix_f32_sycl(
+     ggml_backend_sycl_context & ctx,
+     const float * src,
+@@ -196,6 +257,12 @@ static void top_k_radix_f32_sycl(
+     const sycl::range<1> block_dims(block_size);
+     const sycl::range<1> grid_dims(nrows);
+     const bool deterministic = top_k_radix_deterministic();
++    const bool scan_emit     = top_k_radix_scan_emit();
++    // the scan emit keeps two counts per sub-group in the histogram's SLM
++    GGML_ASSERT(!scan_emit || 2 * (block_size / 8) <= SYCL_TOP_K_RADIX_HIST_SIZE);   // sub-groups of 8 or more
++    if (deterministic && scan_emit) {
++        GGML_SYCL_DEBUG("[SYCL][OP] top_k radix: scan emit (%lld columns, k %d)\n", (long long) ncols, k);
++    }
+ 
+     main_stream->submit([&](sycl::handler &cgh) {
+         sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(SYCL_TOP_K_RADIX_SLM_WORDS), cgh);
+@@ -207,7 +274,7 @@ static void top_k_radix_f32_sycl(
+ 
+                 top_k_radix_select_f32(
+                     src + (int64_t) row * ncols, dst_indices + (int64_t) row * k,
+-                    (int) ncols, k, deterministic,
++                    (int) ncols, k, deterministic, scan_emit,
+                     slm.get_multi_ptr<sycl::access::decorated::no>().get(),
+                     item_ct1);
+             });
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4240,7 +4240,7 @@ struct test_decode_glue : public test_case {
+     bool run_whole_graph() override { return true; }
+     std::string vars() override { return VARS_TO_STR4(pattern, n, T, variant); }
+     // multi_mmv: the reference quantizes the activations its own way (as test_mul_mat's q8_0 cases)
+-    double max_nmse_err() override { return pattern == "multi_mmv" ? 5e-4 : 1e-7; }
++    double max_nmse_err() override { return pattern == "multi_mmv" || pattern == "mmv_glu" ? 5e-4 : 1e-7; }
+ 
+     test_decode_glue(std::string pattern, int64_t n, int64_t T, bool variant = false)
+         : pattern(std::move(pattern)), n(n), T(T), variant(variant) {}
+@@ -4371,6 +4371,48 @@ struct test_decode_glue : public test_case {
+             ggml_set_name(out, "out");
+             return out;
+         }
++        if (pattern == "mmv_glu") {     // patch 40: q8_0 gate and up of one input and their swiglu (variant: gate also read elsewhere)
++            ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
++            ggml_tensor * wg = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n, 64);
++            ggml_tensor * wu = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n, 64);
++            ggml_set_name(x, "x"); ggml_set_name(wg, "wg"); ggml_set_name(wu, "wu");
++            ggml_tensor * g = ggml_mul_mat(ctx, wg, x);
++            ggml_tensor * u = ggml_mul_mat(ctx, wu, x);
++            ggml_tensor * out = ggml_swiglu_split(ctx, g, u);
++            if (variant) out = ggml_add(ctx, out, g);   // gate has a second reader: not fused
++            ggml_set_name(out, "out");
++            return out;
++        }
++        if (pattern == "moesum_w") {    // patch 40: the MoE sum over permuted expert rows, its weights a strided view
++            const int64_t nl = 4, nmax = 8;   // the late fold: nl rows of the per-position weights table
++            ggml_tensor * D  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, nl, T);
++            ggml_tensor * gw = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, nmax, T);
++            ggml_set_name(D, "D"); ggml_set_name(gw, "gw");
++            ggml_tensor * dc = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, D, 1, 0, 2, 3)), nl, n, T);
++            ggml_tensor * wv = ggml_view_3d(ctx, gw, 1, nl, T, gw->nb[1], gw->nb[2], variant ? gw->nb[1] : 0);
++            ggml_tensor * w  = ggml_reshape_3d(ctx, ggml_cont(ctx, wv), nl, 1, T);
++            ggml_tensor * out = ggml_mul_mat(ctx, dc, w);   // [n, 1, T]
++            ggml_set_name(out, "out");
++            return out;
++        }
++        if (pattern == "pack_ids") {    // patch 40: the routed ids' gather and, later, their f32 copy into a pack
++            const int64_t U = 10;
++            ggml_tensor * probs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
++            ggml_tensor * vslot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n);
++            ggml_tensor * pack  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, U * T + 8);
++            ggml_set_name(probs, "probs"); ggml_set_name(vslot, "vslot"); ggml_set_name(pack, "pack");
++            ggml_tensor * sel  = ggml_argsort_top_k(ctx, probs, U);                  // [U, T], a view
++            ggml_tensor * sl1  = ggml_reshape_1d(ctx, ggml_cont(ctx, sel), U * T);
++            ggml_tensor * slot = ggml_get_rows(ctx, vslot, sl1);                      // [1, U*T] i32
++            ggml_tensor * slot_f = ggml_reshape_2d(ctx, ggml_cast(ctx, slot, GGML_TYPE_F32), U, T);
++            ggml_tensor * pv   = ggml_view_1d(ctx, pack, U * T, 8 * sizeof(float));
++            // variant: the pack read between the gather and the copy (built first, so it runs first): not fused
++            if (variant) slot_f = ggml_add(ctx, slot_f, ggml_reshape_2d(ctx, ggml_scale(ctx, pv, 2.0f), U, T));
++            ggml_tensor * c    = ggml_cpy(ctx, sel, pv);                              // i32 -> f32
++            ggml_tensor * out  = ggml_add(ctx, slot_f, ggml_reshape_2d(ctx, c, U, T));
++            ggml_set_name(out, "out");
++            return out;
++        }
+         GGML_ABORT("unknown pattern %s", pattern.c_str());
+     }
+ 
+@@ -9898,6 +9940,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_decode_glue("multi_mmv", 256, T, true));
+     }
+     test_cases.emplace_back(new test_decode_glue("multi_mmv", 2560, 2));
++    for (int64_t T : { 1, 2, 3, 4 }) {   // patch 40 (T = 1 is not fused)
++        test_cases.emplace_back(new test_decode_glue("mmv_glu", 256, T));
++        test_cases.emplace_back(new test_decode_glue("mmv_glu", 256, T, true));
++        test_cases.emplace_back(new test_decode_glue("moesum_w", 2560, T));
++        test_cases.emplace_back(new test_decode_glue("moesum_w", 2560, T, true));
++        test_cases.emplace_back(new test_decode_glue("pack_ids", 512, T));
++        test_cases.emplace_back(new test_decode_glue("pack_ids", 512, T, true));
++    }
++    test_cases.emplace_back(new test_decode_glue("mmv_glu", 2560, 2));
++    // patch 40: the decode indexer (1-4 queries, f16 keys) and the top-k of its blocks
++    for (int64_t kv : { 768, 5000, 15001 }) {
++        for (int64_t nb : { 1, 2, 3, 4 }) {
++            test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, nb, 1, 1, GGML_TYPE_F16));
++        }
++        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {kv, 2, 1, 1}, 513));
++        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {kv, 2, 1, 1}, 513, true));
++    }
+ 
+     // fused add + unary + mul: the delta-net alpha gate, bias and scale broadcast over dim 0
+     for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SOFTPLUS }) {
+@@ -12751,6 +12810,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    // patch 40: decode-step indexer and block top-k at short and long context
++    for (int kv : { 768, 3072, 15000 }) {
++        for (int bs : { 1, 2 }) {
++            test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, GGML_TYPE_F16));
++        }
++        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {kv, 2, 1, 1}, 513));
++    }
++
+     // launch-overhead isolation: single L2_NORM launch vs batched siblings at the GDN
+     // production shape (strided qkv views) -- perf-mode only, the eval list has its own
+     // 2/4-wide coverage
