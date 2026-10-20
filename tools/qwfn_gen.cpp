@@ -302,6 +302,13 @@ int main(int argc, char ** argv) {
     // to be exact is checked against it).
     static const bool hash_decode = getenv("QWFN_HASH_DECODE") != nullptr;
     uint64_t logits_hash = 1469598103934665603ull;
+    // QWFN_LOGITS_SAVE=FILE / QWFN_LOGITS_CMP=FILE (diagnostic): every scored position's logits written to FILE, or read
+    // back from a saved FILE and compared with this run's: KL(saved || this), top-1 agreement, |d logprob| of the scored
+    // token, the largest |d logit|, and positions where all logits are equal.
+    FILE * lg_save = getenv("QWFN_LOGITS_SAVE") ? fopen(getenv("QWFN_LOGITS_SAVE"), "wb") : nullptr;
+    FILE * lg_cmp  = getenv("QWFN_LOGITS_CMP")  ? fopen(getenv("QWFN_LOGITS_CMP"),  "rb") : nullptr;
+    std::vector<float> lg_ref(lg_cmp ? (size_t) eng.n_vocab() : 0);
+    struct { int n = 0, top1 = 0, same = 0; double kl = 0, kl_max = 0, dlp = 0, dlp_max = 0, dlogit_max = 0, nll_ref = 0; } lc;
     auto argmax = [&](const float * l) { return qwfn_argmax(l, eng.n_vocab()); };
     auto score  = [&](const float * l, int32_t tok) {   // -log softmax(l)[tok]
         if (hash_decode) {
@@ -312,6 +319,26 @@ int main(int argc, char ** argv) {
         double z = 0.0; for (int64_t v = 0; v < eng.n_vocab(); v++) z += std::exp((double) l[v] - mx);
         const double v = -((double) l[tok] - mx - std::log(z));
         nll_sum += v; nll_n++;
+        if (lg_save) fwrite(l, sizeof(float), (size_t) eng.n_vocab(), lg_save);
+        if (lg_cmp && fread(lg_ref.data(), sizeof(float), lg_ref.size(), lg_cmp) == lg_ref.size()) {
+            const int64_t nv = eng.n_vocab();
+            const float * r = lg_ref.data();
+            float mr = r[0]; int64_t ar = 0, al = 0;
+            for (int64_t u = 1; u < nv; u++) { if (r[u] > mr) { mr = r[u]; ar = u; } if (l[u] > l[al]) al = u; }
+            double zr = 0.0; for (int64_t u = 0; u < nv; u++) zr += std::exp((double) r[u] - mr);
+            const double lzr = mr + std::log(zr), lzl = mx + std::log(z);
+            double kl = 0.0, dl = 0.0;
+            for (int64_t u = 0; u < nv; u++) {
+                const double lpr = r[u] - lzr, lpl = l[u] - lzl;
+                kl += std::exp(lpr) * (lpr - lpl);
+                dl = std::max(dl, (double) std::fabs(r[u] - l[u]));
+            }
+            const double dlp = std::fabs((r[tok] - lzr) - (l[tok] - lzl));
+            lc.n++; lc.top1 += ar == al; lc.kl += kl; lc.kl_max = std::max(lc.kl_max, kl);
+            lc.dlp += dlp; lc.dlp_max = std::max(lc.dlp_max, dlp); lc.dlogit_max = std::max(lc.dlogit_max, dl);
+            if (dl == 0.0) lc.same++;
+            lc.nll_ref += -(r[tok] - lzr);
+        }
         static const bool verbose = getenv("QWFN_PPL_VERBOSE") != nullptr;
         if (verbose) fprintf(stderr, "[nll] #%d tok %d: %.6f\n", nll_n, tok, v);
     };
@@ -481,6 +508,14 @@ int main(int argc, char ** argv) {
     }
     if (nll_n) printf("replay NLL: %.4f per token (ppl %.2f) over %d tokens\n", nll_sum / nll_n, std::exp(nll_sum / nll_n), nll_n);
     if (hash_decode && nll_n) printf("decode logits hash: %016llx over %d positions\n", (unsigned long long) logits_hash, nll_n);
+    if (lg_save) fclose(lg_save);
+    if (lg_cmp) {
+        fclose(lg_cmp);
+        if (lc.n) printf("logits vs saved: %d positions, %d identical, top-1 agrees %d (%.2f%%), KL mean %.3g max %.3g, "
+                         "|d logprob(tok)| mean %.3g max %.3g, max |d logit| %.3g, NLL %.4f vs saved %.4f\n",
+                         lc.n, lc.same, lc.top1, 100.0 * lc.top1 / lc.n, lc.kl / lc.n, lc.kl_max, lc.dlp / lc.n, lc.dlp_max,
+                         lc.dlogit_max, nll_n ? nll_sum / nll_n : 0.0, lc.nll_ref / lc.n);
+    }
     if (eng.n_exp_skipped) printf("skipped experts: %llu (misses computed without)\n", (unsigned long long) eng.n_exp_skipped);
     if (eng.n_spec_l0) printf("layer-0 speculation: %llu calls, %.2f ms each\n", (unsigned long long) eng.n_spec_l0, 1e3 * eng.t_spec_l0 / eng.n_spec_l0);
     if (eng.t_mtp_pre + eng.t_mtp_moe + eng.t_mtp_post > 0)
