@@ -275,6 +275,9 @@ Off unless set; details per patch in [B70-SYCL.md](B70-SYCL.md).
 | `GGML_SYCL_FUSE_ROUTE_GATHER=1` | 37 | 1 | The in-graph MoE's lookups: the routed ids' CONT with the slot-table gather, and the mask gather with the gate-weight MUL, as one kernel each. |
 | `GGML_SYCL_FUSE_PREDICT=1` | 37 | 1 | With `GGML_SYCL_TOPK_WG`: the next-layer predictor's top-k with the CPY, CONT and GET_ROWS of its first k, as one kernel. |
 | `GGML_SYCL_FUSE_ADDCHAIN_VIEWS=1` | 37 | 1 | With `GGML_SYCL_FUSE_ADDCHAIN`: the ADD chain also when view nodes sit between its ADDs. |
+| `GGML_SYCL_FUSE_CONV_T=1\|2` | 38 | 1 | The DeltaNet conv of a 2-4-position step (the MTP verify): concat with the state, the new state and rollback copies, conv and SiLU. 1 = one kernel, the sum written as the stock kernel's 4-tap unrolled loop (bit-identical); 2 = the concat and its copies only, the stock conv + SiLU kernel after it (exact by construction, one launch more: the fallback if a compiler update changes mode 1's rounding). |
+| `GGML_SYCL_FUSE_POOL=1` | 38 | 1 | The sparse-attention indexer's mean pool (the CONTs of its strided slices, their ADDs and the SCALE) as one kernel. |
+| `GGML_SYCL_FUSE_MASK=1` | 38 | 1 | The cell mask (SUB of n_past, SCALE, STEP, SCALE, CPY to f16) as one kernel, one work-group: every read before any write, since its output may reuse the cell positions' memory. Up to 16,384 cells x positions. |
 
 ## 6. Upstream ggml and runtime variables the launcher sets
 

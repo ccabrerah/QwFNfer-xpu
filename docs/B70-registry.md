@@ -256,3 +256,21 @@ wrote, with the same expressions in the same order.
 A removed launch was worth ~1.9 us here, below the ~3 us a rerun of the same kernels costs. What is left of the glue
 (the DeltaNet conv and its state copies at two positions, the DeltaNet gates and gated norm, the late-fold weights copy,
 the routing ids' copy into the readback pack, the attention mask chain) is estimated at another 1.5-2%.
+
+## Decode glue fusions, round 2 (2026-10-20)
+
+Patch 38 merges three more groups (switches in `docs/PARAMETERS.md`): the DeltaNet conv of a 2-4-position step (the
+concat with the state, the new state and rollback copies, the conv and its SiLU), the indexer's mean pool, and the
+cell mask. Measured against round 1 on.
+
+| Experiment | Result | Status |
+|---|---|---|
+| Firing in the real graphs (span dump) | at first only the pool fused: the graph allocator gives the conv's output, and the mask's f16 output, the memory of an input that is dead by then, and the overlap checks declined. test-backend-ops cannot show this (every tensor gets its own memory). Fixed: the conv accepts the exact alias (each work-item reads its channel's inputs before writing the same addresses), the mask runs as one work-group (all reads, a barrier, all writes) | fixed |
+| Exactness of the conv (decode logits hash, draft head) | the first kernel summed the taps in a runtime-bound loop and changed the hash; replay NLL moved 1-2% either way through the draft acceptance and routing. Written as the stock kernel's unrolled 4-tap loop it is bit-identical, as is a copies-only mode (`=2`) | exact (mode 1) |
+| Exactness, all three on | hash identical, draft head and plain; `test-backend-ops -o DECODE_GLUE` 41/41 | exact |
+| Launches per layer and step at two positions | recurrent 54 -> 51, attention 80 -> 69, PLE layers 95 -> 92 (the 9-column PLE conv is not taken) | -- |
+| Speed, the same 1,500 replayed tokens, round 1 / rounds 1 + 2, A-B-B-A | layer graphs 28.20 -> 27.56 s (-2.3%); at 53K context -2.6% (measured with the first conv kernel: the same launches) | **adopted in the launcher** |
+
+Lesson: replay NLL does not separate a rounding change from a bug; the logits hash and a dump of what actually fused do.
+Left: the late-fold weights copy, the routing ids' copy into the readback pack, the DeltaNet beta sigmoid, the gated norm
+(its reduction order), the PLE conv.

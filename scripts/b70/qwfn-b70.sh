@@ -39,6 +39,7 @@ export GGML_SYCL_FUSE_SPARSE_PREFILL=1 GGML_SYCL_SPF_MIN_KV=45056               
 export GGML_SYCL_DNNL_DETERMINISTIC=1 GGML_SYCL_TOPK_DETERMINISTIC=1                                 # bit-identical runs: oneDNN matmuls and the radix top-k without atomics (patches 26-27)
 export GGML_SYCL_TOPK_WG=1 GGML_SYCL_FUSE_HC_MIX=1 GGML_SYCL_FUSE_ADDCHAIN=1 GGML_SYCL_FUSE_MOESUM=1 GGML_SYCL_FUSE_CONV=1   # decode fusions (patches 12-15)
 export GGML_SYCL_FUSE_SCALE_SILU=1 GGML_SYCL_FUSE_GATE_BCAST=1 GGML_SYCL_FUSE_ROUTE_GATHER=1 GGML_SYCL_FUSE_PREDICT=1 GGML_SYCL_FUSE_ADDCHAIN_VIEWS=1   # decode glue as merged kernels (patch 37, bit-identical): layer graphs -3%
+export GGML_SYCL_FUSE_CONV_T=1 GGML_SYCL_FUSE_POOL=1 GGML_SYCL_FUSE_MASK=1                                     # decode glue, round 2 (patch 38, bit-identical): layer graphs -2.3%
 # The MTP draft head (docs/B70-config.md, "MTP"): QWFN_B70_MTP = the head (its experts in Q2_0, all on the device),
 # QWFN_B70_DRAFT_VOCAB = the token ids it may draft (optional). One draft per step, no layer-0 prefetch pass, and the
 # expert tier one GB smaller for the head.

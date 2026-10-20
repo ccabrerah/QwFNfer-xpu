@@ -1,0 +1,400 @@
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -81,6 +81,10 @@
+ static bool fuse_route_gather_on()   { static const bool v = fuse3_env("GGML_SYCL_FUSE_ROUTE_GATHER");   return v; }
+ static bool fuse_predict_on()        { static const bool v = fuse3_env("GGML_SYCL_FUSE_PREDICT");        return v; }
+ static bool fuse_addchain_views_on() { static const bool v = fuse3_env("GGML_SYCL_FUSE_ADDCHAIN_VIEWS"); return v; }
++// ---- decode glue fusions, round 2 (patch 38) ----
++static int  fuse_conv_t_mode()       { static const int  v = [] { const char * e = getenv("GGML_SYCL_FUSE_CONV_T"); const int m = e ? atoi(e) : 0; return m == 1 || m == 2 ? m : 0; }(); return v; }
++static bool fuse_pool_on()           { static const bool v = fuse3_env("GGML_SYCL_FUSE_POOL");           return v; }
++static bool fuse_mask_on()           { static const bool v = fuse3_env("GGML_SYCL_FUSE_MASK");           return v; }
+ 
+ static bool f3_single(const ggml_cgraph * g, int k) {
+     return !(g->nodes[k]->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(g, k) == 1;
+@@ -6969,7 +6973,263 @@
+     if (glue_overlap(c, x) || glue_overlap(n2, x) || glue_overlap(c, as) || glue_overlap(n2, as) || glue_overlap(c, n2)) return -1;
+     if (ct && (glue_overlap(ct, x) || glue_overlap(ct, as) || glue_overlap(ct, c) || glue_overlap(ct, n2))) return -1;
+     *cpy = c; *cont = ct; *gr = n2;
++    return j;
++}
++
++// ---- decode glue fusions, round 2 (patch 38) ----
++
++// The index of node t in g (searching from `from` on), or -1.
++static int glue_index_of(const ggml_cgraph * g, const ggml_tensor * t, int from) {
++    for (int k = from; k < g->n_nodes; k++) if (g->nodes[k] == t) return k;
++    return -1;
++}
++
++// GGML_SYCL_FUSE_CONV_T: the DeltaNet short conv of a step of 2-4 positions (f3_conv takes one position), as the engine
++// builds it: CONCAT(state [hist, C], x^T [T, C]) along dim 0 -> CPY of its last hist columns to the state (the new state)
++// -> CPYs of earlier hist-column tails to the rollback slots -> SSM_CONV of the concat -> SILU, the next nodes the loop
++// runs. One work-item per channel reads its state row and its T inputs, then writes the new state and the snapshots, and
++// (mode 1) the conv outputs, as ssm_conv_element<DC> computes them (the same loop, unrolled for 4 taps as the stock
++// kernel is, and op_silu), or (mode 2) the concat, leaving the conv + SiLU to the stock kernel: copies only, exact by
++// construction. In mode 1 the concat is not written: its only readers are the copies' views and the conv. The SiLU output
++// may be x^T's own memory element for element (the allocator gives the conv the input projection's buffer, dead after
++// the concat): each work-item reads its channel's T inputs before it writes their outputs, and no other work-item reads them.
++struct glue_conv_t {
++    ggml_tensor *       cat = nullptr;
++    const ggml_tensor * conv = nullptr;
++    ggml_tensor *       silu = nullptr, * state = nullptr;
++    ggml_tensor *       snap[4] = {};
++    int64_t             snap_off[4] = {};
++    int                 n_snap = 0, last = -1;
++};
++
++static bool glue_conv_t_match(const ggml_cgraph * g, int i, int mode, glue_conv_t & m) {
++    m = glue_conv_t{};
++    ggml_tensor * cat = g->nodes[i];
++    if (cat->op != GGML_OP_CONCAT || cat->op_params[0] != 0 || cat->type != GGML_TYPE_F32 || (cat->flags & GGML_TENSOR_FLAG_OUTPUT)) return false;
++    const ggml_tensor * st = cat->src[0], * xt = cat->src[1];
++    if (!st || !xt || st->type != GGML_TYPE_F32 || xt->type != GGML_TYPE_F32) return false;
++    const int64_t hist = st->ne[0], C = st->ne[1], T = xt->ne[0];
++    if (T < 2 || T > 4 || hist < 1 || hist > 7 || xt->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 || xt->ne[2] != 1 || xt->ne[3] != 1) return false;
++    if (st->nb[0] != sizeof(float) || cat->ne[0] != hist + T || cat->ne[1] != C || cat->ne[2] != 1 || cat->ne[3] != 1 || !ggml_is_contiguous(cat)) return false;
++    m.cat = cat;
++    int j = i, n_views = 0, last_cpy = -1;
++    for (;;) {
++        j = glue_next_computed(g, j);
++        if (j < 0) return false;
++        ggml_tensor * n = g->nodes[j];
++        if (n->op != GGML_OP_CPY) break;
++        const ggml_tensor * v = n->src[0], * d = n->src[1];
++        if (!v || !d || v->op != GGML_OP_VIEW || v->view_src != cat || v->ne[0] != hist || v->ne[1] != C || v->ne[2] != 1 || v->ne[3] != 1 ||
++            v->nb[0] != sizeof(float) || v->nb[1] != cat->nb[1] || v->view_offs % sizeof(float) != 0) return false;
++        const int vi = glue_index_of(g, v, i + 1);
++        if (vi < 0 || vi > j || ggml_node_get_use_count(g, vi) != 1) return false;   // the view feeds this copy only
++        const int64_t off = (int64_t) (v->view_offs / sizeof(float));
++        if (off < 0 || off > T) return false;
++        if (d->type != GGML_TYPE_F32 || n->type != GGML_TYPE_F32 || d->ne[0] != hist || d->ne[1] != C || d->ne[2] != 1 || d->ne[3] != 1 ||
++            d->nb[0] != sizeof(float)) return false;
++        if (off == T) {
++            if (m.state) return false;
++            m.state = n;
++        } else {
++            if (m.n_snap >= 4) return false;
++            m.snap[m.n_snap] = n; m.snap_off[m.n_snap] = off; m.n_snap++;
++        }
++        n_views++;
++        last_cpy = j;
++    }
++    const ggml_tensor * conv = g->nodes[j], * w = conv->src[1];
++    if (!m.state || conv->op != GGML_OP_SSM_CONV || conv->src[0] != cat || !w || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
++        w->ne[0] != hist + 1 || w->ne[1] != C) return false;
++    if (conv->type != GGML_TYPE_F32 || conv->ne[0] != C || conv->ne[1] != T || conv->ne[2] != 1 || !ggml_is_contiguous(conv) || !f3_single(g, j)) return false;
++    if (ggml_node_get_use_count(g, i) != n_views + 1) return false;   // the copies' views and the conv: nothing else reads the concat
++    const int js = glue_next_computed(g, j);
++    if (js < 0) return false;
++    ggml_tensor * su = g->nodes[js];
++    if (su->op != GGML_OP_UNARY || ggml_get_unary_op(su) != GGML_UNARY_OP_SILU || su->src[0] != conv || su->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(su) || !ggml_are_same_shape(su, conv)) return false;
++    // overlaps: the new state may be the old one in place (same rows, same layout: each work-item reads its row first)
++    const ggml_tensor * sd = m.state->src[1];
++    const bool state_in_place = sd->data == st->data && sd->nb[1] == st->nb[1];
++    if (!state_in_place && glue_overlap(sd, st)) return false;
++    // mode 1: the SiLU output may be x^T exactly: output (c, t) at the address input (t, c) is read from
++    const bool out_on_x = su->data == xt->data && xt->nb[0] == (size_t) C * sizeof(float) && xt->nb[1] == sizeof(float);
++    const ggml_tensor * outs[6] = { sd, mode == 1 ? (const ggml_tensor *) su : cat };   // mode 2 writes the concat instead
++    int n_outs = 2;
++    for (int k = 0; k < m.n_snap; k++) outs[n_outs++] = m.snap[k]->src[1];
++    for (int a = 0; a < n_outs; a++) {
++        if (!(outs[a] == su && out_on_x) && glue_overlap(outs[a], xt)) return false;
++        if (glue_overlap(outs[a], w)) return false;
++        if (outs[a] != sd && glue_overlap(outs[a], st)) return false;
++        for (int b = a + 1; b < n_outs; b++) if (glue_overlap(outs[a], outs[b])) return false;
++    }
++    m.cat = cat; m.conv = conv; m.silu = su;
++    m.last = mode == 1 ? js : last_cpy;   // mode 2: the loop goes on at the SSM_CONV (the stock SSM_CONV + SILU fusion)
++    return true;
++}
++
++// DC: the taps when the stock kernel has a specialization for them (4), else 0 (its runtime loop); FULL: mode 1
++template <int DC, bool FULL>
++static void glue_conv_t_kernel(dpct::queue_ptr q, const glue_conv_t & m) {
++    const ggml_tensor * st = m.cat->src[0], * xt = m.cat->src[1], * w = m.conv->src[1];
++    const int64_t hist = st->ne[0], C = st->ne[1], T = xt->ne[0];
++    const int d_conv = (int) hist + 1;
++    const char * sd = (const char *) st->data; const size_t s1 = st->nb[1];
++    const char * xd = (const char *) xt->data; const size_t x0 = xt->nb[0], x1 = xt->nb[1];
++    const float * wd = (const float *) w->data;
++    float * od = (float *) m.silu->data;
++    char * cd = (char *) m.cat->data; const size_t c1 = m.cat->nb[1];
++    char * nd = (char *) m.state->src[1]->data; const size_t n1 = m.state->src[1]->nb[1];
++    const int n_snap = m.n_snap;
++    char * pd[4] = {}; size_t p1[4] = {}; int64_t po[4] = {};
++    for (int k = 0; k < n_snap; k++) { pd[k] = (char *) m.snap[k]->src[1]->data; p1[k] = m.snap[k]->src[1]->nb[1]; po[k] = m.snap_off[k]; }
++    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(((C + 255) / 256) * 256), sycl::range<1>(256)), [=](sycl::nd_item<1> it) {
++        const int64_t c = it.get_global_id(0);
++        if (c >= C) return;
++        float p[12];
++        for (int64_t h = 0; h < hist; h++) p[h] = *(const float *) (sd + c * s1 + h * sizeof(float));
++        for (int64_t t = 0; t < T; t++) p[hist + t] = *(const float *) (xd + t * x0 + c * x1);
++        if constexpr (FULL) {
++            const float * cw = wd + c * d_conv;
++            for (int64_t t = 0; t < T; t++) {
++                const float * s = p + t;
++                float sumf = 0.0f;
++                if constexpr (DC > 0) {
++#pragma unroll
++                    for (int i0 = 0; i0 < DC; ++i0) sumf += s[i0] * cw[i0];
++                } else {
++                    for (int i0 = 0; i0 < d_conv; ++i0) sumf += s[i0] * cw[i0];
++                }
++                od[t * C + c] = op_silu(sumf);
++            }
++        } else {
++            for (int64_t k = 0; k < hist + T; k++) *(float *) (cd + c * c1 + k * sizeof(float)) = p[k];
++        }
++        for (int64_t h = 0; h < hist; h++) *(float *) (nd + c * n1 + h * sizeof(float)) = p[T + h];
++        for (int k = 0; k < n_snap; k++)
++            for (int64_t h = 0; h < hist; h++) *(float *) (pd[k] + c * p1[k] + h * sizeof(float)) = p[po[k] + h];
++    });
++}
++
++static void glue_conv_t_run(dpct::queue_ptr q, const glue_conv_t & m, int mode) {
++    if (mode == 2)                     glue_conv_t_kernel<0, false>(q, m);
++    else if (m.cat->src[0]->ne[0] == 3) glue_conv_t_kernel<4, true>(q, m);
++    else                               glue_conv_t_kernel<0, true>(q, m);
++}
++
++// GGML_SYCL_FUSE_POOL: the QSA indexer's mean pool as the engine builds it: CONT of r strided views (r >= 2), each
++// added to the previous sum (the first two added together), then a SCALE, the next nodes the loop runs; every
++// intermediate read once. One work-item per element sums the views in that order (a + b is b + a bit for bit) and
++// writes scale * sum + bias, as scale_f32 does. Only the SCALE's output is written.
++static int glue_pool_match(const ggml_cgraph * g, int i, const ggml_tensor * views[8], int * n_views) {
++    const ggml_tensor * c0 = g->nodes[i];
++    auto cont_ok = [&](const ggml_tensor * c, const ggml_tensor * like) {
++        const ggml_tensor * v = c->src[0];
++        return c->op == GGML_OP_CONT && c->type == GGML_TYPE_F32 && ggml_is_contiguous(c) && v && v->type == GGML_TYPE_F32 &&
++               v->nb[0] == sizeof(float) && v->ne[2] == 1 && v->ne[3] == 1 && ggml_are_same_shape(v, c) && (!like || ggml_are_same_shape(c, like));
++    };
++    if (!cont_ok(c0, nullptr) || c0->ne[2] != 1 || c0->ne[3] != 1 || !f3_single(g, i)) return -1;
++    views[0] = c0->src[0];
++    int n = 1, prev = i;      // prev: the node holding the running sum (the first CONT, then each ADD)
++    int j = i;
++    for (;;) {
++        j = glue_next_computed(g, j);
++        if (j < 0) return -1;
++        const ggml_tensor * c = g->nodes[j];
++        if (c->op == GGML_OP_SCALE) break;
++        if (n >= 8 || !cont_ok(c, c0) || !f3_single(g, j)) return -1;
++        const int ja = glue_next_computed(g, j);
++        if (ja < 0) return -1;
++        const ggml_tensor * a = g->nodes[ja];
++        const ggml_tensor * p = g->nodes[prev];
++        if (a->op != GGML_OP_ADD || a->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) || !ggml_are_same_shape(a, c0)) return -1;
++        if (!((a->src[0] == p && a->src[1] == c) || (a->src[0] == c && a->src[1] == p))) return -1;
++        if (!f3_single(g, ja)) return -1;
++        views[n++] = c->src[0];
++        prev = ja; j = ja;
++    }
++    const ggml_tensor * sc = g->nodes[j];
++    if (n < 2 || sc->src[0] != g->nodes[prev] || sc->type != GGML_TYPE_F32 || !ggml_is_contiguous(sc) || !ggml_are_same_shape(sc, c0)) return -1;
++    for (int k = 0; k < n; k++) if (glue_overlap(sc, views[k])) return -1;
++    *n_views = n;
+     return j;
++}
++
++static void glue_pool(dpct::queue_ptr q, const ggml_tensor * const views[8], int n_views, ggml_tensor * sc) {
++    struct vv { const char * d; size_t nb1; } v[8] = {};
++    for (int k = 0; k < n_views; k++) { v[k].d = (const char *) views[k]->data; v[k].nb1 = views[k]->nb[1]; }
++    const int64_t ne0 = sc->ne[0], n = ggml_nelements(sc);
++    float scale, bias;
++    memcpy(&scale, (const float *) sc->op_params + 0, sizeof(float));
++    memcpy(&bias,  (const float *) sc->op_params + 1, sizeof(float));
++    float * od = (float *) sc->data;
++    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(((n + 255) / 256) * 256), sycl::range<1>(256)), [=](sycl::nd_item<1> it) {
++        const int64_t e = it.get_global_id(0);
++        if (e >= n) return;
++        const size_t off = (size_t) (e % ne0) * sizeof(float);
++        const int64_t r = e / ne0;
++        float acc = *(const float *) (v[0].d + r * v[0].nb1 + off) + *(const float *) (v[1].d + r * v[1].nb1 + off);
++        for (int k = 2; k < n_views; k++) acc = acc + *(const float *) (v[k].d + r * v[k].nb1 + off);
++        od[e] = scale * acc + bias;
++    });
++}
++
++// GGML_SYCL_FUSE_MASK: the sparse attention's cell mask as the engine builds it: SUB(cell positions [N, T], n_past [1, T]
++// broadcast over dim 0) -> SCALE -> STEP -> SCALE -> CPY to f16, the next nodes the loop runs, every intermediate read
++// once. One work-group evaluates every element's five steps (each rounded to f32 as the separate kernels store it) and
++// the f16 conversion of the CPY into local memory, then writes them after a barrier: the allocator may give the CPY's
++// output the cell positions' memory (dead after the SUB), so every read comes before any write. At most GLUE_MASK_MAX
++// elements (local memory of one work-group).
++#define GLUE_MASK_MAX 16384
++#define GLUE_MASK_WG  512
++struct glue_mask { const ggml_tensor * sub, * s1, * s2; ggml_tensor * cpy; int last; };
++
++static bool glue_mask_match(const ggml_cgraph * g, int i, glue_mask & m) {
++    const ggml_tensor * sub = g->nodes[i];
++    if (sub->op != GGML_OP_SUB || sub->type != GGML_TYPE_F32 || !ggml_is_contiguous(sub) || !f3_single(g, i)) return false;
++    const ggml_tensor * a = sub->src[0], * b = sub->src[1];
++    if (!a || !b || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) || !ggml_are_same_shape(a, sub)) return false;
++    if (sub->ne[2] != 1 || sub->ne[3] != 1 || b->ne[0] != 1 || b->ne[1] != sub->ne[1] || b->ne[2] != 1 || b->ne[3] != 1) return false;
++    if (ggml_nelements(sub) < 1 || ggml_nelements(sub) > GLUE_MASK_MAX) return false;
++    int idx[4]; const ggml_tensor * n[4];
++    int j = i;
++    for (int k = 0; k < 4; k++) { j = glue_next_computed(g, j); if (j < 0) return false; idx[k] = j; n[k] = g->nodes[j]; }
++    const ggml_tensor * prev = sub;
++    const ggml_op want[3] = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE };
++    for (int k = 0; k < 3; k++) {
++        if (n[k]->op != want[k] || n[k]->src[0] != prev || n[k]->type != GGML_TYPE_F32 || !ggml_is_contiguous(n[k]) ||
++            !ggml_are_same_shape(n[k], sub) || !f3_single(g, idx[k])) return false;
++        prev = n[k];
++    }
++    if (ggml_get_unary_op(n[1]) != GGML_UNARY_OP_STEP) return false;
++    ggml_tensor * cp = g->nodes[idx[3]];
++    if (cp->op != GGML_OP_CPY || cp->src[0] != prev || cp->type != GGML_TYPE_F16 || !ggml_is_contiguous(cp) || ggml_nelements(cp) != ggml_nelements(sub)) return false;
++    m.sub = sub; m.s1 = n[0]; m.s2 = n[2]; m.cpy = cp; m.last = idx[3];
++    return true;
++}
++
++static void glue_mask_kernel(dpct::queue_ptr q, const glue_mask & m) {
++    const ggml_tensor * a = m.sub->src[0], * b = m.sub->src[1];
++    const int64_t ne0 = m.sub->ne[0], n = ggml_nelements(m.sub);
++    const float * ad = (const float *) a->data;
++    const char *  bd = (const char *) b->data; const size_t b1 = b->nb[1];
++    float sc1, bi1, sc2, bi2;
++    memcpy(&sc1, (const float *) m.s1->op_params + 0, sizeof(float)); memcpy(&bi1, (const float *) m.s1->op_params + 1, sizeof(float));
++    memcpy(&sc2, (const float *) m.s2->op_params + 0, sizeof(float)); memcpy(&bi2, (const float *) m.s2->op_params + 1, sizeof(float));
++    sycl::half * od = (sycl::half *) m.cpy->data;
++    q->submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<sycl::half, 1> res(sycl::range<1>(n), cgh);
++        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(GLUE_MASK_WG), sycl::range<1>(GLUE_MASK_WG)), [=](sycl::nd_item<1> it) {
++            for (int64_t e = it.get_local_id(0); e < n; e += GLUE_MASK_WG) {
++                const float x  = ad[e] - *(const float *) (bd + (e / ne0) * b1);
++                const float y1 = sc1 * x + bi1;
++                const float z  = y1 > 0.0f ? 1.0f : 0.0f;
++                const float y2 = sc2 * z + bi2;
++                res[e] = sycl::vec<float, 1>(y2).convert<sycl::half, sycl::rounding_mode::automatic>()[0];
++            }
++            it.barrier(sycl::access::fence_space::local_space);
++            for (int64_t e = it.get_local_id(0); e < n; e += GLUE_MASK_WG) od[e] = res[e];
++        });
++    });
+ }
+ 
+ // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
+@@ -7116,6 +7376,24 @@
+                                 (int) ggml_nelements(node), sycl_ctx->stream());
+             i++;
+             continue;
++        }
++        if (node->op == GGML_OP_CONT && fuse_pool_on()) {
++            const ggml_tensor * views[8] = {};
++            int n_views = 0;
++            const int j = glue_pool_match(cgraph, i, views, &n_views);
++            if (j > 0) {
++                glue_pool(sycl_ctx->stream(), views, n_views, cgraph->nodes[j]);
++                i = j;
++                continue;
++            }
++        }
++        if (node->op == GGML_OP_SUB && fuse_mask_on()) {
++            glue_mask mm;
++            if (glue_mask_match(cgraph, i, mm)) {
++                glue_mask_kernel(sycl_ctx->stream(), mm);
++                i = mm.last;
++                continue;
++            }
+         }
+         if (node->op == GGML_OP_CONT && fuse_route_gather_on()) {
+             const int j = glue_route_match_a(cgraph, i);
+@@ -7231,6 +7509,14 @@
+             if (hit >= 0) {
+                 f3_moesum(sycl_ctx->stream(), node);
+                 g_moesum_pending[hit] = g_moesum_pending[--g_moesum_n];
++                continue;
++            }
++        }
++        if (node->op == GGML_OP_CONCAT && fuse_conv_t_mode()) {
++            glue_conv_t mc;
++            if (glue_conv_t_match(cgraph, i, fuse_conv_t_mode(), mc)) {
++                glue_conv_t_run(sycl_ctx->stream(), mc, fuse_conv_t_mode());
++                i = mc.last;
+                 continue;
+             }
+         }
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4228,6 +4228,9 @@
+ //                 at them, the mask times the gate weights
+ //   predict       the next-layer predictor: argsort's first k copied to f32, CONT, GET_ROWS of the scores at them
+ //   addchain      a chain of ADDs with view nodes between them
++//   conv_t        (patch 38) the DeltaNet conv of T >= 2 positions: concat, new state and rollback copies, conv, SiLU
++//   pool          (patch 38) the indexer's mean pool: CONT of strided slices, ADD chain, SCALE
++//   mask          (patch 38) the cell mask: SUB (broadcast), SCALE, STEP, SCALE, cast to f16
+ struct test_decode_glue : public test_case {
+     const std::string pattern;
+     const int64_t n, T;
+@@ -4301,6 +4304,54 @@
+             ggml_set_name(a, "out");
+             return a;
+         }
++        if (pattern == "conv_t") {   // patch 38: the DeltaNet conv of T positions with its state and rollback copies
++            const int64_t hist = 3, C = n;
++            ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hist, C);
++            ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
++            ggml_tensor * w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hist + 1, C);
++            ggml_tensor * rb    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hist, C, 3);
++            ggml_set_name(state, "state"); ggml_set_name(x, "x"); ggml_set_name(w, "w"); ggml_set_name(rb, "rb");
++            ggml_tensor * padded = ggml_concat(ctx, ggml_reshape_3d(ctx, state, hist, C, 1), ggml_transpose(ctx, x), 0);
++            ggml_tensor * tail = ggml_view_2d(ctx, padded, hist, C, padded->nb[1], ggml_row_size(padded->type, padded->ne[0] - hist));
++            ggml_tensor * st_new = ggml_cpy(ctx, tail, state);                                      // the new state, in place
++            ggml_tensor * snaps[3] = {};
++            for (int64_t sn = 1; sn < T; sn++) {
++                ggml_tensor * tails = ggml_view_2d(ctx, padded, hist, C, padded->nb[1], ggml_row_size(padded->type, padded->ne[0] - hist - sn));
++                ggml_tensor * dst = ggml_view_2d(ctx, rb, hist, C, rb->nb[1], (size_t) (sn - 1) * rb->nb[2]);
++                snaps[sn - 1] = ggml_cpy(ctx, tails, dst);
++            }
++            ggml_tensor * y = ggml_silu(ctx, ggml_ssm_conv(ctx, padded, w));                       // [C, T]
++            // collected right-nested, so the graph runs concat, the copies, the conv and the SiLU in that order (the
++            // engine's), and the collecting concats after them
++            ggml_tensor * out = ggml_reshape_1d(ctx, y, C * T);
++            for (int64_t sn = T - 1; sn >= 1; sn--) out = ggml_concat(ctx, ggml_reshape_1d(ctx, snaps[sn - 1], hist * C), out, 0);
++            out = ggml_concat(ctx, ggml_reshape_1d(ctx, st_new, hist * C), out, 0);
++            ggml_set_name(out, "out");
++            return out;
++        }
++        if (pattern == "pool") {     // patch 38: the indexer's mean pool of 4 strided slices
++            const int64_t D = 128, r = 4;
++            ggml_tensor * members = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, r, T);
++            ggml_set_name(members, "members");
++            ggml_tensor * pooled = nullptr;
++            for (int64_t k = 0; k < r; k++) {
++                ggml_tensor * slice = ggml_cont(ctx, ggml_view_2d(ctx, members, D, T, members->nb[2], k * members->nb[1]));
++                pooled = pooled ? ggml_add(ctx, pooled, slice) : slice;
++            }
++            ggml_tensor * out = ggml_scale(ctx, pooled, 1.0f / (float) r);
++            ggml_set_name(out, "out");
++            return out;
++        }
++        if (pattern == "mask") {     // patch 38: the cell mask (the engine's +-1e30 overflow f16 to -inf: smaller here)
++            ggml_tensor * cp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
++            ggml_tensor * np = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, T);
++            ggml_set_name(cp, "cp"); ggml_set_name(np, "np");
++            ggml_tensor * dpos = ggml_sub(ctx, cp, ggml_reshape_2d(ctx, np, 1, T));
++            ggml_tensor * ok   = ggml_step(ctx, ggml_scale_bias(ctx, dpos, -1.0f, 0.5f));
++            ggml_tensor * out  = ggml_cast(ctx, ggml_scale_bias(ctx, ok, 1000.0f, -1000.0f), GGML_TYPE_F16);
++            ggml_set_name(out, "out");
++            return out;
++        }
+         GGML_ABORT("unknown pattern %s", pattern.c_str());
+     }
+ 
+@@ -9814,7 +9865,15 @@
+         test_cases.emplace_back(new test_decode_glue("predict", 512, T, true));
+         test_cases.emplace_back(new test_decode_glue("addchain", 2560, T));
+         test_cases.emplace_back(new test_decode_glue("addchain", 2560, T, true));
++        test_cases.emplace_back(new test_decode_glue("pool", 0, T));
++        test_cases.emplace_back(new test_decode_glue("mask", 2052, T));
++    }
++    for (int64_t T : { 2, 3, 4 }) {
++        test_cases.emplace_back(new test_decode_glue("conv_t", 10240, T));
++        test_cases.emplace_back(new test_decode_glue("conv_t", 33, T));
+     }
++    test_cases.emplace_back(new test_decode_glue("mask", 2052, 4));   // 8208 elements: one work-group
++    test_cases.emplace_back(new test_decode_glue("mask", 5000, 4));   // over GLUE_MASK_MAX: not fused
+ 
+     // fused add + unary + mul: the delta-net alpha gate, bias and scale broadcast over dim 0
+     for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SOFTPLUS }) {
