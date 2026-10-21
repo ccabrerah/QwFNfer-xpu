@@ -3860,6 +3860,13 @@ const float * engine::eval_decode(const int32_t * hist, int32_t n_hist, int32_t 
     // expert upload on the compute queue (a unitrace profile: 270 pinned-host uploads per verify step against 155 per
     // token). The one-token budget at verify steps was measured without effect on the step's time (dropped, see
     // docs/dropped-features.md).
+    // As eval() does before a batch that is not streamed: a streamed prompt's last pass can be followed directly by
+    // verify steps (the draft head), so the lent layers' tiers are refilled here too (QWFN_LEND_RESTORE), and a client
+    // lend no prefill closed is ended. Before, the refill ran only when a short non-streamed pass came between the
+    // prompt and the decode (the prompt-boundary checkpoint's split did that).
+    if (client_lent_) vram_lend_end();
+    ec_.lend_restore_if_pending();
+    sync_tier_epoch();
     ec_.set_max_promotions(cfg_.promote_per_layer * (uint32_t) n_new);
     const bool ok = eval_batch(hist, n_hist, n_new, err, /*cache_batched=*/false, /*force_decode=*/true);
     ec_.set_max_promotions(cfg_.promote_per_layer);

@@ -330,3 +330,20 @@ against patch 40's kernel (`GGML_SYCL_LIDX_CHECK`, and every scored position's l
 | Decode, 1,000 replayed tokens after a 52K prompt, per step, 2 runs per arm (twice) | layer graphs -0.9% and -0.5% | -- |
 | First decode step of a process (5-token prompt, 2 replayed tokens), per attention graph | patch 40's kernel 11 ms, patch 41 92 ms: ~1 s once per process (warm driver compiler cache: not compilation); a slim form (lanes 1 and 4 only, the dimension loop not unrolled) 18.5 ms | -- |
 | The slim form against patch 40's kernel, per attention graph | 792 vs 784 us at short context; ~1,046 vs ~1,066 us at 52K (~0.7% of layer-graph time; the 52K pair from two windows) | **shelved 2026-10-21** (`dropped-features.md`): not enough gain for the code it adds |
+
+## The prompt refill before verify steps (2026-10-21)
+
+After a streamed prompt borrows part of the VRAM expert tier, `QWFN_LEND_RESTORE` refills the borrowed layers with what
+they held, before the next decode. The refill ran only at the start of a prompt call that is not streamed: with the
+draft head the decode goes through the verify-step entry, which never ran it. It therefore ran only when the
+prompt-boundary checkpoint (`--prefix-cache-boundary`, histories of 4,096 tokens or more) split a prompt and fed its tail
+as a short pass; a streamed prompt (over 512 new tokens) with a shorter history, or any prompt with the boundary
+checkpoint off, left the lent layers depleted. Found while measuring the prefix cache's cost on agent turns (a 52K
+conversation + 5 turns, 3 runs per arm).
+
+| Experiment | Result | Status |
+|---|---|---|
+| Boundary checkpoint off, before the fix | turn prompts 12.0 -> 9.5 s, but expert misses 4.8 -> 7.7 per step and reply decode 32.1 -> 27.1 tok/s: the refill no longer ran | -- |
+| The fix: the verify-step entry runs the pending refill too | with the checkpoint off, misses 4.7 per step again; per agent turn (prompt + reply) ~16 s in every configuration: the refill costs 1-2 s wherever it runs and pays back only over replies longer than ~400 tokens | **adopted** (the refill no longer depends on how a prompt was split) |
+| What the boundary checkpoint costs | ~1 GB device-to-host per turn at 52K inside the prompt (0.4-1.2 s), 0.5-0.8 GB of host memory pushed to swap per long conversation; it helps only when a later request diverges inside the held sequence (regenerate, edited message, a client that re-renders the reply); the server already reuses a reply whole, reasoning included | kept on |
+
