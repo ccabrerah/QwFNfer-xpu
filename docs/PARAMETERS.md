@@ -223,6 +223,8 @@ Extra arguments are appended to the server's command line (later values win).
 | Variable | Tool | What it does |
 |---|---|---|
 | `QWFN_PPL_VERBOSE` | qwfn-gen | Print each replayed token's NLL. |
+| `QWFN_HASH_DECODE` | qwfn-gen | With `--replay-file --ppl`: an FNV-1a hash of every scored position's logits, in order. Two runs agree exactly when every logit of every position does: how a kernel change that claims to be exact is checked (freeze the VRAM tier with `--promote 0`, or keep promotions on: replays are deterministic). |
+| `QWFN_LOGITS_SAVE=FILE`, `QWFN_LOGITS_CMP=FILE` | qwfn-gen | Write every scored position's logits to FILE, or compare a run with a saved one: positions identical, top-1 agreement, KL(saved \|\| this), the scored token's log-probability change, the largest logit change. For changes that are not bit-identical (how far they drift). About 1 MB per position. |
 | `QWFN_SEGMENTS=N` | qwfn-gen | Rates and tier shares per N decoded tokens. |
 | `QWFN_PROFILE_LAYERS=list\|all` | qwfn-gen | Per-node timing of those layers' cached decode graphs. |
 | `QWFN_IO_PROFILE` | qwfn-gen | Where decode waits for reads, per layer. |
