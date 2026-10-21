@@ -311,7 +311,7 @@ prompt (2 per arm).
 The indexer is still ~7x off its bandwidth bound at long context (43 us for 3.8 MB of keys): keeping the stock kernel's
 per-score order (a 16-lane reduction per head) is what keeps it bit-identical.
 
-## The indexer in another summation order (2026-10-20)
+## The indexer in another summation order (2026-10-20/21, shelved)
 
 Patch 40's indexer keeps the stock kernel's per-score order (a 16-lane reduction per head) to stay bit-identical, which
 leaves it ~7x off its bandwidth bound at long context. Patch 41 drops that constraint: 4 lanes per key row below 5,120
@@ -327,5 +327,6 @@ against patch 40's kernel (`GGML_SYCL_LIDX_CHECK`, and every scored position's l
 | Both kernels on the same live inputs, 1,000 decode tokens at 52K (15,480 query rows) | 2 of ~7.9 M selected blocks differ (one in each of two rows); largest score difference 6.9e-5 | -- |
 | Greedy decode, 300 tokens after a 52K prompt | identical text (another expert placement, `--vram 21` with patch 40's kernel: differs from token 38) | -- |
 | Replayed logits, 1,000 tokens after a 52K / 75K prompt, against patch 40's kernel | first 83 positions identical at 52K; after the first flip the logits diverge as much as with another expert placement (top-1 agreement 79.9% vs 76.7% at 52K, 91.7% vs 92.1% at 75K; KL 0.61 vs 0.64, 0.37 vs 0.39). With the draft head, a changed draft regroups the later positions into one- or two-position steps, which compute with different kernels; MoE routing near-ties do the rest. Replay NLL moves with placement alone by several percent (52K: 3.757 / 3.802 / 3.778; 75K: 0.782 / 0.725 / 0.694) | within the run-to-run variation production already has |
-| Decode, 1,000 replayed tokens after a 52K prompt, per step, 2 runs per arm (twice) | layer graphs -0.9% and -0.5% | **adopted in the launcher (`GGML_SYCL_LIDX_DECODE=2`)** |
-
+| Decode, 1,000 replayed tokens after a 52K prompt, per step, 2 runs per arm (twice) | layer graphs -0.9% and -0.5% | -- |
+| First decode step of a process (5-token prompt, 2 replayed tokens), per attention graph | patch 40's kernel 11 ms, patch 41 92 ms: ~1 s once per process (warm driver compiler cache: not compilation); a slim form (lanes 1 and 4 only, the dimension loop not unrolled) 18.5 ms | -- |
+| The slim form against patch 40's kernel, per attention graph | 792 vs 784 us at short context; ~1,046 vs ~1,066 us at 52K (~0.7% of layer-graph time; the 52K pair from two windows) | **shelved 2026-10-21** (`dropped-features.md`): not enough gain for the code it adds |

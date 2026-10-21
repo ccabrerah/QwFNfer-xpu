@@ -182,6 +182,51 @@ launcher (`scripts/b70/qwfn-b70.sh`) turns on the adopted ones.
 
 ## ggml-sycl patches and backend switches
 
+### Patch 41, `GGML_SYCL_LIDX_DECODE=2` -- the decode indexer in another summation order (2026-10-20/21, shelved)
+
+In the launcher for one day (fork commit 2bed07b, reverted); revive from that commit.
+
+- **What it did:** the sparse-attention indexer (LIGHTNING_INDEXER) scores, at decode and verify steps, every pooled key
+  block of the context against 1-4 queries over 4 heads of 128 dimensions. Patch 40's form (kept, `=1`) keeps the stock
+  kernel's per-score order so the output stays bit-identical: a sub-group of 16 lanes per key block, 8 dimensions per
+  lane, one 16-lane reduction per (query, head). That order keeps it ~7x off the bandwidth bound at long context (43 us
+  for 15,000 blocks x 2 queries, 3.8 MB of keys). Patch 41 summed in another order: LPR lanes per key block (4 below
+  5,120 blocks, 1 from there on), each lane summing its 128 / LPR dimensions in order for every (query, head), then a
+  log2(LPR)-step lane tree; the queries and head weights staged once per work-group in local memory.
+  `GGML_SYCL_LIDX_LPR` forced the lanes per block; `GGML_SYCL_LIDX_CHECK=K` ran both kernels on the same live inputs and
+  compared their top-K block sets on the host (a diagnostic).
+- **Where its rounding can reach the output:** only through the top-513 block selection, whose indices are then used in
+  index order (patch 40's top-k emit), not score order. With fewer blocks than that (contexts under ~2K tokens) every
+  block is selected and the output is bit-identical (decode logits hash checked); above it, only a near-tie at the 513th
+  place can select another block.
+- **Data, kernel (2 queries):** 768 blocks 7.0 -> 5.9 us, 3,072 12.1 -> 6.3, 5,000 17.0 -> 7.5, 8,000 23.6 -> 9.5,
+  15,000 43.1 -> 10.2 (4x). `test-backend-ops` LIGHTNING_INDEXER 222/222 at every lane count.
+- **Data, drift:** both kernels on the same inputs over 1,000 decode tokens at 52K context (7,740 calls, 15,480 query rows,
+  ~7.9 M selected blocks): a different block selected twice, the largest score difference 6.9e-5. Greedy decode of 300
+  tokens after a 52K prompt: identical text (another expert placement, with patch 40's kernel, differs from token 38).
+  Replayed logits are identical until the first flip, then diverge as much as with another expert placement: top-1
+  agreement 79.9% vs 76.7% at 52K and 91.7% vs 92.1% at 75K, mean KL 0.61 vs 0.64 and 0.37 vs 0.39. With the draft head a
+  changed draft regroups the later positions into one- or two-position steps, which compute with different kernels, and
+  MoE routing near-ties do the rest; replay NLL moves by several percent with the expert placement alone (52K: 3.757
+  exact, 3.802 patch 41, 3.778 placement control). So within the run-to-run variation production already has, but no
+  longer bit-identical across releases.
+- **Data, speed:** decode with 1,000 replayed tokens after a 52K prompt: layer graphs -0.9% and -0.5% per step (two
+  A-B-B-A pairs); nothing at short context. A first-use cost: the four lane-count instantiations, fully unrolled (one lane
+  per block is 16 chunks x 128 products of straight-line code), made the first decode step of every process ~1 s slower
+  (attention graphs 92 vs 11 ms in that step). Not compilation (the driver's compiler cache was warm), but paid at every
+  start, and it showed in 1,000-1,500-token benchmarks as +88 us per attention graph. A slim form (lanes 1 and 4 only,
+  the dimension loop `#pragma unroll 1`) cut it to ~0.09 s at ~2 us more per call at 15,000 blocks; against patch 40's
+  kernel it measured 792 vs 784 us per attention graph at short context and ~1,046 vs ~1,066 us at 52K (~0.7% of the
+  layer-graph time; the 52K pair from two windows).
+- **Why shelved:** the gain (none at short context, under 1% at 52K, perhaps 1-2% near 100K) did not offset the code it
+  adds and needs maintaining: a second indexer kernel family with its own lane tuning, a check mode, a first-use cost to
+  keep in check, and the end of bit-identical output across releases (patches 37-40 kept the decode logits hash unchanged
+  since the glue work began, which is how kernel changes are verified here). Patch 40's bit-identical kernel (63 -> 43
+  us at 15,000 blocks) stays.
+- **Don't redo as:** an exact indexer must keep the stock 16-lane reduction per (query, head), and that structure is the
+  difference between the two kernels (43 vs 10 us at 15,000 blocks); another summation order would only pay at contexts
+  well past 60K.
+
 ### Patch 34, `GGML_SYCL_Q8_PROD` -- q8_1 quantization fused into the producer
 
 - **What it did:** a one-token producer (UNARY silu / sigmoid / softplus + MUL, or GLU swiglu) whose f32 output is
