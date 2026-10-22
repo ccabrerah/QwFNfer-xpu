@@ -347,3 +347,22 @@ conversation + 5 turns, 3 runs per arm).
 | The fix: the verify-step entry runs the pending refill too | with the checkpoint off, misses 4.7 per step again; per agent turn (prompt + reply) ~16 s in every configuration: the refill costs 1-2 s wherever it runs and pays back only over replies longer than ~400 tokens | **adopted** (the refill no longer depends on how a prompt was split) |
 | What the boundary checkpoint costs | ~1 GB device-to-host per turn at 52K inside the prompt (0.4-1.2 s), 0.5-0.8 GB of host memory pushed to swap per long conversation; it helps only when a later request diverges inside the held sequence (regenerate, edited message, a client that re-renders the reply); the server already reuses a reply whole, reasoning included | kept on |
 
+
+## Expert down at IQ4_NL on every layer (2026-10-21/22)
+
+Overlay v4 keeps expert down at Q8_0 on five layers (2, 4, 30, 46, 47), as Unsloth's UD-Q3_K_XL does; their UD-Q2_K_XL
+and bartowski's low tiers use IQ4_NL on all 48. Measured on Swift 1.5 in the v4 layout, same engine and flags, 160 W,
+`--vram 22`, draft head on: natural-text NLL over 8 texts (2,000-token prompt + 1,024 replayed tokens each, against v4),
+decode as served on a short prompt + 1,500 replayed tokens and on 52K + 1,000, each pair of arms in one sitting. The
+dense rows take the types UD-Q2_K_XL gives those tensors (Q5_K: attention q / output / gate / qkv and the shared
+expert's gate / up; Q6_K: attention k / v, `ssm_out` and layer 2's; the shared expert's down and the hyper-connection
+mixers stay Q8_0), re-encoded from Q8_0 without an importance matrix (`gguf_requant`'s `dense5` rule is the same
+selection, with k / v at Q5_K).
+
+| Layout | Natural-text NLL vs v4 | Decode vs v4, short / 52K | Status |
+|---|---|---|---|
+| v4, expert down IQ4_NL on all 48 layers (2.1 GB less to read) | -0.2% (SE 0.15), KL 0.0045 | +5 to +15% / +5 to +17% (the disk wait varies between sittings; GPU graph time -2%) | **adopted**: the preferred layout |
+| ... + dense at UD-Q2_K_XL's types, LM head Q4_K | +1.7% (SE 0.26), worse on 8 of 8 | +6 to +14% / +17 to +22% (GPU graph -6%) | rejected: quality |
+| ... + the same dense cut, LM head kept at Q6_K | +0.9% (SE 0.36), worse on 6 of 8 | +14% / +25% | rejected: quality |
+
+The dense cut does not grow the VRAM expert tier (`--vram` sizes the tier); its gain is the dense matvecs' time.

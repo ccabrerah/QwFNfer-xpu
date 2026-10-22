@@ -151,6 +151,11 @@ configuration below with more bits where the stock quantization is thinnest: exp
 Same build, flags and launcher, a different head. Its IQ4_NL expert down runs through patch 17's kernel
 (`QWFN_IQ4_SOA`), which cuts the GPU time per decode token by 12%.
 
+Since 2026-10-22 the preferred layout takes expert down at IQ4_NL on all 48 layers, including the five that v4 keeps at
+Q8_0 (as Unsloth's UD-Q2_K_XL ships them): no measurable quality change, 2.1 GB less to read, decode +5-17%
+([registry](docs/B70-registry.md#expert-down-at-iq4_nl-on-every-layer-2026-10-2122)). `build-overlay.sh v4` still
+fetches those five at Q8_0; take them from UD-Q2_K_XL for the new layout.
+
 ## Acknowledgment
 
 Built on [ggml](https://github.com/ggml-org/ggml) (quantized kernels, CUDA backend) and [llama.cpp](https://github.com/ggml-org/llama.cpp) (tokenizer, and the bit-exact reference the forward pass is validated against). Model: Qwen3.8-Flash-Next by the [Qwen](https://huggingface.co/Qwen) team; quantized GGUFs by [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), whose Studio served as the harness for testing. The MTP recipe (rows marked *(Strata)*) follows
@@ -164,4 +169,4 @@ by ISTA-DASLab. The SYCL backend is ggml's, built with Intel oneAPI and oneDNN.
 
 [Apache License 2.0](LICENSE).
 
-Last updated: 2026-10-14
+Last updated: 2026-10-22
