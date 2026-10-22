@@ -22,29 +22,20 @@ True answer: It is, it attempts to be as fast as possible for the target archite
 
 ## On perf
 
-For the V4 quant (see recipe, a "Q3-level" set), on a Ryzen 5700, 32GB dual channel system ram, on a dedicated linux system with a B70 power limited to 120W you get (the box has run at 160 W since 2026-10-10: decode +5-11%, prefill +16-23%):
+For the V4 quant (see recipe, a "Q3-level" set), on a Ryzen 5700, 32GB dual channel system ram, on a dedicated linux system with a B70 power limited to 160W you get:
 
 * 30 TPS decode up to 150k or so context
 * Around 500 TPS prefill
 
-A weaker "Q2 level" quant gets you to 40TPS, but with a **noticeable downgrade** on inference.
+A weaker "Q2 level" quant gets you to 40TPS, but with a **noticeable downgrade** on inference, not recommended.
 
 ## Major improvements
 
-Against the first B70 enablement (2026-09-15: stock llama.cpp SYCL backend, Unsloth UD-Q3_K_XL, no switches):
-**15-16 tok/s warm chat and 222-248 tok/s prefill at 21K**. Now, with the validated run configuration below, at a
-110 W power cap: **29-31 tok/s short-prompt decode, 27 tok/s decode at 40K context, 430-450 tok/s prefill at
-20-40K, ~386 tok/s at 89K**. The [preferred config](#preferred-config) (overlay v4) spends some of that on quality --
-natural-text NLL ~1.5 against 2.02 for the validated overlay -- and with patches 18-21 (one-token Q8_0 on llama.cpp's own kernel since 2026-10-15) and `--vram 25` runs at
-**28-33 tok/s short-prompt decode, ~510 / ~600 / ~500-515 tok/s prefill at 20K / 40K / 89K**.
+There are multiple custom kernels that target what the B70 is able to effectively accelerate, a lot of the formats in use on quants published on huggingface can not be run at a good speed here.
+This is also paired with a recommended set of weights, pieced from popular quants. This helps a lot with speed.
+And the two big ones for quality of life are a scheduler that allows stopping and resuming ongoing work, so it can serve more than 1 client using time-sharing. The other one is a System RAM backed prefix cache, so you can keep the prefixes for these clients cached for reuse, LRU eviction.
 
-**2026-10: the MTP draft head.** The model's own multi-token-prediction head now drafts one token per step and the
-trunk verifies the pair (exact: the output is the trunk's). The recipe -- a small all-on-GPU head with 2-bit experts,
-a draft vocabulary, cheap verify steps, an AVX2 CPU kernel for Q2_0 -- comes from
-[Strata](https://github.com/Niko1221/Strata), a CUDA/HIP engine for this model; the rows marked *(Strata)* below are
-those ideas ported to this engine and the B70. On the stock-quant overlay v2 (`--vram 24` + the head against
-`--vram 25` without it): **~+13% short-prompt decode** (essay ~35, code ~40 tok/s), ~39.5 tok/s on long answers, the
-prefix cache and vision unchanged. Configuration: [`docs/B70-config.md`](docs/B70-config.md), "MTP".
+The table below has the details on each small one, note that there are multiple attempts that did not yield a good result and those are on the repo too.
 
 | Change | Where | Measured effect |
 |---|---|---|
